@@ -289,6 +289,7 @@ import {
 } from "./recentSessions";
 import { pickFilesViaWebView, stageFileForImport } from "./library/mobileFilePicker";
 import { LibraryPanel } from "./panels/LibraryPanel";
+import { WorshipToolsSidebarPanel } from "./panels/WorshipToolsSidebarPanel";
 import { useAudioMeters } from "./hooks/useAudioMeters";
 import { useRegionMeters } from "./hooks/useRegionMeters";
 import { useLibraryActions } from "./hooks/useLibraryActions";
@@ -6796,6 +6797,12 @@ export function TransportPanelContent() {
       }),
     },
     {
+      id: "worshiptools",
+      label: t("transport.settingsModal.tabWorshipTools", {
+        defaultValue: "WorshipTools",
+      }),
+    },
+    {
       id: "midi",
       label: t("transport.settingsModal.tabMidi", { defaultValue: "MIDI" }),
     },
@@ -6973,6 +6980,7 @@ export function TransportPanelContent() {
           }}
           midiLearnMode={midiLearnMode}
           onMidiLearnTarget={handleMidiLearnTarget}
+          onOpenWorshipTools={() => handleSidebarTabToggle("worshiptools")}
         />
 
         <MetronomePopover
@@ -7020,6 +7028,7 @@ export function TransportPanelContent() {
             isRemoteModalOpen={isRemoteModalOpen}
             isSettingsModalOpen={isSettingsModalOpen}
             onLibraryToggle={() => handleSidebarTabToggle("library")}
+            onWorshipToolsToggle={() => handleSidebarTabToggle("worshiptools")}
             onRemoteClick={handleRemoteButtonClick}
             onSettingsClick={handleSettingsButtonClick}
             onSessionsClick={() => setIsMobileSessionsModalOpen(true)}
@@ -7129,6 +7138,14 @@ export function TransportPanelContent() {
                   );
                 }}
                 onAddFolderToTimeline={handleAddLibraryFolderToTimeline}
+              />
+              <WorshipToolsSidebarPanel
+                isOpen={activeSidebarTab === "worshiptools"}
+                onClose={() => setActiveSidebarTab(null)}
+                onOpenSettings={() => {
+                  setActiveSettingsTab("worshiptools");
+                  setIsSettingsModalOpen(true);
+                }}
               />
               {shouldShowEmptyState ? (
                 isMobileApp ? (

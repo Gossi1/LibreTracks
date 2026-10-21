@@ -7,6 +7,7 @@
   "exports": {
     "./models": "./src/models.ts",
     "./desktopApi": "./src/desktopApi.ts",
+    "./barGrid": "./src/barGrid.ts",
     "./timelineMath": "./src/timelineMath.ts",
     "./meterBallistics": "./src/meterBallistics.ts",
     "./faderScale": "./src/faderScale.ts",

@@ -23,6 +23,7 @@ import { formatUserFacingError } from "../errors/formatTransportError";
 import { UI_ZOOM_STEPS, setUiZoom, useUiZoom } from "../../../shared/uiZoom";
 import { TelemetrySettingsField } from "../../telemetry/TelemetryController";
 import { DiagnosticsSettingsTab } from "./DiagnosticsSettingsTab";
+import { WorshipToolsSettingsTab } from "./WorshipToolsSettingsTab";
 import { MulticoreAudioField } from "./MulticoreAudioField";
 import { SessionStorageVolumeField } from "./SessionStorageVolumeField";
 import { UpdateCheckField } from "./UpdateCheckField";
@@ -937,6 +938,17 @@ export function SettingsPanel({
                   aria-labelledby="lt-settings-tab-diagnostics"
                 >
                   <DiagnosticsSettingsTab />
+                </section>
+              ) : null}
+
+              {activeTab === "worshiptools" ? (
+                <section
+                  className="lt-settings-tab-panel"
+                  role="tabpanel"
+                  id="lt-settings-panel-worshiptools"
+                  aria-labelledby="lt-settings-tab-worshiptools"
+                >
+                  <WorshipToolsSettingsTab />
                 </section>
               ) : null}
 

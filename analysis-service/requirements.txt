@@ -1,0 +1,10 @@
+# Core model stack. torch/torchaudio are installed separately from the CPU
+# wheel index first (see install.bat) so pip does not pull a CUDA build.
+allin1==1.1.0
+imageio-ffmpeg==0.6.0
+
+# NATTEN is built from source afterwards inside a Visual Studio environment:
+#   pip install --no-build-isolation natten==0.17.4
+# allin1 1.1.0 calls the legacy `natten*d{qk,av}` ops, which NATTEN removed in
+# 0.17.5 — and 0.20 dropped the CPU kernels this machine needs. 0.17.4 is the
+# last release with both.

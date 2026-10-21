@@ -13,3 +13,4 @@ pub mod system;
 pub mod timeline;
 pub mod transport;
 pub mod video;
+pub mod rehearse;

@@ -43,6 +43,7 @@ symphonia = { version = "0.5", default-features = false, features = ["aac", "fla
 tauri-plugin-dialog = "2.7.0"
 tauri-plugin-opener = "2"
 tauri-plugin-fs = "2.5.1"
+url = "2"
 
 [dependencies.libretracks-core]
 path = "../../../crates/libretracks-core"

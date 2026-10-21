@@ -23,6 +23,7 @@ import {
 import { AudioDeviceStatusBadge } from "../AudioDeviceStatusBadge";
 import { MidiDeviceStatusBadge } from "../MidiDeviceStatusBadge";
 import { requestAppClose } from "../../appClose/appCloseService";
+import { useWorshipToolsStore } from "../../worshiptools/worshipToolsStore";
 
 type TimelineTopbarProps = {
   openTopMenu: "file" | null;
@@ -90,6 +91,7 @@ type TimelineTopbarProps = {
   onTimeSignatureCommit: () => void;
   midiLearnMode: string | null;
   onMidiLearnTarget: (controlKey: string) => void;
+  onOpenWorshipTools?: () => void;
 };
 
 export function TimelineTopbar({
@@ -152,8 +154,22 @@ export function TimelineTopbar({
   onTimeSignatureCommit,
   midiLearnMode,
   onMidiLearnTarget,
+  onOpenWorshipTools,
 }: TimelineTopbarProps) {
   const { t } = useTranslation();
+  const wtUpcoming = useWorshipToolsStore((state) => state.upcoming);
+  const wtPast = useWorshipToolsStore((state) => state.past);
+  const wtSelectedId = useWorshipToolsStore((state) => state.selectedServiceId);
+  const wtIsLoading = useWorshipToolsStore((state) => state.isLoadingServices);
+  const wtSelectService = useWorshipToolsStore((state) => state.selectService);
+
+  useEffect(() => {
+    const store = useWorshipToolsStore.getState();
+    if (store.services.length === 0 && !store.isLoadingServices) {
+      void store.loadServices(false);
+    }
+  }, []);
+
   // Narrow selectors: the topbar only needs the base tempo and whether a
   // project is loaded, so unrelated mutations of `song` no longer re-render it.
   const fallbackBpm = useSongStore((state) => getSongBaseBpm(state.song));
@@ -462,6 +478,54 @@ export function TimelineTopbar({
           </div>
         </nav>
         ) : null}
+
+        {!isMobileApp && (
+          <div className="lt-topbar-wt-service-picker">
+            <span
+              className={`material-symbols-outlined lt-topbar-wt-icon ${wtIsLoading ? "is-spinning" : ""}`}
+              aria-hidden="true"
+            >
+              {wtIsLoading ? "progress_activity" : "church"}
+            </span>
+            <select
+              className="lt-topbar-wt-select"
+              value={wtSelectedId ?? ""}
+              disabled={wtIsLoading}
+              aria-label={t("transport.worshiptools.selectService", { defaultValue: "Select service" })}
+              onChange={(e) => {
+                const id = e.target.value;
+                void wtSelectService(id || null);
+                if (id && onOpenWorshipTools) {
+                  onOpenWorshipTools();
+                }
+              }}
+            >
+              <option value="">
+                {wtIsLoading
+                  ? t("transport.worshiptools.loadingServices", { defaultValue: "Loading services…" })
+                  : t("transport.worshiptools.chooseServicePlaceholder", { defaultValue: "— WorshipTools Service —" })}
+              </option>
+              {wtUpcoming.length > 0 && (
+                <optgroup label={t("transport.worshiptools.upcomingGroup", { defaultValue: "Upcoming services" })}>
+                  {wtUpcoming.map((s) => (
+                    <option key={s.id} value={s.id}>
+                      {s.displayDate} · {s.name} ({s.cuesCount} cues)
+                    </option>
+                  ))}
+                </optgroup>
+              )}
+              {wtPast.length > 0 && (
+                <optgroup label={t("transport.worshiptools.pastGroup", { defaultValue: "Past services" })}>
+                  {wtPast.map((s) => (
+                    <option key={s.id} value={s.id}>
+                      {s.displayDate} · {s.name} ({s.cuesCount} cues)
+                    </option>
+                  ))}
+                </optgroup>
+              )}
+            </select>
+          </div>
+        )}
 
         {/* Phone: the video output's two icons sit in this row, next to the
             meter. Floating below the bar (the desktop's slot) they covered

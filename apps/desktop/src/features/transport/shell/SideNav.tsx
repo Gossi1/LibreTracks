@@ -9,6 +9,7 @@ type SideNavProps = {
   isRemoteModalOpen: boolean;
   isSettingsModalOpen: boolean;
   onLibraryToggle: () => void;
+  onWorshipToolsToggle?: () => void;
   onRemoteClick: () => void;
   onSettingsClick: () => void;
   /** Android: the FILE menu's two mobile entries live here instead of the
@@ -26,6 +27,7 @@ export function SideNav({
   isRemoteModalOpen,
   isSettingsModalOpen,
   onLibraryToggle,
+  onWorshipToolsToggle,
   onRemoteClick,
   onSettingsClick,
   onSessionsClick,
@@ -92,6 +94,18 @@ export function SideNav({
         <span className="material-symbols-outlined">library_music</span>
         {t("transport.shell.library")}
       </button>
+      {onWorshipToolsToggle ? (
+        <button
+          type="button"
+          className={activeSidebarTab === "worshiptools" ? "is-active" : ""}
+          aria-label={t("transport.shell.worshiptools", { defaultValue: "WorshipTools" })}
+          title={t("transport.shell.worshiptools", { defaultValue: "WorshipTools" })}
+          onClick={onWorshipToolsToggle}
+        >
+          <span className="material-symbols-outlined">church</span>
+          {t("transport.shell.worshiptoolsShort", { defaultValue: "Worship" })}
+        </button>
+      ) : null}
       {!isMobileApp && (
         <button
           type="button"

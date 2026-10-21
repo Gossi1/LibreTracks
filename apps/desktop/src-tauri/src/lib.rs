@@ -157,7 +157,8 @@ pub fn run() {
 
     let builder = builder
         .manage(EngineV2State::new())
-        .manage(commands::app_close::AppCloseState::default());
+        .manage(commands::app_close::AppCloseState::default())
+        .manage(commands::rehearse::RehearseState::default());
 
     // La X de la ventana pasa por la interfaz para guardar y avisar de que se
     // ha guardado antes de cerrar. Ver commands::app_close.
@@ -585,7 +586,15 @@ pub fn run() {
             commands::engine_v2::engine_v2_poll_events,
             commands::engine_v2::engine_v2_list_devices,
             commands::engine_v2::engine_v2_get_diagnostics,
-            commands::engine_v2::engine_v2_load_session
+            commands::engine_v2::engine_v2_load_session,
+            // ── CCLI Rehearse Commands ──
+            commands::rehearse::save_rehearse_token,
+            commands::rehearse::set_last_rehearse_track_id,
+            commands::rehearse::get_rehearse_status,
+            commands::rehearse::open_rehearse_window,
+            commands::rehearse::fetch_rehearse_song,
+            commands::rehearse::export_song_markers,
+            commands::rehearse::search_rehearse_songs
         ])
         .build(tauri::generate_context!())
         .expect("failed to run LibreTracks desktop application")

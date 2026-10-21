@@ -164,7 +164,8 @@ export type SettingsTab =
   | "shortcuts"
   | "midiLearn"
   | "diagnostics"
-  | "video";
+  | "video"
+  | "worshiptools";
 
 export type TrackDropState = {
   targetTrackId: string;
@@ -216,7 +217,7 @@ export type LiveTrackMixRequestState = {
   lastSentAt: number;
 };
 
-export type SidebarTab = "library";
+export type SidebarTab = "library" | "worshiptools";
 
 export type MidiLearnCommand = {
   key: string;
