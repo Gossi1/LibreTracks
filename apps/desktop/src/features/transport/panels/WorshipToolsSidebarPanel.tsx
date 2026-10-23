@@ -1,4 +1,4 @@
-import { useEffect, useState, useTransition } from "react";
+import { useEffect, useRef, useState, useTransition } from "react";
 import { useTranslation } from "react-i18next";
 
 import { pickLibraryFiles } from "@libretracks/shared/desktopApi";
@@ -75,38 +75,49 @@ export function WorshipToolsSidebarPanel({
   const [rehearseFeedback, setRehearseFeedback] = useState<string | null>(null);
   const [markerOffsetSeconds, setMarkerOffsetSeconds] = useState(0);
 
+  const initialLoadAttemptedRef = useRef(false);
+
   useEffect(() => {
     if (!isOpen) return;
+    let isMounted = true;
+    let unlistenToken: (() => void) | undefined;
+    let unlistenTrack: (() => void) | undefined;
+
     void getRehearseStatus().then((status) => {
+      if (!isMounted) return;
       setRehearseStatus(status);
       if (status.lastTrackId) {
         setRehearseTrackInput((prev) => prev || status.lastTrackId || "");
       }
     });
 
-    let unlistenToken: (() => void) | undefined;
-    let unlistenTrack: (() => void) | undefined;
-
     void listenRehearseToken(() => {
+      if (!isMounted) return;
       setRehearseStatus((prev) => ({ ...prev, hasToken: true }));
       setRehearseFeedback(
         t("transport.worshiptools.tokenCapturedFeedback", {
           defaultValue: "Live Rehearse token captured!",
         }),
       );
-      setTimeout(() => setRehearseFeedback(null), 4000);
+      setTimeout(() => {
+        if (isMounted) setRehearseFeedback(null);
+      }, 4000);
     }).then((unlisten) => {
-      unlistenToken = unlisten;
+      if (isMounted) unlistenToken = unlisten;
+      else unlisten();
     });
 
     void listenRehearseTrack((trackId) => {
+      if (!isMounted) return;
       setRehearseStatus((prev) => ({ ...prev, lastTrackId: trackId }));
       setRehearseTrackInput(trackId);
     }).then((unlisten) => {
-      unlistenTrack = unlisten;
+      if (isMounted) unlistenTrack = unlisten;
+      else unlisten();
     });
 
     return () => {
+      isMounted = false;
       unlistenToken?.();
       unlistenTrack?.();
     };
@@ -182,9 +193,14 @@ export function WorshipToolsSidebarPanel({
     }
   };
 
-  // Load services when first opened if empty
+  // Load services when first opened if empty (at most once per open to prevent infinite re-render loops on failure)
   useEffect(() => {
-    if (isOpen && services.length === 0 && !isLoadingServices) {
+    if (!isOpen) {
+      initialLoadAttemptedRef.current = false;
+      return;
+    }
+    if (!initialLoadAttemptedRef.current && services.length === 0 && !isLoadingServices) {
+      initialLoadAttemptedRef.current = true;
       void loadServices(false);
     }
   }, [isOpen, services.length, isLoadingServices, loadServices]);
