@@ -5,6 +5,7 @@
 #include <lt_engine/diagnostics/rt_guard.h>
 #include <lt_engine/diagnostics/callback_budget.h>
 #include <lt_engine/render/fade_processor.h>
+#include <lt_engine/render/region_envelope.h>
 #include <lt_engine/render/pitch_resolution.h>
 #include <lt_engine/pitch/bungee_voice_manager.h>
 #include <algorithm>
@@ -68,6 +69,79 @@ void atomic_max_relaxed(std::atomic<float>& target, float value) noexcept {
     float current = target.load(std::memory_order_relaxed);
     while (current < value && !target.compare_exchange_weak(
                current, value, std::memory_order_relaxed, std::memory_order_relaxed)) {}
+}
+
+// Como coloca la pista sus dos canales ANTES del paneo. Solo la suma a mono
+// (boton de mono de la pista) los toca: una fuente MONO ya llega duplicada a
+// los dos lados desde el renderer de clips (TrackRenderer, por clip y segun el
+// numero de canales de la fuente), y una ESTEREO se respeta tal cual aunque un
+// lado venga en silencio, como en Ableton. Lo comparten la mezcla y el
+// medidor de pista, para que el medidor muestre exactamente lo que se mezcla.
+inline void place_track_source(bool mono_downmix,
+                               float& source_l, float& source_r) noexcept {
+    if (mono_downmix) {
+        const float summed = 0.5f * (source_l + source_r);
+        source_l = summed;
+        source_r = summed;
+    }
+}
+
+struct TrackMeterReading {
+    float peak_l = 0.f, peak_r = 0.f;
+    float rms_l = 0.f, rms_r = 0.f;
+};
+
+// Medidor de pista en el punto que pide `mode` (ver TrackMeterMode en
+// mixer.h). La rampa de paneo es la misma, muestra a muestra, que la de la
+// fase B, asi que en PostPan/PostFader el medidor muestra exactamente lo que
+// se mezcla.
+//
+// `fader_gain` es el fader PROPIO de la pista en este bloque: volumen x mute x
+// solo, sin las carpetas padre (esas van en el medidor de la carpeta). Es
+// constante en el bloque, asi que escala pico y RMS sin tocar el bucle; solo
+// cuenta en PostFader. Mide los objetivos, no la rampa de 10 ms: un medidor no
+// necesita esa precision y asi una pista muteada marca 0 en el acto.
+TrackMeterReading measure_track(const float* mix_l, const float* mix_r,
+                                int num_frames, float start_pan, float end_pan,
+                                bool mono_downmix, TrackMeterMode mode,
+                                float fader_gain) noexcept {
+    TrackMeterReading out;
+    if (mode == TrackMeterMode::PostFader && fader_gain <= 0.0f)
+        return out;
+    const bool raw = mode == TrackMeterMode::PreFader;
+    double sum_l = 0.0, sum_r = 0.0;
+    for (int f = 0; f < num_frames; ++f) {
+        float l = mix_l[f];
+        float r = mix_r[f];
+        if (!raw) {
+            const float t = static_cast<float>(f + 1) / static_cast<float>(std::max(1, num_frames));
+            const float pan = clamp_pan(start_pan + (end_pan - start_pan) * t);
+            place_track_source(mono_downmix, l, r);
+            l *= pan_left_gain(pan);
+            r *= pan_right_gain(pan);
+        }
+        out.peak_l = std::max(out.peak_l, std::abs(l));
+        out.peak_r = std::max(out.peak_r, std::abs(r));
+        sum_l += static_cast<double>(l) * l;
+        sum_r += static_cast<double>(r) * r;
+    }
+    out.rms_l = static_cast<float>(std::sqrt(sum_l / std::max(1, num_frames)));
+    out.rms_r = static_cast<float>(std::sqrt(sum_r / std::max(1, num_frames)));
+    if (mode == TrackMeterMode::PostFader) {
+        out.peak_l *= fader_gain;
+        out.peak_r *= fader_gain;
+        out.rms_l *= fader_gain;
+        out.rms_r *= fader_gain;
+    }
+    return out;
+}
+
+// Fader propio de la pista para el medidor PostFader: su volumen y su mute
+// (no los de sus carpetas) por la ganancia de solo, que ya tiene en cuenta la
+// jerarquia (una pista dentro de una carpeta en solo sigue sonando).
+float track_meter_fader_gain(float own_gain, bool own_mute, float target_solo_gain) noexcept {
+    if (own_mute) return 0.0f;
+    return std::max(0.0f, own_gain) * target_solo_gain;
 }
 
 bool jump_debug_enabled() {
@@ -690,6 +764,8 @@ void Mixer::render_timeline_span(float** output_channels,
             continue;
 
         const bool solo_active = any_solo_active_in_slots();
+        // Una lectura por bloque: todas las pistas se miden en el mismo punto.
+        const TrackMeterMode meter_mode = track_meter_mode();
 
         // La fase B se salta las ranuras que la A no marco. Sin este reseteo
         // arrastraria el estado del bloque anterior y una pista saltada seguiria
@@ -787,22 +863,16 @@ void Mixer::render_timeline_span(float** output_channels,
                                    /*track_gain_override=*/1.0f);
             ++rendered_this_block;
 
-            float track_peak_l = 0.f, track_peak_r = 0.f;
-            double track_sum_l = 0.0, track_sum_r = 0.0;
-            for (int f = 0; f < num_frames; ++f) {
-                track_peak_l = std::max(track_peak_l, std::abs(mix_l[f]));
-                track_peak_r = std::max(track_peak_r, std::abs(mix_r[f]));
-                track_sum_l += static_cast<double>(mix_l[f]) * mix_l[f];
-                track_sum_r += static_cast<double>(mix_r[f]) * mix_r[f];
-            }
-            track_meters_[ti]->left_peak.store(track_peak_l, std::memory_order_relaxed);
-            track_meters_[ti]->right_peak.store(track_peak_r, std::memory_order_relaxed);
-            const float track_rms_l =
-                static_cast<float>(std::sqrt(track_sum_l / std::max(1, num_frames)));
-            const float track_rms_r =
-                static_cast<float>(std::sqrt(track_sum_r / std::max(1, num_frames)));
-            track_meters_[ti]->left_rms.store(track_rms_l, std::memory_order_relaxed);
-            track_meters_[ti]->right_rms.store(track_rms_r, std::memory_order_relaxed);
+            const TrackMeterReading meter = measure_track(
+                mix_l, mix_r, num_frames, start_pan, end_pan, track.mono_downmix,
+                meter_mode,
+                track_meter_fader_gain(control->gain.load(std::memory_order_relaxed),
+                                       control->mute.load(std::memory_order_relaxed),
+                                       target_solo_gain));
+            track_meters_[ti]->left_peak.store(meter.peak_l, std::memory_order_relaxed);
+            track_meters_[ti]->right_peak.store(meter.peak_r, std::memory_order_relaxed);
+            track_meters_[ti]->left_rms.store(meter.rms_l, std::memory_order_relaxed);
+            track_meters_[ti]->right_rms.store(meter.rms_r, std::memory_order_relaxed);
 
             // Los medidores de CARPETA acumulan entre pistas, asi que no pueden
             // ir aqui: van en la fase B, en orden de ranura. El routing si se
@@ -825,13 +895,14 @@ void Mixer::render_timeline_span(float** output_channels,
             st.start_pan        = start_pan;       st.end_pan        = end_pan;
             st.start_mute_gain  = start_mute_gain; st.end_mute_gain  = end_mute_gain;
             st.start_solo_gain  = start_solo_gain; st.end_solo_gain  = end_solo_gain;
-            st.peak_l           = track_peak_l;    st.peak_r         = track_peak_r;
-            st.rms_l            = track_rms_l;     st.rms_r          = track_rms_r;
+            st.meter_peak_l     = meter.peak_l;    st.meter_peak_r   = meter.peak_r;
+            st.meter_rms_l      = meter.rms_l;     st.meter_rms_r    = meter.rms_r;
             st.left_channel     = left_channel;    st.right_channel  = right_channel;
             st.track            = &track;
             st.map_index        = map_index;
             st.has_ancestor_map =
                 published_slots && map_index < ancestor_meter_indices_for_renderer_.size();
+            st.meter_mode       = meter_mode;
         }
 
         // -- FASE B: reduccion, siempre en el director y EN ORDEN ASCENDENTE --
@@ -849,17 +920,16 @@ void Mixer::render_timeline_span(float** output_channels,
             const float* mix_r = track_buses_[ti]->right.data();
 
             update_ancestor_folder_meters(
-                song, track, st.peak_l, st.peak_r, st.rms_l, st.rms_r,
+                song, track, st.meter_peak_l, st.meter_peak_r, st.meter_rms_l, st.meter_rms_r,
                 st.has_ancestor_map
-                    ? &ancestor_meter_indices_for_renderer_[st.map_index] : nullptr);
+                    ? &ancestor_meter_indices_for_renderer_[st.map_index] : nullptr,
+                st.meter_mode == TrackMeterMode::PostFader, st.map_index - ti);
 
             const float start_gain = st.start_gain, end_gain = st.end_gain;
             const float start_pan = st.start_pan, end_pan = st.end_pan;
             const float start_mute_gain = st.start_mute_gain, end_mute_gain = st.end_mute_gain;
             const float start_solo_gain = st.start_solo_gain, end_solo_gain = st.end_solo_gain;
             const int   left_channel = st.left_channel, right_channel = st.right_channel;
-            const bool left_only_source = st.peak_l > 1.0e-7f && st.peak_r <= 1.0e-7f;
-            const bool right_only_source = st.peak_r > 1.0e-7f && st.peak_l <= 1.0e-7f;
             // Pista sumada a mono: los dos canales se funden en uno y ese uno
             // se coloca con el paneo, como el boton de mono de un canal de
             // mezcla. Va ANTES de las ganancias de paneo a proposito, para que
@@ -884,15 +954,7 @@ void Mixer::render_timeline_span(float** output_channels,
                 const float right_gain = pan_right_gain(pan);
                 float source_l = mix_l[f];
                 float source_r = mix_r[f];
-                if (mono_downmix) {
-                    const float summed = 0.5f * (source_l + source_r);
-                    source_l = summed;
-                    source_r = summed;
-                } else if (left_only_source) {
-                    source_r = source_l;
-                } else if (right_only_source) {
-                    source_l = source_r;
-                }
+                place_track_source(mono_downmix, source_l, source_r);
 
                 float out_l = source_l * effective_gain * left_gain;
                 float out_r = source_r * effective_gain * right_gain;
@@ -919,6 +981,7 @@ void Mixer::render_timeline_span(float** output_channels,
                                        output_offset, session.get(), timeline_frame);
     // Same for the jump transition fade: the song fades, the cues do not.
     apply_master_fade_to_tracks(output_channels, num_channels, num_frames, output_offset);
+    capture_region_track_peaks(output_channels, num_channels, num_frames, output_offset);
 
     std::array<float*, 64> shifted_channels{};
     float** metronome_channels = output_channels;
@@ -999,6 +1062,9 @@ void Mixer::render(float** output_channels,
     begin_master_fade_block();
 
     bool fade_processed_in_split = false;
+    // Where in this block the vamp between songs starts clicking: 0 while it
+    // holds, or the song-end frame in the block that just entered it.
+    int song_gap_vamp_offset = 0;
     if (due_jump) {
         const Frame block_start = clock_->position().frame;
         const int pre_frames = static_cast<int>(std::clamp<Frame>(
@@ -1041,6 +1107,7 @@ void Mixer::render(float** output_channels,
                 publish_summary.queued_max,
                 publish_summary.queued_total);
             bungee_voices_->publish_prepared_voice_map_realtime(due_jump->prepared_voice_map);
+            pending_prepared_jump_frame_.store(due_jump->target_frame, std::memory_order_release);
         }
         clock_->seek(due_jump->target_frame);
         // Warp lives inside the single Bungee voice now (one stretcher per
@@ -1105,6 +1172,16 @@ void Mixer::render(float** output_channels,
         clock_->pause();
         song_end_pause_count_.fetch_add(1, std::memory_order_relaxed);
         fade_.trigger_crossfade();
+        if (song_gap_vamp_enabled_.load(std::memory_order_relaxed)) {
+            // Freeze the click of the song that just ended (its last frame,
+            // so a tempo change on the next song's first frame is not taken)
+            // and keep it running from the end frame on.
+            MetronomeRenderer::freeze_timing_at(session.get(), *pause_frame - 1,
+                                                song_gap_vamp_timing_);
+            song_gap_vamp_frame_ = *pause_frame;
+            song_gap_vamp_offset = pre_frames;
+            song_gap_vamp_active_.store(true, std::memory_order_release);
+        }
 
         const int post_frames = num_frames - pre_frames;
         std::array<float*, 64> shifted_channels{};
@@ -1131,6 +1208,7 @@ void Mixer::render(float** output_channels,
                 continue;
 
             const bool solo_active = any_solo_active_in_slots();
+            const TrackMeterMode meter_mode = track_meter_mode();
 
             for (std::size_t ti = 0; ti < renderer_slots && ti < track_block_state_.size(); ++ti)
                 track_block_state_[ti].rendered = false;
@@ -1248,22 +1326,16 @@ void Mixer::render(float** output_channels,
                                        /*track_gain_override=*/1.0f);
                 rendered_atomic.fetch_add(1, std::memory_order_relaxed);
 
-                float track_peak_l = 0.f, track_peak_r = 0.f;
-                double track_sum_l = 0.0, track_sum_r = 0.0;
-                for (int f = 0; f < num_frames; ++f) {
-                    track_peak_l = std::max(track_peak_l, std::abs(mix_l[f]));
-                    track_peak_r = std::max(track_peak_r, std::abs(mix_r[f]));
-                    track_sum_l += static_cast<double>(mix_l[f]) * mix_l[f];
-                    track_sum_r += static_cast<double>(mix_r[f]) * mix_r[f];
-                }
-                track_meters_[ti]->left_peak.store(track_peak_l, std::memory_order_relaxed);
-                track_meters_[ti]->right_peak.store(track_peak_r, std::memory_order_relaxed);
-                const float track_rms_l =
-                    static_cast<float>(std::sqrt(track_sum_l / std::max(1, num_frames)));
-                const float track_rms_r =
-                    static_cast<float>(std::sqrt(track_sum_r / std::max(1, num_frames)));
-                track_meters_[ti]->left_rms.store(track_rms_l, std::memory_order_relaxed);
-                track_meters_[ti]->right_rms.store(track_rms_r, std::memory_order_relaxed);
+                const TrackMeterReading meter = measure_track(
+                    mix_l, mix_r, num_frames, start_pan, end_pan, track.mono_downmix,
+                    meter_mode,
+                    track_meter_fader_gain(control->gain.load(std::memory_order_relaxed),
+                                           control->mute.load(std::memory_order_relaxed),
+                                           target_solo_gain));
+                track_meters_[ti]->left_peak.store(meter.peak_l, std::memory_order_relaxed);
+                track_meters_[ti]->right_peak.store(meter.peak_r, std::memory_order_relaxed);
+                track_meters_[ti]->left_rms.store(meter.rms_l, std::memory_order_relaxed);
+                track_meters_[ti]->right_rms.store(meter.rms_r, std::memory_order_relaxed);
 
                 // Los medidores de CARPETA acumulan entre pistas: van en la
                 // fase B. El routing se resuelve aqui porque depende de
@@ -1285,13 +1357,14 @@ void Mixer::render(float** output_channels,
                 st.start_pan        = start_pan;       st.end_pan        = end_pan;
                 st.start_mute_gain  = start_mute_gain; st.end_mute_gain  = end_mute_gain;
                 st.start_solo_gain  = start_solo_gain; st.end_solo_gain  = end_solo_gain;
-                st.peak_l           = track_peak_l;    st.peak_r         = track_peak_r;
-                st.rms_l            = track_rms_l;     st.rms_r          = track_rms_r;
+                st.meter_peak_l     = meter.peak_l;    st.meter_peak_r   = meter.peak_r;
+                st.meter_rms_l      = meter.rms_l;     st.meter_rms_r    = meter.rms_r;
                 st.left_channel     = left_channel;    st.right_channel  = right_channel;
                 st.track            = &track;
                 st.map_index        = map_index;
                 st.has_ancestor_map =
                     published_slots && map_index < ancestor_meter_indices_for_renderer_.size();
+                st.meter_mode       = meter_mode;
             };
 
             {
@@ -1322,17 +1395,16 @@ void Mixer::render(float** output_channels,
                 const float* mix_r = track_buses_[ti]->right.data();
 
                 update_ancestor_folder_meters(
-                    song, track, st.peak_l, st.peak_r, st.rms_l, st.rms_r,
+                    song, track, st.meter_peak_l, st.meter_peak_r, st.meter_rms_l, st.meter_rms_r,
                     st.has_ancestor_map
-                        ? &ancestor_meter_indices_for_renderer_[st.map_index] : nullptr);
+                        ? &ancestor_meter_indices_for_renderer_[st.map_index] : nullptr,
+                    st.meter_mode == TrackMeterMode::PostFader, st.map_index - ti);
 
                 const float start_gain = st.start_gain, end_gain = st.end_gain;
                 const float start_pan = st.start_pan, end_pan = st.end_pan;
                 const float start_mute_gain = st.start_mute_gain, end_mute_gain = st.end_mute_gain;
                 const float start_solo_gain = st.start_solo_gain, end_solo_gain = st.end_solo_gain;
                 const int   left_channel = st.left_channel, right_channel = st.right_channel;
-                const bool left_only_source = st.peak_l > 1.0e-7f && st.peak_r <= 1.0e-7f;
-                const bool right_only_source = st.peak_r > 1.0e-7f && st.peak_l <= 1.0e-7f;
                 // El MISMO downmix que el camino de arriba. Son dos caminos de
                 // mezcla (uno por ruta de salida, otro no) y una pista no puede
                 // sonar distinto segun por cual entre.
@@ -1350,15 +1422,7 @@ void Mixer::render(float** output_channels,
                     const float right_gain = pan_right_gain(pan);
                     float source_l = mix_l[f];
                     float source_r = mix_r[f];
-                    if (mono_downmix) {
-                        const float summed = 0.5f * (source_l + source_r);
-                        source_l = summed;
-                        source_r = summed;
-                    } else if (left_only_source) {
-                        source_r = source_l;
-                    } else if (right_only_source) {
-                        source_l = source_r;
-                    }
+                    place_track_source(mono_downmix, source_l, source_r);
 
                     float out_l = source_l * effective_gain * left_gain;
                     float out_r = source_r * effective_gain * right_gain;
@@ -1385,6 +1449,8 @@ void Mixer::render(float** output_channels,
         // Same for the jump transition fade: the song fades, the cues do not.
         apply_master_fade_to_tracks(output_channels, num_channels, num_frames,
                                     /*output_offset=*/0);
+        capture_region_track_peaks(output_channels, num_channels, num_frames,
+                                   /*output_offset=*/0);
 
         metronome_.render(output_channels, num_channels, num_frames,
                           clock_->sample_rate(), timeline_frame, session.get(),
@@ -1411,7 +1477,20 @@ void Mixer::render(float** output_channels,
     // …unless the user opted into "stop with playback", in which case the pad
     // follows the transport through a gate instead of its enabled switch, so it
     // fades out on stop/pause and returns on play with the switch still on.
-    pad_.set_transport_gate(!pad_.stop_with_transport() ||
+    // The vamp between songs: the transport is parked on the next song's first
+    // frame, the click of the song that ended keeps going until Play.
+    bool song_gap_vamp_holding = false;
+    if (song_gap_vamp_active_.load(std::memory_order_acquire)) {
+        if (clock_->position().state == TransportState::Playing) {
+            song_gap_vamp_active_.store(false, std::memory_order_release);
+        } else {
+            song_gap_vamp_holding = true;
+            render_song_gap_vamp(output_channels, num_channels,
+                                 num_frames - song_gap_vamp_offset, song_gap_vamp_offset);
+        }
+    }
+
+    pad_.set_transport_gate(!pad_.stop_with_transport() || song_gap_vamp_holding ||
                             clock_->position().state == TransportState::Playing);
     pad_.render(output_channels, num_channels, num_frames, clock_->sample_rate(),
                 render_output_channels_.data(), render_output_channel_count_);
@@ -1428,8 +1507,7 @@ void Mixer::render(float** output_channels,
     end_master_fade_block(num_frames);
     apply_output_limiter(output_channels, num_channels, num_frames);
 
-    update_region_meters(output_channels, num_channels, num_frames,
-                         session.get(), timeline_frame);
+    update_region_meters(num_frames, session.get(), timeline_frame);
 
     // Peak meters.
     float peak_l = 0.f, peak_r = 0.f;
@@ -1545,9 +1623,59 @@ void Mixer::set_pause_at_song_end(bool enabled) noexcept {
     pause_at_song_end_.store(enabled, std::memory_order_relaxed);
 }
 
+void Mixer::set_song_gap_vamp(bool enabled) noexcept {
+    song_gap_vamp_enabled_.store(enabled, std::memory_order_relaxed);
+    if (!enabled)
+        end_song_gap_vamp();
+}
+
+void Mixer::set_track_meter_mode(TrackMeterMode mode) noexcept {
+    track_meter_mode_.store(static_cast<int>(mode), std::memory_order_relaxed);
+}
+
+TrackMeterMode Mixer::track_meter_mode() const noexcept {
+    const int raw = track_meter_mode_.load(std::memory_order_relaxed);
+    switch (raw) {
+        case static_cast<int>(TrackMeterMode::PostPan):  return TrackMeterMode::PostPan;
+        case static_cast<int>(TrackMeterMode::PreFader): return TrackMeterMode::PreFader;
+        default:                                         return TrackMeterMode::PostFader;
+    }
+}
+
+void Mixer::end_song_gap_vamp() noexcept {
+    song_gap_vamp_active_.store(false, std::memory_order_release);
+}
+
+bool Mixer::song_gap_vamp_active() const noexcept {
+    return song_gap_vamp_active_.load(std::memory_order_acquire);
+}
+
+void Mixer::render_song_gap_vamp(float** output_channels,
+                                 int num_channels,
+                                 int num_frames,
+                                 int output_offset) noexcept {
+    if (num_frames <= 0 || num_channels <= 0)
+        return;
+    std::array<float*, 64> shifted_channels{};
+    float** channels = output_channels;
+    if (output_offset > 0) {
+        if (num_channels > static_cast<int>(shifted_channels.size()))
+            return;
+        for (int ch = 0; ch < num_channels; ++ch)
+            shifted_channels[static_cast<std::size_t>(ch)] = output_channels[ch] + output_offset;
+        channels = shifted_channels.data();
+    }
+    metronome_.render_song(channels, num_channels, num_frames, clock_->sample_rate(),
+                           song_gap_vamp_frame_, &song_gap_vamp_timing_,
+                           render_output_channels_.data(), render_output_channel_count_);
+    song_gap_vamp_frame_ += num_frames;
+}
+
 std::optional<Frame> Mixer::song_end_pause_frame(const Session* session,
                                                  int num_frames) const noexcept {
-    if (!session || num_frames <= 0 || !pause_at_song_end_.load(std::memory_order_relaxed))
+    if (!session || num_frames <= 0
+        || (!pause_at_song_end_.load(std::memory_order_relaxed)
+            && !song_gap_vamp_enabled_.load(std::memory_order_relaxed)))
         return std::nullopt;
     const auto position = clock_->position();
     if (position.state != TransportState::Playing || clock_->pending_start())
@@ -1682,18 +1810,6 @@ void Mixer::trigger_crossfade() noexcept {
     fade_.trigger_crossfade();
 }
 
-float Mixer::region_master_gain_at(const Session* session, Frame timeline_frame) const noexcept {
-    if (!session) return 1.0f;
-    for (const auto& song : session->songs) {
-        for (const auto& region : song.regions) {
-            if (timeline_frame >= region.start_frame
-                && timeline_frame < region.end_frame)
-                return region.master_gain;
-        }
-    }
-    return 1.0f;
-}
-
 void Mixer::apply_region_master_gain_to_tracks(float** output_channels,
                                                int num_channels,
                                                int num_frames,
@@ -1703,24 +1819,48 @@ void Mixer::apply_region_master_gain_to_tracks(float** output_channels,
     if (!session || num_channels <= 0 || num_frames <= 0)
         return;
 
-    const float gain = region_master_gain_at(session, timeline_frame);
-    if (std::abs(gain - 1.0f) <= 0.000001f)
-        return;
-
-    for (int ch = 0; ch < num_channels; ++ch) {
-        if (!output_channels[ch]) continue;
-        float* buf = output_channels[ch] + output_offset;
-        for (int f = 0; f < num_frames; ++f)
-            buf[f] *= gain;
+    // Master gain times the song's fade in/out, per sample (region_envelope.h).
+    // The fades need a per-sample envelope; a block-constant gain would step
+    // audibly. Walked in fixed chunks so the scratch buffer lives on the stack.
+    std::array<float, kRegionEnvelopeChunk> gains{};
+    for (int chunk_start = 0; chunk_start < num_frames; chunk_start += kRegionEnvelopeChunk) {
+        const int count = std::min(kRegionEnvelopeChunk, num_frames - chunk_start);
+        if (fill_region_envelope(*session, timeline_frame + chunk_start, count, gains.data()))
+            continue;
+        for (int ch = 0; ch < num_channels; ++ch) {
+            if (!output_channels[ch]) continue;
+            float* buf = output_channels[ch] + output_offset + chunk_start;
+            for (int f = 0; f < count; ++f)
+                buf[f] *= gains[static_cast<std::size_t>(f)];
+        }
     }
 }
 
-void Mixer::update_region_meters(float** output_channels,
-                                 int num_channels,
-                                 int num_frames,
+void Mixer::capture_region_track_peaks(float** output_channels,
+                                       int num_channels,
+                                       int num_frames,
+                                       int output_offset) noexcept {
+    if (num_channels <= 0 || num_frames <= 0)
+        return;
+    for (int ch = 0; ch < std::min(num_channels, 2); ++ch) {
+        if (!output_channels[ch]) continue;
+        const float* buf = output_channels[ch] + output_offset;
+        float peak = region_block_peaks_[ch];
+        for (int f = 0; f < num_frames; ++f)
+            peak = std::max(peak, std::abs(buf[f]));
+        region_block_peaks_[ch] = peak;
+    }
+    if (num_channels == 1)
+        region_block_peaks_[1] = region_block_peaks_[0];
+}
+
+void Mixer::update_region_meters(int num_frames,
                                  const Session* session,
                                  Frame timeline_frame) noexcept {
-    if (!session || num_channels <= 0 || num_frames <= 0)
+    // Consume this callback's track peaks whatever happens below.
+    const float captured_peaks[2] = {region_block_peaks_[0], region_block_peaks_[1]};
+    region_block_peaks_[0] = region_block_peaks_[1] = 0.f;
+    if (!session || num_frames <= 0)
         return;
 
     // Refresh region-slot mapping. The session pointer can swap atomically
@@ -1743,19 +1883,14 @@ void Mixer::update_region_meters(float** output_channels,
     }
     region_meter_count_.store(region_count, std::memory_order_release);
 
-    // Compute the peak of the active region from the final output bus (mono
-    // max(|L|, |R|)) and apply a 200ms release to every other slot so inactive
-    // bars decay smoothly toward zero instead of snapping off when the playhead
-    // crosses a region boundary.
-    float block_peak = 0.f;
+    // The active region takes the track-bus peak captured before the click,
+    // voice guide and pad were mixed in (L, R; a mono bus feeds both). Every
+    // other slot gets a 200ms release so inactive bars decay smoothly toward
+    // zero instead of snapping off when the playhead crosses a boundary.
+    float block_peaks[2] = {0.f, 0.f};
     if (active_index >= 0) {
-        for (int ch = 0; ch < std::min(num_channels, 2); ++ch) {
-            if (!output_channels[ch]) continue;
-            for (int f = 0; f < num_frames; ++f) {
-                const float v = std::abs(output_channels[ch][f]);
-                if (v > block_peak) block_peak = v;
-            }
-        }
+        block_peaks[0] = captured_peaks[0];
+        block_peaks[1] = captured_peaks[1];
     }
 
     const int sr = clock_ ? std::max(1, clock_->sample_rate()) : 48000;
@@ -1763,21 +1898,24 @@ void Mixer::update_region_meters(float** output_channels,
     const float release_coef = std::exp(
         -static_cast<float>(num_frames) / (0.2f * static_cast<float>(sr)));
 
-    for (int i = 0; i < region_count; ++i) {
-        auto& slot = region_meters_[static_cast<std::size_t>(i)];
-        const float prev = slot.peak.load(std::memory_order_relaxed);
+    // Peak follows the block: rise instantly to the new peak if higher,
+    // otherwise fall by release_coef. Standard PPM behaviour.
+    auto advance = [release_coef](std::atomic<float>& meter, bool active, float block_peak) {
+        const float prev = meter.load(std::memory_order_relaxed);
         float next;
-        if (i == active_index) {
-            // Peak follows the block: rise instantly to the new peak if higher,
-            // otherwise fall by release_coef. Standard PPM behaviour.
-            next = (block_peak >= prev)
-                ? block_peak
-                : prev * release_coef;
+        if (active && block_peak >= prev) {
+            next = block_peak;
         } else {
             next = prev * release_coef;
-            if (next < 1e-6f) next = 0.f;
+            if (!active && next < 1e-6f) next = 0.f;
         }
-        slot.peak.store(next, std::memory_order_relaxed);
+        meter.store(next, std::memory_order_relaxed);
+    };
+    for (int i = 0; i < region_count; ++i) {
+        auto& slot = region_meters_[static_cast<std::size_t>(i)];
+        const bool active = i == active_index;
+        advance(slot.left_peak, active, block_peaks[0]);
+        advance(slot.right_peak, active, block_peaks[1]);
     }
 }
 
@@ -1790,7 +1928,9 @@ std::vector<RegionMeterValues> Mixer::region_meters() const {
         const auto& slot = region_meters_[static_cast<std::size_t>(i)];
         RegionMeterValues out;
         out.region_id = slot.region_id;
-        out.peak = slot.peak.load(std::memory_order_relaxed);
+        out.left_peak = slot.left_peak.load(std::memory_order_relaxed);
+        out.right_peak = slot.right_peak.load(std::memory_order_relaxed);
+        out.peak = std::max(out.left_peak, out.right_peak);
         values.push_back(std::move(out));
     }
     return values;
@@ -2042,16 +2182,43 @@ void Mixer::update_ancestor_folder_meters(const Song& song,
                                           float right_peak,
                                           float left_rms,
                                           float right_rms,
-                                          const std::array<int, kMaxFolderDepth>* precomputed_ancestors) noexcept {
+                                          const std::array<int, kMaxFolderDepth>* precomputed_ancestors,
+                                          bool apply_folder_faders,
+                                          std::size_t song_slot_base) noexcept {
+    // En PostFader cada carpeta mide DESPUES de su propio fader: lo que le llega
+    // de la hija se escala por el volumen/mute de cada carpeta que se cruza al
+    // subir (la de fuera tambien lleva el de la de dentro, como dos grupos
+    // anidados). En los otros modos la carpeta acumula lo que marcan sus hijas.
+    float scale = 1.0f;
+    auto accumulate = [&](std::size_t meter_index, float folder_gain, bool folder_mute) noexcept {
+        if (apply_folder_faders)
+            scale *= folder_mute ? 0.0f : std::max(0.0f, folder_gain);
+        auto& meter = *track_meters_[meter_index];
+        atomic_max_relaxed(meter.left_peak, left_peak * scale);
+        atomic_max_relaxed(meter.right_peak, right_peak * scale);
+        atomic_max_relaxed(meter.left_rms, left_rms * scale);
+        atomic_max_relaxed(meter.right_rms, right_rms * scale);
+    };
     if (precomputed_ancestors) {
         for (int depth = 0; depth < kMaxFolderDepth; ++depth) {
             const int parent_index = (*precomputed_ancestors)[static_cast<std::size_t>(depth)];
             if (parent_index < 0 || static_cast<std::size_t>(parent_index) >= track_meters_.size()) break;
-            auto& meter = *track_meters_[static_cast<std::size_t>(parent_index)];
-            atomic_max_relaxed(meter.left_peak, left_peak);
-            atomic_max_relaxed(meter.right_peak, right_peak);
-            atomic_max_relaxed(meter.left_rms, left_rms);
-            atomic_max_relaxed(meter.right_rms, right_rms);
+            float folder_gain = 1.0f;
+            bool folder_mute = false;
+            if (apply_folder_faders) {
+                const std::size_t map = song_slot_base + static_cast<std::size_t>(parent_index);
+                const int slot = map < control_slot_for_renderer_.size()
+                    ? control_slot_for_renderer_[map] : -1;
+                if (slot >= 0 && static_cast<std::size_t>(slot) < controls_.size()) {
+                    const auto& control = *controls_[static_cast<std::size_t>(slot)];
+                    folder_gain = control.gain.load(std::memory_order_relaxed);
+                    folder_mute = control.mute.load(std::memory_order_relaxed);
+                } else if (static_cast<std::size_t>(parent_index) < song.tracks.size()) {
+                    folder_gain = song.tracks[static_cast<std::size_t>(parent_index)].gain;
+                    folder_mute = song.tracks[static_cast<std::size_t>(parent_index)].mute;
+                }
+            }
+            accumulate(static_cast<std::size_t>(parent_index), folder_gain, folder_mute);
         }
         return;
     }
@@ -2071,11 +2238,9 @@ void Mixer::update_ancestor_folder_meters(const Song& song,
         if (parent_index >= track_meters_.size())
             break;
 
-        auto& meter = *track_meters_[parent_index];
-        atomic_max_relaxed(meter.left_peak, left_peak);
-        atomic_max_relaxed(meter.right_peak, right_peak);
-        atomic_max_relaxed(meter.left_rms, left_rms);
-        atomic_max_relaxed(meter.right_rms, right_rms);
+        // Sin tabla de ranuras publicada (ventana de reconstruccion): los
+        // valores de la sesion, como hace effective_controls_from_session.
+        accumulate(parent_index, parent->gain, parent->mute);
 
         current = &(*parent);
         ++depth;
@@ -2102,6 +2267,10 @@ Frame Mixer::take_pending_scheduled_jump() noexcept {
             expected, kNoJumpPending, std::memory_order_acq_rel))
         return f;
     return kNoJumpPending;
+}
+
+Frame Mixer::take_pending_prepared_jump() noexcept {
+    return pending_prepared_jump_frame_.exchange(kNoJumpPending, std::memory_order_acq_rel);
 }
 
 } // namespace lt

@@ -207,6 +207,17 @@ pub fn import_video_files(
     Ok(VideoImportResult { assets, skipped })
 }
 
+/// Take a video out of the session library; answers with the library as
+/// `list_video_assets` lists it.
+#[tauri::command(async)]
+pub fn delete_video_asset(
+    file_path: String,
+    state: State<'_, DesktopState>,
+) -> Result<Vec<VideoAssetSummary>, String> {
+    with_session(&state, |session, _| session.delete_video_asset(&file_path))?;
+    list_video_assets(state)
+}
+
 #[tauri::command(async)]
 pub fn list_video_assets(state: State<'_, DesktopState>) -> Result<Vec<VideoAssetSummary>, String> {
     let (mut assets, song_dir) = with_session(&state, |session, _| {
@@ -512,6 +523,20 @@ pub fn video_test_pattern(
     };
     state.video.send(OutputCommand::Overlay(image));
     Ok(())
+}
+
+/// Raise the output window over whatever covers it (the badge's right-click
+/// menu), without taking the keyboard from the app.
+#[tauri::command(async)]
+pub fn video_bring_to_front(state: State<'_, DesktopState>) {
+    state.video.send(OutputCommand::BringToFront);
+}
+
+/// The playhead is being dragged (`Some`, view seconds) or was released or
+/// cancelled (`None`): the output shows the frame under it meanwhile.
+#[tauri::command(async)]
+pub fn video_scrub(position_seconds: Option<f64>, state: State<'_, DesktopState>) {
+    state.video.set_scrub(position_seconds);
 }
 
 /// Sync diagnostics for the settings tab (error p50/p95, seeks, swaps…).

@@ -25,6 +25,8 @@ import {
   deletePad,
   saveSettings,
   createAudioTracksWithClips,
+  createClipsWithAutoTracks,
+  createEmptySong,
   createSongRegion,
   createSectionMarker,
   deleteTracks,
@@ -65,12 +67,14 @@ import {
   updateSongRegionKey,
   updateSongRegionWarp,
   updateSongRegionMasterGain,
+  setSongRegionChart,
   type ClipMoveRequest,
+  type SongChart,
   type MarkerKind,
   type TrackKind,
 } from "../desktopApi";
 import { useTransportStore, type MeterDictionary } from "../store";
-import { useTimelineUIStore } from "../uiStore";
+import { useTimelineUIStore, type ViewMode } from "../uiStore";
 
 /**
  * Exposes a tiny, stable automation surface on `window.__ltE2E` — but ONLY when
@@ -255,6 +259,28 @@ export interface E2ETestHooks {
   /** List the `.lttemplate` files in the default templates folder. */
   listSessionTemplates: () => Promise<Array<{ name: string; path: string }>>;
   /**
+   * Save the two song-template settings (the rest stay as they are): the
+   * default template (`"builtin:band"`, a `.lttemplate` path or null) and
+   * where each song's tracks go.
+   */
+  setSongTemplateSettings: (
+    defaultSongTemplate: string | null,
+    songTrackLayout: AppSettings["songTrackLayout"],
+  ) => Promise<void>;
+  /**
+   * «+ Nueva canción»: a new empty song after the last one, laid out from
+   * `template` (or from the default template when it is null).
+   */
+  createEmptySong: (name: string | null, template: string | null) => Promise<void>;
+  /**
+   * The compact-view column drop: every file lands at `timelineStartSeconds`
+   * with its own auto track, unless a song template sends it somewhere else.
+   */
+  createClipsWithAutoTracks: (
+    filePaths: string[],
+    timelineStartSeconds: number,
+  ) => Promise<void>;
+  /**
    * Create a new session named `name` in `parentDir` from the template at
    * `templatePath`, through the production project-load flow (no dialog).
    */
@@ -355,6 +381,10 @@ export interface E2ETestHooks {
     regionId: string,
     masterGain: number,
   ) => Promise<void>;
+  /** Replace a song's lyrics and chords (null removes them). */
+  setSongRegionChart: (regionId: string, chart: SongChart | null) => Promise<void>;
+  /** Switch the main view (daw, compact, live). */
+  setViewMode: (mode: ViewMode) => void;
 }
 
 type E2EWindow = Window & { __ltE2E?: E2ETestHooks };
@@ -565,6 +595,18 @@ export function useE2ETestHooks(
         return templatePath;
       },
       listSessionTemplates: () => listSessionTemplates(),
+      setSongTemplateSettings: async (defaultSongTemplate, songTrackLayout) => {
+        const base = await getSettings();
+        await saveSettings({ ...base, defaultSongTemplate, songTrackLayout });
+      },
+      createEmptySong: async (name, template) => {
+        await createEmptySong(name ?? undefined, template);
+      },
+      createClipsWithAutoTracks: async (filePaths, timelineStartSeconds) => {
+        await createClipsWithAutoTracks(
+          filePaths.map((filePath) => ({ filePath, timelineStartSeconds })),
+        );
+      },
       createSessionFromTemplate: (templatePath, name, parentDir) => {
         void createSongFromTemplateNamed(templatePath, name, parentDir);
       },
@@ -611,6 +653,10 @@ export function useE2ETestHooks(
       updateSongRegionMasterGain: async (regionId, masterGain) => {
         await updateSongRegionMasterGain(regionId, masterGain);
       },
+      setSongRegionChart: async (regionId, chart) => {
+        await setSongRegionChart(regionId, chart);
+      },
+      setViewMode: (mode) => useTimelineUIStore.getState().setViewMode(mode),
     };
 
     return () => {

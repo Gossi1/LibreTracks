@@ -1,7 +1,7 @@
 {
   "name": "@libretracks/desktop",
   "private": true,
-  "version": "1.13.0",
+  "version": "1.15.0",
   "license": "AGPL-3.0-or-later",
   "type": "module",
   "browserslist": [
@@ -22,6 +22,7 @@
     "@tauri-apps/plugin-dialog": "^2.7.0",
     "@tauri-apps/plugin-opener": "^2.5.0",
     "i18next": "^26.0.8",
+    "pdfjs-dist": "4.10.38",
     "qrcode": "^1.5.4",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",

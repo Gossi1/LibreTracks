@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { subscribeWithSelector } from "zustand/middleware";
 import { recordProductEvent } from "../telemetry/telemetry";
+import type { RulerMarkerRef } from "@libretracks/shared/desktopApi";
 
 export type GlobalJumpMode = "immediate" | "after_bars" | "next_marker";
 export type SongJumpTrigger =
@@ -33,12 +34,85 @@ const EMPTY_SELECTION = {
   selectedSectionId: null as string | null,
   selectedTempoMarkerId: null as string | null,
   selectedTimeSignatureMarkerId: null as string | null,
+  selectedMarkers: [] as RulerMarkerRef[],
 };
 
 const CLEAR_RULER_MARKERS = {
   selectedTempoMarkerId: null as string | null,
   selectedTimeSignatureMarkerId: null as string | null,
+  selectedMarkers: [] as RulerMarkerRef[],
 };
+
+/**
+ * Las marcas seleccionadas, de cualquier tipo.
+ *
+ * Con UNA marca la verdad siguen siendo los campos sueltos de siempre
+ * (`selectedSectionId`, `selectedTempoMarkerId`, ...), que es lo que lee todo
+ * el codigo de antes; `selectedMarkers` solo se llena con una seleccion
+ * multiple. Leer siempre por aqui evita tener que mirar los dos sitios.
+ */
+export function selectedRulerMarkers(state: {
+  selectedMarkers: RulerMarkerRef[];
+  selectedSectionId: string | null;
+  selectedTempoMarkerId: string | null;
+  selectedTimeSignatureMarkerId: string | null;
+}): RulerMarkerRef[] {
+  if (state.selectedMarkers.length > 0) return state.selectedMarkers;
+  if (state.selectedSectionId) return [{ kind: "section", id: state.selectedSectionId }];
+  if (state.selectedTempoMarkerId) return [{ kind: "tempo", id: state.selectedTempoMarkerId }];
+  if (state.selectedTimeSignatureMarkerId) {
+    return [{ kind: "timeSignature", id: state.selectedTimeSignatureMarkerId }];
+  }
+  return [];
+}
+
+function sameMarker(a: RulerMarkerRef, b: RulerMarkerRef) {
+  return a.kind === b.kind && a.id === b.id;
+}
+
+/** Una seleccion de marcas como campos del store: con una sola, los campos
+ * sueltos de siempre; con varias, la lista. */
+function markerSelectionFields(markers: RulerMarkerRef[]) {
+  if (markers.length === 1) {
+    const [only] = markers;
+    return {
+      ...EMPTY_SELECTION,
+      selectedSectionId: only.kind === "section" ? only.id : null,
+      selectedTempoMarkerId: only.kind === "tempo" ? only.id : null,
+      selectedTimeSignatureMarkerId:
+        only.kind === "timeSignature" ? only.id : null,
+    };
+  }
+  return { ...EMPTY_SELECTION, selectedMarkers: markers };
+}
+
+/**
+ * La altura global de las pistas es una preferencia de la instalación, como el
+ * zoom de la interfaz: se guarda en localStorage para que sobreviva a cerrar y
+ * abrir la app. Las alturas por pista ya viajan en el proyecto (offsets).
+ */
+const TRACK_HEIGHT_STORAGE_KEY = "lt.timeline.trackHeight";
+
+function readStoredTrackHeight(): number {
+  try {
+    const raw = window.localStorage.getItem(TRACK_HEIGHT_STORAGE_KEY);
+    if (raw === null) return TIMELINE_DEFAULT_TRACK_HEIGHT;
+    const parsed = Number.parseFloat(raw);
+    return Number.isFinite(parsed) && parsed > 0
+      ? parsed
+      : TIMELINE_DEFAULT_TRACK_HEIGHT;
+  } catch {
+    return TIMELINE_DEFAULT_TRACK_HEIGHT;
+  }
+}
+
+function storeTrackHeight(trackHeight: number): void {
+  try {
+    window.localStorage.setItem(TRACK_HEIGHT_STORAGE_KEY, String(trackHeight));
+  } catch {
+    // Sin almacenamiento (modo privado, cuota): la altura vale para esta sesión.
+  }
+}
 
 function recordViewMode(viewMode: ViewMode): void {
   recordProductEvent(`feature_${viewMode}_view`);
@@ -56,6 +130,11 @@ type TimelineUIState = {
    * la puerta a sus acciones; en escritorio siguen yendo por clic derecho. */
   selectedTempoMarkerId: string | null;
   selectedTimeSignatureMarkerId: string | null;
+  /** Seleccion MULTIPLE de marcas de la regla (de cualquier tipo). Vacia con
+   * una sola: ver `selectedRulerMarkers`. */
+  selectedMarkers: RulerMarkerRef[];
+  /** Desde donde cuenta Shift+clic: la ultima marca elegida sola o con Ctrl. */
+  markerSelectionAnchor: RulerMarkerRef | null;
   snapEnabled: boolean;
   followPlayheadEnabled: boolean;
   midiLearnMode: string | null;
@@ -72,12 +151,13 @@ type TimelineUIState = {
    * los dos, uno debajo del otro.
    */
   selectionMixOpen: boolean;
-  /** Móvil: los toques en las cabeceras SUMAN a la selección en vez de
-   * reemplazarla. Sin esto no hay forma de borrar varias pistas de un tirón
-   * con un dedo: no hay Ctrl que mantener. */
-  trackMultiSelect: boolean;
-  /** Lo mismo para los clips: cada toque suma o quita el clip que hay debajo. */
-  clipMultiSelect: boolean;
+  /**
+   * Móvil: selección por área. Un dedo dibuja un recuadro (en las cabeceras
+   * coge pistas; en los carriles, clips) y los toques sueltos SUMAN o quitan en
+   * vez de reemplazar. Con un dedo no hay Ctrl ni Shift que mantener: sin esto
+   * juntar varias pistas era tocarlas una a una. Ver mobile/areaSelection.ts.
+   */
+  areaSelectMode: boolean;
   viewMode: ViewMode;
   setViewMode: (mode: ViewMode) => void;
   toggleViewMode: () => void;
@@ -92,6 +172,11 @@ type TimelineUIState = {
   setSelectedSectionId: (sectionId: string | null) => void;
   selectTempoMarker: (markerId: string | null) => void;
   selectTimeSignatureMarker: (markerId: string | null) => void;
+  /** Sustituye la seleccion por estas marcas. `anchor` fija desde donde cuenta
+   * el siguiente Shift+clic; sin el, se queda el que habia. */
+  setSelectedMarkers: (markers: RulerMarkerRef[], anchor?: RulerMarkerRef) => void;
+  /** Ctrl+clic: pone o quita una marca, y pasa a ser el ancla. */
+  toggleMarkerSelection: (marker: RulerMarkerRef) => void;
   clearSelection: () => void;
   clearSelectionIfAny: () => void;
   selectTrack: (trackIds: string[]) => void;
@@ -108,8 +193,7 @@ type TimelineUIState = {
   toggleTrackReorderMode: () => void;
   setMarkerPositionEditorId: (markerId: string | null) => void;
   toggleExpandedTrackId: (trackId: string) => void;
-  setTrackMultiSelect: (enabled: boolean) => void;
-  setClipMultiSelect: (enabled: boolean) => void;
+  setAreaSelectMode: (enabled: boolean) => void;
   toggleTrackSelection: (trackId: string) => void;
   setExpandedTrackId: (trackId: string | null) => void;
   setSelectionMixOpen: (open: boolean) => void;
@@ -128,13 +212,18 @@ export const useTimelineUIStore = create<TimelineUIState>()(
   subscribeWithSelector((set, get) => ({
     cameraX: 0,
     zoomLevel: TIMELINE_DEFAULT_ZOOM_LEVEL,
-    trackHeight: TIMELINE_DEFAULT_TRACK_HEIGHT,
+    trackHeight:
+      typeof window === "undefined"
+        ? TIMELINE_DEFAULT_TRACK_HEIGHT
+        : readStoredTrackHeight(),
     selectedTrackIds: [],
     selectedClipId: null,
     selectedClipIds: [],
     selectedSectionId: null,
     selectedTempoMarkerId: null,
     selectedTimeSignatureMarkerId: null,
+    selectedMarkers: [],
+    markerSelectionAnchor: null,
     snapEnabled: TIMELINE_DEFAULT_SNAP_ENABLED,
     followPlayheadEnabled: TIMELINE_DEFAULT_FOLLOW_PLAYHEAD_ENABLED,
     midiLearnMode: null,
@@ -143,8 +232,7 @@ export const useTimelineUIStore = create<TimelineUIState>()(
     expandedTrackId: null,
     selectionMixOpen: false,
     missingMediaOpen: false,
-    trackMultiSelect: false,
-    clipMultiSelect: false,
+    areaSelectMode: false,
     viewMode: DEFAULT_VIEW_MODE,
     setViewMode: (viewMode) => {
       recordViewMode(viewMode);
@@ -184,10 +272,15 @@ export const useTimelineUIStore = create<TimelineUIState>()(
       }));
     },
     setTrackHeight: (trackHeight) => {
+      const previous = get().trackHeight;
       set((state) => ({
         trackHeight:
           typeof trackHeight === "function" ? trackHeight(state.trackHeight) : trackHeight,
       }));
+      const next = get().trackHeight;
+      if (next !== previous && Number.isFinite(next)) {
+        storeTrackHeight(next);
+      }
     },
     setSelectedTrackIds: (selectedTrackIds) => {
       set({
@@ -234,18 +327,39 @@ export const useTimelineUIStore = create<TimelineUIState>()(
       set({
         ...EMPTY_SELECTION,
         selectedTempoMarkerId,
+        markerSelectionAnchor: selectedTempoMarkerId
+          ? { kind: "tempo", id: selectedTempoMarkerId }
+          : null,
       });
     },
     selectTimeSignatureMarker: (selectedTimeSignatureMarkerId) => {
       set({
         ...EMPTY_SELECTION,
         selectedTimeSignatureMarkerId,
+        markerSelectionAnchor: selectedTimeSignatureMarkerId
+          ? { kind: "timeSignature", id: selectedTimeSignatureMarkerId }
+          : null,
+      });
+    },
+    setSelectedMarkers: (markers, anchor) => {
+      set((state) => ({
+        ...markerSelectionFields(markers),
+        markerSelectionAnchor: anchor ?? state.markerSelectionAnchor,
+      }));
+    },
+    toggleMarkerSelection: (marker) => {
+      set((state) => {
+        const current = selectedRulerMarkers(state);
+        const next = current.some((entry) => sameMarker(entry, marker))
+          ? current.filter((entry) => !sameMarker(entry, marker))
+          : [...current, marker];
+        return { ...markerSelectionFields(next), markerSelectionAnchor: marker };
       });
     },
     clearSelection: () => {
       // Soltar la seleccion sale tambien de los modos de sumar: si no, el
       // siguiente toque volveria a sumar sin que nadie lo haya pedido.
-      set({ ...EMPTY_SELECTION, trackMultiSelect: false, clipMultiSelect: false });
+      set({ ...EMPTY_SELECTION, areaSelectMode: false, markerSelectionAnchor: null });
     },
     /** Como `clearSelection`, pero no toca el estado si no había nada
      * seleccionado. El fondo del timeline llama a esto en CADA clic de salto y
@@ -259,7 +373,8 @@ export const useTimelineUIStore = create<TimelineUIState>()(
         state.selectedClipId === null &&
         state.selectedSectionId === null &&
         state.selectedTempoMarkerId === null &&
-        state.selectedTimeSignatureMarkerId === null
+        state.selectedTimeSignatureMarkerId === null &&
+        state.selectedMarkers.length === 0
       ) {
         return;
       }
@@ -282,6 +397,7 @@ export const useTimelineUIStore = create<TimelineUIState>()(
       set({
         ...EMPTY_SELECTION,
         selectedSectionId: sectionId,
+        markerSelectionAnchor: sectionId ? { kind: "section", id: sectionId } : null,
       });
     },
     setSnapEnabled: (snapEnabled) => {
@@ -310,10 +426,16 @@ export const useTimelineUIStore = create<TimelineUIState>()(
       set({ midiLearnMode });
     },
     setTrackReorderMode: (trackReorderMode) => {
-      set({ trackReorderMode });
+      set((state) => ({
+        trackReorderMode,
+        areaSelectMode: trackReorderMode ? false : state.areaSelectMode,
+      }));
     },
     toggleTrackReorderMode: () => {
-      set((state) => ({ trackReorderMode: !state.trackReorderMode }));
+      set((state) => ({
+        trackReorderMode: !state.trackReorderMode,
+        areaSelectMode: state.trackReorderMode ? state.areaSelectMode : false,
+      }));
     },
     setMarkerPositionEditorId: (markerPositionEditorId) => {
       set({ markerPositionEditorId });
@@ -344,11 +466,13 @@ export const useTimelineUIStore = create<TimelineUIState>()(
         expandedTrackId: selectionMixOpen ? null : state.expandedTrackId,
       }));
     },
-    setTrackMultiSelect: (trackMultiSelect) => {
-      set({ trackMultiSelect });
-    },
-    setClipMultiSelect: (clipMultiSelect) => {
-      set({ clipMultiSelect });
+    // Excluyente con reordenar: los dos se quedan el arrastre de un dedo
+    // sobre las cabeceras.
+    setAreaSelectMode: (areaSelectMode) => {
+      set((state) => ({
+        areaSelectMode,
+        trackReorderMode: areaSelectMode ? false : state.trackReorderMode,
+      }));
     },
     toggleTrackSelection: (trackId) => {
       set((state) => ({

@@ -14,6 +14,7 @@ use crate::state::DesktopSession;
 
 fn region(id: &str, start: f64, end: f64) -> SongRegion {
     SongRegion {
+        key_changes: Vec::new(),
         id: id.into(),
         name: id.into(),
         start_seconds: start,
@@ -24,6 +25,8 @@ fn region(id: &str, start: f64, end: f64) -> SongRegion {
         warp_source_bpm: None,
         master: SongMaster::default(),
         compact_column_width_rem: None,
+        chart: None,
+        voice_guide_count_style: None,
         structure: None,
     }
 }
@@ -88,6 +91,8 @@ fn song_with(regions: Vec<SongRegion>, clips: Vec<Clip>) -> Song {
             midi_enabled: true,
             collapsed: false,
             height_offset: None,
+            match_aliases: Vec::new(),
+            song_region_id: None,
         }],
         clips,
         midi_clips: vec![],
@@ -139,6 +144,7 @@ fn moving_the_last_song_first_carries_everything_inside_it() {
         id: "t3".into(),
         start_seconds: 16.0,
         bpm: 120.0,
+        ramp: false,
     }];
     song.section_markers = vec![section("s2", 10.0), section("s3", 20.0)];
     song.midi_clips = vec![MidiClip {

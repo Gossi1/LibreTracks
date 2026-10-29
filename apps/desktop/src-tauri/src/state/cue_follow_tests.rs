@@ -18,6 +18,7 @@ use crate::state::DesktopSession;
 
 fn region(id: &str, start: f64, end: f64) -> SongRegion {
     SongRegion {
+        key_changes: Vec::new(),
         id: id.into(),
         name: id.into(),
         start_seconds: start,
@@ -28,6 +29,8 @@ fn region(id: &str, start: f64, end: f64) -> SongRegion {
         warp_source_bpm: None,
         master: SongMaster::default(),
         compact_column_width_rem: None,
+        chart: None,
+        voice_guide_count_style: None,
         structure: None,
     }
 }
@@ -84,6 +87,8 @@ fn three_songs() -> Song {
             midi_enabled: true,
             collapsed: false,
             height_offset: None,
+            match_aliases: Vec::new(),
+            song_region_id: None,
         }],
         clips: vec![clip("c1", 1.0), clip("c2", 9.0), clip("c3", 17.0)],
         midi_clips: vec![],
@@ -258,6 +263,7 @@ fn moving_a_warped_song_keeps_the_cue_on_the_same_visible_beat() {
         id: "t".into(),
         start_seconds: 0.0,
         bpm: 120.0,
+        ramp: false,
     }];
     // r2 suena a 100 BPM y se estira a los 120 de la línea de tiempo.
     song.regions[1].warp_enabled = true;

@@ -10,6 +10,10 @@ asks to "create a new version" or "tag vX.Y.Z".
 - Scope of changes (use `git log <prev-tag>..HEAD` — do NOT trust memory).
 - Whether to push and create the remote tag (releases pipeline triggers on tag push), or stop at local commits.
 - Whether to bundle pending uncommitted work into a feature commit first.
+- Which announcement piece this release gets (step 11): a **feature video**
+  if it ships a new feature or another relevant user-visible change, a
+  **poster** if it is fixes and polish only. Decide it from the release notes,
+  and tell the user which one you picked.
 
 ## 1. Inspect what's actually changing
 
@@ -24,6 +28,20 @@ Cross-check against `docs/releases/<prev-tag>.md` — sometimes the prior
 release notes already covered commits made before the actual tag commit.
 The tag is the source of truth: anything in `git log <prev-tag>..HEAD`
 is fair game for the new release notes.
+
+**Features behind a flag.** `packages/shared/src/featureFlags.ts` lists
+features that are built but hidden (no UI at all while their flag is
+`false`). Check it every release: a feature planned for this version is
+turned on here, together with the guard test next to it
+(`featureFlags.test.ts`), in the release commit. Commits of a hidden feature
+do NOT go in the release notes. As of 1.15.0: `lyrics` (lyrics & chords in
+Live and the remote) and `songAnalysis` («Analizar canción…»: tempo, key and
+sections from the click, guide and audio) are on and ship in 1.15.0.
+`networkSessions` (LibreTracks apps joining a host over the LAN,
+`docs/plans/network-sessions`) and `songTemplates` (songs from a template,
+stems organised on drop, «one folder per song» layout) are off, planned for
+1.16.0. While off, their backend stays in place (the templates E2E drives it
+through test hooks); only the UI is hidden.
 
 ## 2. Commit pending work (optional)
 
@@ -174,6 +192,11 @@ It reads as major · 1000000 + minor · 1000 + a counter: `1.11.1` shipped as
 `1011002`, so `1.12.0` goes out as `1012000`. The only hard rule is that it
 must strictly increase.
 
+`android-release.yml` checks it against Play (`node scripts/google-play.mjs check`)
+before the NDK build, so a forgotten bump fails in the first minute instead of
+at upload. Locally the same check runs with the service-account key in
+`PLAY_SERVICE_ACCOUNT_JSON`.
+
 ### iOS needs nothing here
 
 `tauri.ios.conf.json` carries no version: `CFBundleShortVersionString` comes
@@ -236,19 +259,57 @@ the full universal build, run `cargo test -p libretracks-video` with
 `THIRD-PARTY-NOTICES.md`. On an mpv bump, check that the script's Swift-less
 patch still applies (it fails loudly if not).
 
-## 5. Update web docs (only if user-visible behavior changed)
+## 5. Update the user guide (mandatory when the UI changed)
 
-Files: `apps/website/src/content/docs/docs/index.md` and
-`apps/website/src/content/docs/es/docs/index.md`.
-
-Add or refine 1–2 lines about anything in the release that affects how
-users perceive the app (new always-visible features, important behavior
-changes). Skip pure refactors, internal perf, or features that aren't
-user-discoverable yet.
+The guide lives in `apps/website/src/content/docs/es/docs/` (Spanish) and
+`apps/website/src/content/docs/docs/` (English, mirrored page for page). It is
+a visual guide, button by button: every control is explained next to an
+annotated screenshot of the real app, and gestures that are hard to describe
+get a short clip. **A release that adds or changes something the user sees —
+a new button, menu entry, panel, dialog, gesture, or a control that moved —
+updates the guide in that same style.** A release whose new UI is not in the
+guide is not finished.
 
 Go through the release's user-facing commits one by one — it is easy to
-document the headline feature and miss the four smaller ones. Both language
-files must stay mirrored.
+document the headline feature and miss the four smaller ones. For each one:
+
+1. **Find its page.** Toolbar, timeline, side nav/library, settings and the
+   main screen live under `interface/`; workflows under `tasks/` and
+   `start/`; features with their own page (pitch & warp, pads, voice guide,
+   automation, remote, Live view, mobile) at the top level. A whole new
+   feature gets its own page, linked from the sidebar and from `index.mdx`.
+2. **Write the explanation** in the voice of the existing pages: what the
+   control does, where it is, and the exact gesture for every platform it
+   exists on (desktop click / right-click, mobile tap / long-press).
+3. **Add annotated screenshots.** New captures go in the guide harnesses,
+   never by hand, so the next re-shoot regenerates them:
+   - Desktop: a step in `tests/e2e/specs/guide-shots.e2e.ts` (`shot()` with
+     numbered boxes or a spotlight from `tests/e2e/utils/annotate.ts`,
+     anchored on `data-lt-tour` targets from
+     `features/tutorial/tourTargets.ts` — add a target if the new control has
+     none). Output: `apps/website/public/guide/desktop/` and `desktop-en/`.
+   - Mobile: a step in `tests/android/guide-shots/shots.ts`, on the Android
+     emulator (AVD `LT_Midi_Test`, debug APK — see the header of that file).
+     Output: `apps/website/public/guide/mobile/` and `mobile-en/`.
+   - Crop to the area being explained: the guide column is ~720-900 px wide
+     and a full window does not read there.
+4. **Add a short clip (5–15 s, no narration) when a still cannot show it:**
+   drags, gestures, anything that animates, a sequence of 2-3 clicks. Desktop
+   clips with `Recorder` (`tests/e2e/utils/record.ts`, see `metronome-settings`
+   or `marker-create` in guide-shots); mobile clips with the `screenrecord`
+   helper in `shots.ts` (see `track-select-mix`). Embed them like the existing
+   ones (`<video src="/guide/desktop/<name>.mp4" ...>`).
+5. **Re-shoot what the change made stale.** A control that moved or was
+   restyled leaves old images showing the old UI — grep the guide for the
+   image names of the area you touched and re-run those steps too.
+6. **Run both languages** (`LT_GUIDESHOTS_LANG=en` for the English set) and
+   regenerate the Guides page cards with `node scripts/guide-cards.mjs` if a
+   desktop image that has a card changed.
+
+Name images and clips after the FEATURE, not the release, so a re-shoot
+overwrites the same file and every page that references it stays current.
+Both language trees must stay mirrored. Skip pure refactors, internal perf,
+and features hidden behind a flag (step 1).
 
 ### Screenshots
 
@@ -401,7 +462,7 @@ fix it, or drop it from the release, before you tag.
 
 `cargo check --all-targets` on desktop does **not** compile anything behind
 `#[cfg(target_os = "android")]` (`platform/android_audio_devices.rs`,
-`platform/mobile_files.rs`), and `build-android` only runs on a tag push. So an
+`platform/mobile_files.rs`), and `android-release.yml` only runs by hand. So an
 Android-only compile error is invisible until you are mid-release.
 
 v1.10.0 hit exactly this: a field added to `DeviceInfo` was wired into the JUCE
@@ -449,10 +510,31 @@ git push origin v<NEW>
 ```
 
 Pushing the tag triggers the release pipeline (macOS bundle validation,
-native lib linking, downloads counters). It's hard to undo a *published*
-release, so the gate is: do the local commit + tag, and push as part of the
-same release request unless told otherwise — don't ask again mid-flow once
-the user has asked for a release.
+native lib linking, downloads counters). The pipeline ends in a **draft**
+release, not a published one (see "Publishing the draft" below), so a green
+run is not yet a release users can see. Gate: do the local commit + tag, and
+push as part of the same release request unless told otherwise — don't ask
+again mid-flow once the user has asked for a release.
+
+### Publishing the draft (the user's step, not yours)
+
+`publish-release` creates the GitHub release as a **draft** with every
+installer attached. Nothing sees a draft: the in-app update check reads
+`releases/latest` (drafts excluded) and the download page filters drafts out.
+That lets the whole CI run while the App Store and Google Play reviews are
+still pending.
+
+The user publishes it when the stores approve: GitHub → Releases → the draft
+→ "Publish release". That click is the go-live:
+
+- the in-app update modal starts offering the version;
+- `website-deploy.yml` fires on `release: published` and rebuilds the
+  download page (it used to be the `notify-website` job at the end of
+  `release.yml`).
+
+Do not publish the draft yourself unless the user explicitly asks. Re-running
+the pipeline (tag moved after a fix) replaces the previous draft, but it
+refuses to touch a release that is already published.
 
 Once the tag is pushed you own the pipeline until it's green: go straight to
 step 9 and stay on it (monitor → fix → move tag → repeat) until CI passes.
@@ -480,8 +562,9 @@ unfinished release. The loop is:
 4. Go back to step 1. Repeat until the pipeline succeeds.
 
 Note: only cancel for a *real* failure on a blocking job. A `continue-on-error`
-job going red (e.g. the `macos-15-intel` validation build) does NOT fail the
-release — don't cancel for those; let the run finish and publish.
+job going red does NOT fail the release — don't cancel for those; let the run
+finish and publish. (Since v1.14.0 a tag runs no such leg: the `macos-15-intel`
+validation build was dropped from releases, see below.)
 
 Auth — the GitHub token lives in the Windows Credential Manager; pull it from
 there. `gh auth login` may reject that token for missing the `read:org`
@@ -513,9 +596,8 @@ Jobs and what each one gates (as of v1.10.0):
 |-----|---------------------|
 | `test` | Yes — unit suites (JS + Rust + native ctest) on all three OSes. |
 | `e2e-windows` | **Disabled** (`if: false`) — see below. |
-| `build-release-assets` | Yes, except the `macos-15-intel` leg (`publish: false`). |
-| `build-android` | No — opt-in from `workflow_dispatch`; it produces signed Play artifacts but does not gate a desktop release. |
-| `publish-release` | Needs `test` and the publishable `build-release-assets` legs green. |
+| `build-release-assets` | Yes. Windows, universal macOS and Linux; all three publish. FFmpeg (macOS/Linux), libmpv (macOS) and the vcpkg packages (Windows) come from caches that `warm-release-caches.yml` keeps on `main` — a tag can't reuse another tag's caches. A "Cache not found" on those steps means the warm run is missing or its keys drifted from release.yml. |
+| `publish-release` | Needs `test` and the publishable `build-release-assets` legs green. Creates a **draft**; the user publishes it. |
 
 `e2e-windows` is a **separate job on purpose**. It used to be two steps at the
 end of `test`, both pinned behind `continue-on-error` because that job has no
@@ -565,26 +647,22 @@ To re-enable, **all three changes go together**: `if:` back to
 `startsWith(github.ref, 'refs/tags/v')`, delete `continue-on-error`, and put
 `e2e-windows` back in `publish-release`'s `needs`.
 
-Triage before "fixing": some jobs are `continue-on-error: true` (e.g. the
-`macos-15-intel` Intel validation build, `publish: false`) — those fail
-red but DO NOT block the release, which still publishes. Also separate a
-real code/workflow bug from a transient runner flake (DNS/network on a
-download step reads as a code error but isn't ours). Prefer a structural
-fix that removes the flaky work over a blind retry — e.g. the Intel runner
-was pulling the arm64 Rust std it never compiles with; scoping the target
-install per-runner deleted the download that flaked.
+Triage before "fixing": separate a real code/workflow bug from a transient
+runner flake (DNS/network on a download step reads as a code error but isn't
+ours). Prefer a structural fix that removes the flaky work over a blind retry
+— e.g. the Intel runner was pulling the arm64 Rust std it never compiles
+with; scoping the target install per-runner deleted the download that flaked.
 
-Known, still open (seen twice in v1.10.0): `macos-15-intel` dies within a
-second of `scripts/build-ffmpeg-universal.sh` starting, with
-`curl: (35) Recv failure: Connection reset by peer` fetching
-`https://ffmpeg.org/releases/ffmpeg-7.1.1.tar.xz`. The `macos-latest` leg runs
-the same script over the same URL and is fine, so it looks specific to the
-Intel runner's route to ffmpeg.org rather than to our code. It is
-`continue-on-error` + `publish: false`, so it does NOT block publishing —
-do not move the tag for it mid-release. If it becomes worth fixing, diagnose
-before adding `curl --retry`: a blind retry would paper over whatever the
-runner is actually hitting (rate limiting vs. no route), and the download is
-cheap to mirror or cache instead.
+**The `macos-15-intel` leg is no longer part of a release** (dropped after
+v1.14.0). It built an x86_64-only app that is never published — Intel Macs
+get the universal DMG from `macos-latest`, whose bundled dylibs step 4c checks
+for both slices — and it never launched it. It still cost ~27 minutes per
+tag: the slowest runner, building FFmpeg + libmpv + the app cold (caches are
+scoped to the tag ref, so no release ever reuses the previous one's), and the
+draft waited for it. It also had runner-specific flakes of its own
+(`curl: (35)` fetching ffmpeg.org, twice in v1.10.0). To check that the app
+still builds on an Intel host, run the Release workflow by hand from Actions
+with **macos_intel** ticked.
 
 Re-trigger after a fix: commit the fix, then MOVE the tag to the new
 commit and force-push it (the pipeline keys on the tag). The release-create
@@ -597,19 +675,19 @@ git tag -f v<NEW>
 git push origin v<NEW> --force
 ```
 
-### The tag also fires the two iOS workflows
+### The iOS and Android builds are started by hand
 
-A `v*` tag starts `ios-smoke.yml` (the unsigned AltStore IPA) and
-`ios-release.yml` (the signed App Store build) alongside the desktop release.
-Neither blocks the release, and neither uploads anything to Apple on its own:
+The tag only starts `release.yml`. `ios-smoke.yml` (the unsigned AltStore
+IPA), `ios-release.yml` (the signed App Store build) and `android-release.yml`
+(the signed Play build) are `workflow_dispatch` only: run them from the tag,
+`gh workflow run <file> --ref v<NEW>`. None of them blocks the desktop release:
 
 - `ios-release.yml` **skips itself with a warning** when the Apple secrets are
-  missing, and when they are present it builds, verifies and validates the IPA
-  but does **not** upload — uploading on a tag is opt-in through the repository
-  variable `IOS_UPLOAD_ON_TAG`.
-- To put the build in TestFlight, run *iOS Release (signed App Store build)*
-  by hand with `upload` ticked. Setup lives in
+  missing. With them it builds, verifies and validates the IPA, and its
+  `upload` input (on by default) sends it to TestFlight. Setup lives in
   [APPLE_SIGNING.md](./APPLE_SIGNING.md).
+- `android-release.yml` checks the `versionCode` against Play first, then
+  builds the AAB and sends it to the chosen `track` (see step 14).
 
 For a release that goes to the App Store, upload the build made **from the
 tag**, not one from a later commit on `main`: the version App Store Connect
@@ -629,12 +707,182 @@ graphify update .
 (AST-only, no API cost. Per the project CLAUDE.md, run this after touching
 code so future sessions stay in sync.)
 
-## 11. Make the release posters (mandatory, Spanish and English per release)
+## 11. Make the announcement piece: feature video OR poster (mandatory)
 
-Every release gets two matching square announcement images, generated with the
-poster tool: the Spanish one goes with the Facebook draft (step 12), and the
-English one goes with the default Reddit draft (step 13). They share the same
-theme, screenshot and layout; only the visible copy changes.
+Every release gets ONE announcement piece, chosen in step 0:
+
+- **New feature or relevant user-visible change → a feature video** (11a),
+  Spanish only for now. No poster for that release.
+- **Fixes, performance and polish only → the posters** (11b), as before.
+
+When in doubt, it is a video: a feature announced only with a picture gets
+answered with "¿cómo se usa?".
+
+### 11a. Feature video (Spanish)
+
+A short narrated video that shows the new feature working in the real app
+and explains how to use it: where it is, what to press, what happens. It is
+the release's announcement, not a full tutorial — aim for 1–2 minutes, one
+release headline (or two or three closely related ones), and nothing else.
+
+**Which platforms it shows** follows where the feature exists — check the
+platform tags of its bullets in `docs/releases/v<NEW>.md` and the code:
+
+- Desktop and mobile → the **desktop part first, then the mobile part**,
+  with a title card in between ("Y en el móvil").
+- Only desktop → only desktop. Only mobile → only mobile.
+
+Structure: intro card (feature name + one line of what it is for) → the
+scenes, one action per scene, each with its sentence of narration → **fixes
+card** → end card (`libretracks.com` + where to download).
+
+The **fixes card** lists the release's user-visible fixes (the ones in the
+"🔧 Y además" bullet and the Facebook post's "Correcciones" block), one short
+line each, on screen long enough to read. The narration does not read them
+out: one sentence for the whole card ("Y además, un buen montón de
+correcciones…") is enough. The user wants them seen, not explained. In the
+desktop recorder it is a `listCard()` fed by a `FIXES` list. The narration explains the HOW with
+the same gestures as the release notes; on mobile it says tap / long-press,
+not click.
+
+It is built with the same pipeline as the "Primeros pasos" tutorial
+(`scripts/tutorial-video/`, recorded scenes + edge-tts narration + burnt-in
+subtitles), so it looks and sounds like the tutorials already on the site:
+
+```bash
+# 1. The script: one scene per action, ids in playback order (desktop scenes
+#    first, then mobile). Voice es-ES-AlvaroNeural, like primeros-pasos.es.json.
+#    Versioned next to the tutorial scripts:
+#    scripts/tutorial-video/novedades-<NEW>.es.json
+# 2. Narration (writes narration/<id>.mp3 + durations.json, which the
+#    recorders read so each scene lasts at least as long as its sentence):
+node scripts/tutorial-video/tts.mjs scripts/tutorial-video/novedades-<NEW>.es.json \
+  marketing/video-<NEW>/narration
+# 3a. Desktop scenes, from the compiled app (npm run build:desktop:native first):
+LT_RELEASEVIDEO=1 LT_TUTORIAL_DIR=marketing/video-<NEW> LT_SHOTS_SESSION=<COPY of a real session> \
+  npx wdio run tests/e2e/wdio.conf.ts --spec tests/e2e/specs/release-video.e2e.ts \
+  --mochaOpts.timeout 1800000
+# 3b. Mobile scenes, on the Android emulator (same AVD and debug APK as the
+#     mobile tutorial and the guide shots):
+LT_TUTORIAL_DIR=marketing/video-<NEW> node tests/android/release-video/record.ts
+# 4. Join scenes + voice + app audio + subtitles:
+node scripts/tutorial-video/compose.mjs scripts/tutorial-video/novedades-<NEW>.es.json \
+  marketing/video-<NEW> marketing/video-<NEW>/novedades-<NEW>.mp4
+# 5. Take out the dead air (mandatory): the recordings pad every scene to its
+#    narration and hold after clicks and loads, which adds up to a minute of
+#    silent, still picture. This cuts only where there is no sound AND nothing
+#    moves, so no sentence or app sound is split. The .tight.mp4 is the one
+#    that gets published.
+node scripts/tutorial-video/tighten.mjs marketing/video-<NEW>/novedades-<NEW>.mp4 \
+  marketing/video-<NEW>/novedades-<NEW>.tight.mp4
+```
+
+Both recorders write into the same `marketing/video-<NEW>/scenes/`, so one
+script and one `compose.mjs` run produce the whole video in order.
+
+Two things in the script JSON keep the voice and the subtitles right:
+
+- **"display"**: write names and versions the way the voice should say them
+  and map them back for the subtitles, e.g.
+  `"display": { "Libre Tracks": "LibreTracks", "uno punto catorce punto cero": "1.14.0" }`.
+  The voice mangles "LibreTracks" and reads "1.14" as "una catorce"; the
+  version is always said and shown in full (1.14.0).
+- **per scene "subtitles"**: `"top"` when the scene shows a panel at the
+  bottom of the app (the arrangement editor), `"mobile"` for every phone
+  scene, which puts them in the black band above the letterboxed phone instead
+  of over its bottom bar.
+
+Recorder traps already paid for: a pause after a click (`settleMs`) records no
+frames, so a menu that must be read needs `rec.hold()`; a WebDriver click on a
+menu item that opens a submenu can land on the submenu's first item (use a
+plain DOM click); handles that capture the pointer (song fades, song edges)
+need `rec.dragToCdp`; and a song with an arrangement applied refuses edits, so
+demo other edits on a song without one.
+
+A scene that waits for something slow (measuring songs, loading audio) still
+records the whole wait, which is moving (a progress bar) and so survives
+`tighten.mjs`. Trim that scene's MP4 by hand before `compose.mjs` (keep the
+start and the result, drop the middle). In 1.14.0, «Nivelar canciones» went
+from 97 s to 17 s that way.
+
+**What the video covers.** Every user-visible novelty of the release, not
+just the headline: go through the release notes bullet by bullet.
+
+**Record the first-run state, not your machine's.** A one-time step that a
+new user will meet (a download, a permission, a setup notice) must appear in
+the video and be explained, including what happens if they skip it, even
+though the development machine already went through it. In 1.15.0 the
+speech recognition model for «Analizar canción» was already on disk, so the
+recorder sets the model file aside in `before()`, the scene shows the
+download notice, says what the model is for and what is lost without it,
+downloads it on camera (the wait is cut), and `after()` puts the original
+back if the download did not finish.
+
+**A native `<select>` never shows its list in a frame**: WebView2 draws it
+outside the page. To show the options, step through them with
+`selectByIndex()` (each one shows in the field) and put the user's value back;
+the app's own context submenus are DOM and do show.
+
+**No debug APK? Record the phone layout from the desktop app.** The frontend
+switches to its phone layout from an Android user agent, so CDP
+`Emulation.setUserAgentOverride` + `setTouchEmulationEnabled` + a landscape
+phone `setDeviceMetricsOverride` (915x412 @2.6), then a reload and the session
+reopened, give the real phone UI on the desktop engine. Gestures that only
+answer to touch (area selection) need `Input.dispatchTouchEvent`. Record that
+scene LAST (it changes the page for good) and letterbox it to 16:9, with
+`"subtitles": "mobile"`. 1.15.0 did this because whisper-rs-sys cannot be
+cross-compiled for Android on Windows; desktop-only backends mean anything that
+needs the phone's own storage or hardware still needs the emulator.
+
+**Modifier clicks (Ctrl/Shift) go in ONE `performActions` call** with the key
+and the pointer as two sources. `Recorder.clickAt()` ends with `perform()`,
+which releases every key, so a Ctrl pressed before two `clickAt()` calls only
+reaches the first click (1.15.0 selected two markers out of three). A feature
+that exists on desktop AND mobile is shown once (desktop) unless the mobile
+gesture is genuinely different; mobile-only features get their own mobile
+scene. For a mobile feature that is only a menu away, a short scene saying
+where it is beats walking through the whole flow. 1.14.0 ended at ~4 min
+after the dead air was cut; that is fine for a release with many features.
+
+The two recorders are **rewritten every release** for that release's feature
+(git history keeps the previous ones). Build them from the tutorial
+recorders, which already solve every hard part: `scene()`, `titleCard()` and
+`listen()` (app audio through `loopback.py`) in
+`tests/e2e/specs/tutorial-video.e2e.ts` and
+`tests/android/tutorial-video/record.ts`; visible touches
+(`setTouchRipple`) and the rest of the device handling in
+`tests/android/lib/device.ts`. Keep their partial runs (`LT_TUTORIAL_SCENES`
+on desktop; `--dry` and scene ids on mobile): get each scene right with them
+before recording the lot.
+
+Mobile traps already paid for (details in the headers of those files):
+
+- The app runs **landscape** on the phone; record it that way.
+- The emulator's own audio is unusable. If a mobile scene plays music, give
+  it the desktop twin's recording with `scripts/tutorial-video/borrow-audio.mjs`
+  (its `TWINS` table maps phone scene → desktop clip).
+- `screenrecord` must be stopped on the device before the local adb, or the
+  MP4 has no index.
+- The app language is set with `cmd locale set-app-locales`, not through
+  the settings.
+
+The output stays in `marketing/video-<NEW>/` (gitignored). Same rules as the
+poster: **watch the whole video before handing it back** (a scene that
+recorded an empty app or a wrong state only shows up there), use a real
+session — never fabricated content — and check no frame shows personal data
+(paths with the account name, file dialogs).
+
+Hand back the MP4 together with the Facebook draft (step 12). The video is
+16:9; if a vertical cut for Reels is wanted, it is laid out with the 9:16
+templates of the tutorial kit (`scripts/tutorial-kit/`).
+
+### 11b. Posters (fixes-only releases, Spanish and English)
+
+A release without a feature video gets two matching square announcement
+images, generated with the poster tool: the Spanish one goes with the Facebook
+draft (step 12), and the English one goes with the default Reddit draft (step
+13). They share the same theme, screenshot and layout; only the visible copy
+changes.
 
 The layout is 1080x1080 but the capture runs at 2x, so the PNG lands at
 2160x2160 (~1.2 MB). That density is for the SCREENSHOTS, not the type: an app
@@ -760,8 +1008,9 @@ End-user audience, natural language, minimal emojis, no version-bump
 jargon. Lead with the most relatable improvement (loading speed, new
 in-app behavior), not internals. Spanish by default unless told otherwise.
 Do NOT post it anywhere; just hand back the text. Hand it back together
-with the poster from step 11 — the post and the image go out as one piece,
-so the poster's headline and the post's first bullet should agree.
+with the piece from step 11 (the feature video or the Spanish poster) — the
+post and the piece go out together, so the video's headline feature (or the
+poster's headline) and the post's first bullet should agree.
 
 Use this exact template (matches the channel's voice):
 
@@ -774,15 +1023,20 @@ Hemos sacado una nueva versión v<NEW> estos han sido los cambios:
 - <emoji> <bullet 4>
 - <emoji> <bullet 5 — optional, max ~5 bullets>
 
+🔧 Correcciones:
+- <fix 1 — one short line>
+- <fix 2>
+- <fix 3 — max ~5 fixes>
+
 Puedes descargar la nueva versión aqui:
 https://libretracks.com/es/download/
 ```
 
 Notes:
-- **Every bullet leads with an emoji.** Reuse the one the same item already
+- **Every change bullet leads with an emoji.** Reuse the one the same item already
   carries in the Spanish section of `docs/releases/v<NEW>.md` so the post and
-  the in-app modal stay visually consistent. This applies to the bullets only —
-  the greeting, the closing line and the URL stay plain.
+  the in-app modal stay visually consistent. This applies to the change bullets only —
+  the greeting, the fix lines, the closing line and the URL stay plain.
 - Bullets are user-facing benefits, lifted from the Spanish section of
   `docs/releases/v<NEW>.md` but rewritten for a conversational tone.
 - **Keep the "how" for new features**, shortened to fit the post: the same
@@ -791,6 +1045,16 @@ Notes:
   a feature without saying where it is gets answered with "¿dónde está?".
 - Keep accents on key words ("rápida", "más", "directo"), but it's OK to
   leave a few off — the original channel does too. Don't over-correct.
+- **Always include the "🔧 Correcciones" block** when the release fixed
+  anything users could notice. Source: the bug fixes folded into the
+  "🔧 Y además" item of `docs/releases/v<NEW>.md` plus `fix(...)` commits
+  since the previous tag (`git log v<PREV>..v<NEW> --oneline | grep fix`).
+  One short line per fix, no emoji (the block header carries it), no "how",
+  no internals — say what the user notices now ("El botón Anterior vuelve a
+  la canción anterior"), not what was wrong in the code. Pick the ~5 most
+  noticeable; new small features from "Y además" do not go here. Call it
+  "Correcciones", never "Arreglos" — that word is a feature name since 1.14.0.
+  Omit the block only if the release has no user-visible fix.
 - Download URL is the localized Spanish page: `/es/download/`, not `/downloads`.
 - No closing line, no signature, no hashtags. The template ends at the URL.
 
@@ -836,7 +1100,7 @@ exist because of a specific failure, not as a style preference:
   Facebook whatever the clipboard happens to hold, which depends on the app it
   was copied from; attaching hands it the PNG. Step 11 renders at 2x precisely
   so the app's UI text stays legible, and that is what an extra re-encode
-  costs.
+  costs. A feature video is uploaded the same way: attach the MP4 file.
 
 Order: attach the PNG → paste the body → publish. Nothing should need fixing
 by hand afterwards.
@@ -857,7 +1121,11 @@ node scripts/announce/reddit-post.mjs --version <NEW> --lang es
 node scripts/announce/reddit-post.mjs --version <NEW> --plain    # rich text editor
 ```
 
-It prints the title, the poster to attach and the body. It has no network code
+It prints the title, the poster to attach and the body. In a release that
+got a feature video instead of posters (step 11a) there is no English poster
+and the video is in Spanish: post the English draft as a text post with the
+links and no media; attach the video only to a Spanish-language post
+(`--lang es`). It has no network code
 and no credentials: the post goes up by hand.
 
 The generator itself is not in the repo — `scripts/announce/` is gitignored,
@@ -907,6 +1175,66 @@ end up with literal `**` on screen. `--plain` emits the same text without the
 emphasis for that case; the default output is for the markdown editor. Look at
 the preview before submitting, either way.
 
+## 14. Hand back the store release notes (Google Play and App Store)
+
+Every release that goes to the stores needs its "What's new" text for both,
+in Spanish and English. They go in `marketing/stores-<NEW>/` (gitignored) and
+are handed back in the reply, ready to paste. They are NOT the release notes:
+only what reaches phones and tablets (no Windows/macOS/Linux-only items, no
+installer or desktop window changes) and much shorter.
+
+**Google Play.** Limit **500 characters per language**, counted on the text
+inside the tags. Play Console takes every language in one paste with its
+locale tags, so hand it back in exactly this shape
+(`marketing/stores-<NEW>/play-release-notes.txt`):
+
+```
+<es-ES>
+Novedades de la <NEW>:
+• ...
+</es-ES>
+<en-US>
+What's new in <NEW>:
+• ...
+</en-US>
+```
+
+- One line per item, starting with `•`; no emojis, no markdown (Play shows it
+  as plain text).
+- The new features first, with the gesture when it is a menu away
+  (`Mantén pulsada la canción → "Arreglo"`), labels exactly as the app shows
+  them.
+- Check the length before handing it back:
+  `node -e "console.log([...require('fs').readFileSync(f,'utf8').trim()].length)"`
+  on each language's text. A note over 500 is rejected by the console.
+- If the listing gets more languages, add their block with Play's locale code
+  (`<pt-BR>`, `<fr-FR>`…); a language without a block falls back to the
+  default one.
+
+**App Store.** Limit 4000 characters per language, entered separately per
+localization in App Store Connect ("What's New in This Version"), so no tags:
+`appstore-es.txt` and `appstore-en.txt`. There is room for one short paragraph
+per feature with its "how"; mention iOS-specific changes (keeps playing when
+minimized, Lightning adapter for video) and leave out Android-only ones.
+
+**Mobile before desktop.** When the apps go to review before the desktop
+release (review takes days), push `main` WITHOUT the tag and build the store
+artifacts by hand: *Android Release* (`android-release.yml`) builds the signed
+AAB and sends it to the chosen Play `track`, and *iOS Release*
+(`ios-release.yml`) with `upload` sends the IPA to TestFlight. Neither is part
+of `release.yml`, so the desktop release never waits for them.
+
+The Play upload goes through `scripts/google-play.mjs` (service account
+`github-play-upload@libretracks.iam.gserviceaccount.com`, secret
+`PLAY_SERVICE_ACCOUNT_JSON`). The default `track: production` uploads the AAB
+and creates the production release as a **draft** in Play Console: paste
+`play-release-notes.txt` into it there. `library` only uploads the AAB (then
+*Production → Create new release → Add from library* by hand), and a testing
+track (`internal`, `alpha`, `beta`) creates a release that rolls out at once. Submitting for review in Play Console /
+App Store Connect is done by hand.
+When desktop ships, tag that same commit `v<NEW>` so the three platforms carry
+the same build.
+
 ---
 
 ## Common pitfalls
@@ -930,6 +1258,10 @@ the preview before submitting, either way.
 - Shipping a poster that repeats the previous release's look — the whole
   point of the theme rotation is that each announcement looks new. If the
   themes start feeling used up, add one (step 11).
+- Announcing a new feature with a poster. A feature release gets a video
+  (step 11a), shown on every platform the feature exists on, desktop first.
+- Shipping new UI with the guide still showing the old one. A new or moved
+  control means new annotated screenshots and, if it moves, a clip (step 5).
 - Publishing a poster without opening the PNG. Overlapping text, a cropped
   app window and a wrapped feature column all render fine and only show up
   when you look.

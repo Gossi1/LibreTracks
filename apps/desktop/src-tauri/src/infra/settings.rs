@@ -1,5 +1,6 @@
 use std::{collections::HashMap, fs, io, path::{Path, PathBuf}, sync::Mutex};
 
+use libretracks_project::SongImportTrackMode;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 
@@ -90,6 +91,18 @@ fn default_song_jump_trigger() -> String {
 
 fn default_song_jump_bars() -> u32 {
     4
+}
+
+/// Default length of «Fade out y parar»: the 5 s Playback (MultiTracks) uses
+/// for its own end-of-song fade.
+pub const DEFAULT_FADE_OUT_STOP_SECONDS: f64 = 5.0;
+
+fn default_library_mode() -> String {
+    "folders".into()
+}
+
+fn default_fade_out_stop_seconds() -> f64 {
+    DEFAULT_FADE_OUT_STOP_SECONDS
 }
 
 fn default_song_transition_mode() -> String {
@@ -249,6 +262,10 @@ pub struct AppSettings {
     pub voice_guide_lead_bars: i32,
     #[serde(default = "default_voice_guide_count_in_enabled")]
     pub voice_guide_count_in_enabled: bool,
+    /// How the count-in is laid out ("1 2 3 4", "1 · 2 · | 1 2 3 4", half
+    /// time). Each song may override it (`SongRegion.voice_guide_count_style`).
+    #[serde(default)]
+    pub voice_guide_count_style: libretracks_core::VoiceGuideCountStyle,
     #[serde(default = "default_voice_guide_language")]
     pub voice_guide_language: String,
     #[serde(default)]
@@ -294,6 +311,18 @@ pub struct AppSettings {
     pub song_jump_bars: u32,
     #[serde(default = "default_song_transition_mode")]
     pub song_transition_mode: String,
+    /// Which library the sidebar shows: "folders" (browse folders of the
+    /// user's disk, the default) or "classic" (the session's imported assets
+    /// with virtual folders, as before).
+    #[serde(default = "default_library_mode")]
+    pub library_mode: String,
+    /// Disk folders added to the folder library ("places"). Global, not per
+    /// session: the same sample folders serve every session.
+    #[serde(default)]
+    pub library_places: Vec<String>,
+    /// Duration of the «Fade out y parar» live action, in seconds.
+    #[serde(default = "default_fade_out_stop_seconds")]
+    pub fade_out_stop_seconds: f64,
     #[serde(default = "default_vamp_mode")]
     pub vamp_mode: String,
     #[serde(default = "default_vamp_bars")]
@@ -305,6 +334,18 @@ pub struct AppSettings {
     /// user queued for that boundary still happens.
     #[serde(default)]
     pub pause_at_song_end: bool,
+    /// "Vamp between songs": at the end of each song the transport waits as
+    /// with `pause_at_song_end`, but the click keeps going at that song's tempo
+    /// and the pad keeps sounding until the user plays the next song. Off by
+    /// default.
+    #[serde(default)]
+    pub vamp_between_songs: bool,
+    /// Where the track and folder meters measure (`postFader`, the default and
+    /// Ableton's choice; `postPan`; `preFader`). Global, not per session: it is
+    /// how this user reads meters, not a property of a song. The master meter
+    /// is not affected.
+    #[serde(default)]
+    pub track_meter_mode: lt_audio_engine_v2::TrackMeterMode,
     #[serde(default = "default_timeline_navigation_scheme")]
     pub timeline_navigation_scheme: String,
     #[serde(default = "default_timeline_playhead_follow_mode")]
@@ -314,8 +355,26 @@ pub struct AppSettings {
     /// keeping one lane per instrument across every song. When false each
     /// imported song brings its own tracks, even if two songs both call a track
     /// "Bateria" — what users who order their set song by song expect.
+    ///
+    /// Superseded by `song_track_layout`, which adds "a folder per song". Kept,
+    /// and kept in step with it by [`AppSettings::sync_legacy_track_layout`], so a
+    /// settings file still reads right in a version from before the layout.
     #[serde(default = "default_import_merge_matching_tracks")]
     pub import_merge_matching_tracks: bool,
+    /// Where each song's tracks go when a song is imported or laid out from a
+    /// template: `"shared"` (one lane per instrument for every song),
+    /// `"songFolder"` (a folder per song) or `"separate"` (per-song tracks at
+    /// the root). `None` — every settings file written before the field — is
+    /// read from `import_merge_matching_tracks`; see
+    /// [`AppSettings::track_layout`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub song_track_layout: Option<String>,
+    /// The template a new song is laid out from, and that organises the stems
+    /// dropped into it: `"builtin:band"` or the path of a `.lttemplate`. `None`
+    /// (the default) = no template, and new songs and drops behave as they
+    /// always did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_song_template: Option<String>,
     /// When true (default), a track created without an explicit colour gets one
     /// from the timeline palette, cycling through it so two tracks made in a
     /// row never share a colour. Off, new tracks keep the historical single
@@ -429,6 +488,7 @@ impl Default for AppSettings {
             voice_guide_volume: default_voice_guide_volume(),
             voice_guide_lead_bars: default_voice_guide_lead_bars(),
             voice_guide_count_in_enabled: default_voice_guide_count_in_enabled(),
+            voice_guide_count_style: libretracks_core::VoiceGuideCountStyle::default(),
             voice_guide_language: default_voice_guide_language(),
             pad_enabled: false,
             pad_id: String::new(),
@@ -444,12 +504,19 @@ impl Default for AppSettings {
             song_jump_trigger: default_song_jump_trigger(),
             song_jump_bars: default_song_jump_bars(),
             song_transition_mode: default_song_transition_mode(),
+            fade_out_stop_seconds: default_fade_out_stop_seconds(),
+            library_mode: default_library_mode(),
+            library_places: Vec::new(),
             vamp_mode: default_vamp_mode(),
             vamp_bars: default_vamp_bars(),
             pause_at_song_end: false,
+            vamp_between_songs: false,
+            track_meter_mode: lt_audio_engine_v2::TrackMeterMode::PostFader,
             timeline_navigation_scheme: default_timeline_navigation_scheme(),
             timeline_playhead_follow_mode: default_timeline_playhead_follow_mode(),
             import_merge_matching_tracks: default_import_merge_matching_tracks(),
+            song_track_layout: None,
+            default_song_template: None,
             auto_color_new_tracks: default_auto_color_new_tracks(),
             auto_save_enabled: default_auto_save_enabled(),
             auto_save_interval_minutes: default_auto_save_interval_minutes(),
@@ -481,6 +548,30 @@ impl Default for AppSettings {
 /// out in English on a Spanish phone that had never touched the setting. Not
 /// persisted: it is a fact about the running UI, not a preference.
 static DISPLAYED_UI_LANGUAGE: Mutex<Option<String>> = Mutex::new(None);
+
+impl AppSettings {
+    /// The track layout in force. A value this version does not know (written
+    /// by a newer one) falls back to the old switch rather than to a guess.
+    pub fn track_layout(&self) -> SongImportTrackMode {
+        match self.song_track_layout.as_deref() {
+            Some("shared") => SongImportTrackMode::MergeIntoExisting,
+            Some("separate") => SongImportTrackMode::KeepSeparate,
+            Some("songFolder") => SongImportTrackMode::SongFolder,
+            _ if self.import_merge_matching_tracks => SongImportTrackMode::MergeIntoExisting,
+            _ => SongImportTrackMode::KeepSeparate,
+        }
+    }
+
+    /// Bring the old merge switch in line with the layout the user chose, so
+    /// an older version reading this file keeps merging only under "shared".
+    /// Called on every save: the UI writes the layout, never the switch.
+    pub fn sync_legacy_track_layout(&mut self) {
+        if self.song_track_layout.is_some() {
+            self.import_merge_matching_tracks =
+                self.track_layout() == SongImportTrackMode::MergeIntoExisting;
+        }
+    }
+}
 
 pub fn set_displayed_ui_language(language: &str) {
     let language = language.trim().to_ascii_lowercase();
@@ -665,7 +756,11 @@ pub fn save_app_settings(app: &AppHandle, settings: &AppSettings) -> Result<Path
         fs::create_dir_all(parent_dir)?;
     }
 
-    let contents = serde_json::to_string_pretty(settings)
+    // Only the file needs the old switch in step: this process reads the
+    // layout through `track_layout`, which prefers the new field.
+    let mut settings = settings.clone();
+    settings.sync_legacy_track_layout();
+    let contents = serde_json::to_string_pretty(&settings)
         .map_err(|error| io::Error::other(error.to_string()))?;
     fs::write(&settings_path, contents)?;
     Ok(settings_path)
@@ -689,6 +784,33 @@ mod tests {
         assert_eq!(displayed_ui_language().as_deref(), Some("es"));
         set_displayed_ui_language("");
         assert_eq!(displayed_ui_language(), None);
+    }
+
+    /// The meter point defaults to post-fader (Ableton), also for a settings
+    /// file written before the setting existed, and persists as camelCase.
+    #[test]
+    fn track_meter_mode_defaults_to_post_fader_and_persists() {
+        use lt_audio_engine_v2::TrackMeterMode;
+        assert_eq!(
+            AppSettings::default().track_meter_mode,
+            TrackMeterMode::PostFader
+        );
+
+        let legacy: AppSettings = serde_json::from_str("{}").expect("legacy settings");
+        assert_eq!(legacy.track_meter_mode, TrackMeterMode::PostFader);
+
+        let saved = AppSettings {
+            track_meter_mode: TrackMeterMode::PreFader,
+            ..AppSettings::default()
+        };
+        let json = serde_json::to_value(&saved).expect("serialize");
+        assert_eq!(json["trackMeterMode"], "preFader");
+        let back: AppSettings = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back.track_meter_mode, TrackMeterMode::PreFader);
+
+        let post_pan: AppSettings =
+            serde_json::from_str(r#"{"trackMeterMode":"postPan"}"#).expect("postPan");
+        assert_eq!(post_pan.track_meter_mode, TrackMeterMode::PostPan);
     }
 
     #[test]
@@ -789,6 +911,49 @@ mod tests {
         let settings: AppSettings =
             serde_json::from_str(r#"{ "importMergeMatchingTracks": false }"#).expect("explicit");
         assert!(!settings.import_merge_matching_tracks);
+    }
+
+    #[test]
+    fn track_layout_is_read_from_the_old_merge_switch_until_one_is_chosen() {
+        let settings: AppSettings = serde_json::from_str("{}").expect("defaults");
+        assert_eq!(settings.track_layout(), SongImportTrackMode::MergeIntoExisting);
+
+        let settings: AppSettings =
+            serde_json::from_str(r#"{ "importMergeMatchingTracks": false }"#).expect("old off");
+        assert_eq!(settings.track_layout(), SongImportTrackMode::KeepSeparate);
+
+        // The layout, once chosen, wins over the old switch.
+        let settings: AppSettings = serde_json::from_str(
+            r#"{ "importMergeMatchingTracks": true, "songTrackLayout": "songFolder" }"#,
+        )
+        .expect("layout");
+        assert_eq!(settings.track_layout(), SongImportTrackMode::SongFolder);
+
+        // A layout from a newer version falls back to the switch.
+        let settings: AppSettings = serde_json::from_str(
+            r#"{ "importMergeMatchingTracks": false, "songTrackLayout": "fromTheFuture" }"#,
+        )
+        .expect("unknown layout");
+        assert_eq!(settings.track_layout(), SongImportTrackMode::KeepSeparate);
+    }
+
+    #[test]
+    fn saving_a_layout_keeps_the_old_switch_meaning_the_same() {
+        let mut settings = AppSettings::default();
+        settings.song_track_layout = Some("songFolder".into());
+        settings.sync_legacy_track_layout();
+        assert!(!settings.import_merge_matching_tracks);
+
+        settings.song_track_layout = Some("shared".into());
+        settings.sync_legacy_track_layout();
+        assert!(settings.import_merge_matching_tracks);
+
+        // Without a layout the switch is the user's own and is left alone.
+        let mut settings = AppSettings::default();
+        settings.import_merge_matching_tracks = false;
+        settings.sync_legacy_track_layout();
+        assert!(!settings.import_merge_matching_tracks);
+        assert_eq!(settings.song_track_layout, None);
     }
 
     #[test]

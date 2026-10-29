@@ -964,6 +964,13 @@ void EngineImpl::service_control_thread_tasks() {
             bungee_voices_->rebuild_for_seek_async(
                 target, *session_, *source_manager_);
         }
+        const Frame prepared_target = mixer_->take_pending_prepared_jump();
+        if (prepared_target != Mixer::kNoJumpPending
+            && bungee_voices_ && bungee_voices_->is_available()
+            && session_ && source_manager_) {
+            bungee_voices_->enroll_missing_voices_async(
+                prepared_target, *session_, *source_manager_);
+        }
     }
 }
 
@@ -1147,6 +1154,7 @@ std::string EngineImpl::get_snapshot() const {
         snap.mixer_scheduled_jump_executed_count =
             mixer_->scheduled_jump_executed_count();
         snap.mixer_song_end_pause_count = mixer_->song_end_pause_count();
+        snap.mixer_song_gap_vamp_active = mixer_->song_gap_vamp_active();
     }
 
     if (prep_queue_) {
@@ -1876,6 +1884,8 @@ Result<void> EngineImpl::dispatch_command(const EngineCommand& cmd) {
             // clips were built at LoadSession / SeekAbsolute time, so Play
             // is now a pure clock advance with no pitch-priming work.
             const auto pos = clock_->position();
+            // Play is how the vamp between songs hands over to the next song.
+            if (mixer_) mixer_->end_song_gap_vamp();
             clock_->play();
             // Tell the background decode/cache-write paths to back off the disk
             // so they don't starve the live block-fill stream (see io_throttle.h).
@@ -2160,6 +2170,7 @@ Result<void> EngineImpl::dispatch_command(const EngineCommand& cmd) {
             voice_guide_config_.output_route = c.route.empty() ? std::string("monitor") : c.route;
             voice_guide_config_.lead_bars = std::clamp(c.lead_bars, 1, 4);
             voice_guide_config_.count_in_enabled = c.count_in_enabled;
+            voice_guide_config_.count_style = voice_guide_count_style_from_int(c.count_style);
             if (mixer_) mixer_->set_voice_guide_config(voice_guide_config_);
             return Result<void>::ok();
         }
@@ -2193,6 +2204,25 @@ Result<void> EngineImpl::dispatch_command(const EngineCommand& cmd) {
         }
         else if constexpr (std::is_same_v<T, CmdSetPauseAtSongEnd>) {
             if (mixer_) mixer_->set_pause_at_song_end(c.enabled);
+            return Result<void>::ok();
+        }
+        else if constexpr (std::is_same_v<T, CmdSetSongGapVamp>) {
+            if (mixer_) mixer_->set_song_gap_vamp(c.enabled);
+            return Result<void>::ok();
+        }
+        else if constexpr (std::is_same_v<T, CmdEndSongGapVamp>) {
+            if (mixer_) mixer_->end_song_gap_vamp();
+            return Result<void>::ok();
+        }
+        else if constexpr (std::is_same_v<T, CmdSetTrackMeterMode>) {
+            // Un atomico que el hilo de audio lee una vez por bloque: sin
+            // locks ni reservas de memoria.
+            if (mixer_) {
+                mixer_->set_track_meter_mode(
+                    c.mode == 1 ? TrackMeterMode::PostPan
+                    : c.mode == 2 ? TrackMeterMode::PreFader
+                    : TrackMeterMode::PostFader);
+            }
             return Result<void>::ok();
         }
         else if constexpr (std::is_same_v<T, CmdLoadPadClip>) {
@@ -2251,6 +2281,11 @@ Result<void> EngineImpl::dispatch_command(const EngineCommand& cmd) {
                     if (auto prepared = prearmed_jumps_->take_ready(key)) {
                         bungee_voices_->swap_in_prepared_voices(
                             prepared->extract_voice_map());
+                        // The set only covers clips audible at the target;
+                        // enroll the warp clips that start later, or they
+                        // play silent when the playhead reaches them.
+                        bungee_voices_->enroll_missing_voices_async(
+                            target_frame, *session_, *source_manager_);
                         // Set transport to target immediately so the next
                         // audio block reads from the new playhead with the
                         // freshly-published voices.
@@ -2330,6 +2365,8 @@ Result<void> EngineImpl::dispatch_command(const EngineCommand& cmd) {
                     if (auto prepared = prearmed_jumps_->take_ready(key)) {
                         bungee_voices_->swap_in_prepared_voices(
                             prepared->extract_voice_map());
+                        bungee_voices_->enroll_missing_voices_async(
+                            target_frame, *session_, *source_manager_);
                         clock_->seek(target_frame);
                         if (mixer_) mixer_->trigger_crossfade();
                         // The prearmed set carries voices, not audio blocks.
@@ -2404,6 +2441,8 @@ Result<void> EngineImpl::dispatch_command(const EngineCommand& cmd) {
                     if (auto prepared = prearmed_jumps_->take_ready(key)) {
                         bungee_voices_->swap_in_prepared_voices(
                             prepared->extract_voice_map());
+                        bungee_voices_->enroll_missing_voices_async(
+                            target_frame, *session_, *source_manager_);
                         clock_->seek(target_frame);
                         if (mixer_) mixer_->trigger_crossfade();
                         // The prearmed set carries voices, not audio blocks.
@@ -2560,6 +2599,8 @@ Result<void> EngineImpl::dispatch_command(const EngineCommand& cmd) {
                             if (auto prepared = prearmed_jumps_->take_ready(key)) {
                                 bungee_voices_->swap_in_prepared_voices(
                                     prepared->extract_voice_map());
+                                bungee_voices_->enroll_missing_voices_async(
+                                    target_frame, *session_, *source_manager_);
                                 clock_->seek(target_frame);
                                 if (mixer_) mixer_->trigger_crossfade();
                                 refill_prearm_cache();
@@ -3033,6 +3074,9 @@ Result<void> EngineImpl::dispatch_command(const EngineCommand& cmd) {
                         region.warp_enabled = update.warp_enabled;
                         region.warp_source_bpm = update.warp_source_bpm;
                         region.master_gain = update.master_gain;
+                        region.fade_in_frames = update.fade_in_frames;
+                        region.fade_out_frames = update.fade_out_frames;
+                        region.voice_guide_count_style = update.voice_guide_count_style;
                         song.regions.push_back(std::move(region));
                     }
                     changed = true;
@@ -3190,6 +3234,7 @@ Result<void> EngineImpl::dispatch_command(const EngineCommand& cmd) {
                         marker.id = update.id;
                         marker.frame = std::max<Frame>(0, update.frame);
                         marker.bpm = std::clamp(update.bpm, 20.0, 300.0);
+                        marker.ramp = update.ramp;
                         song.tempo_markers.push_back(std::move(marker));
                     }
                     std::sort(song.tempo_markers.begin(), song.tempo_markers.end(),
@@ -3300,6 +3345,9 @@ Result<void> EngineImpl::dispatch_command(const EngineCommand& cmd) {
                         region.warp_enabled = update.warp_enabled;
                         region.warp_source_bpm = update.warp_source_bpm;
                         region.master_gain = update.master_gain;
+                        region.fade_in_frames = update.fade_in_frames;
+                        region.fade_out_frames = update.fade_out_frames;
+                        region.voice_guide_count_style = update.voice_guide_count_style;
                         song.regions.push_back(std::move(region));
                     }
 
@@ -3326,6 +3374,7 @@ Result<void> EngineImpl::dispatch_command(const EngineCommand& cmd) {
                         marker.id = update.id;
                         marker.frame = std::max<Frame>(0, update.frame);
                         marker.bpm = std::clamp(update.bpm, 20.0, 300.0);
+                        marker.ramp = update.ramp;
                         song.tempo_markers.push_back(std::move(marker));
                     }
                     std::sort(song.tempo_markers.begin(), song.tempo_markers.end(),
@@ -3460,6 +3509,9 @@ Result<void> EngineImpl::dispatch_command(const EngineCommand& cmd) {
                     region.warp_enabled = update.warp_enabled;
                     region.warp_source_bpm = update.warp_source_bpm;
                     region.master_gain = update.master_gain;
+                    region.fade_in_frames = update.fade_in_frames;
+                    region.fade_out_frames = update.fade_out_frames;
+                    region.voice_guide_count_style = update.voice_guide_count_style;
                     song.regions.push_back(std::move(region));
                 }
 
@@ -3486,6 +3538,7 @@ Result<void> EngineImpl::dispatch_command(const EngineCommand& cmd) {
                     marker.id = update.id;
                     marker.frame = std::max<Frame>(0, update.frame);
                     marker.bpm = std::clamp(update.bpm, 20.0, 300.0);
+                    marker.ramp = update.ramp;
                     song.tempo_markers.push_back(std::move(marker));
                 }
                 std::sort(song.tempo_markers.begin(), song.tempo_markers.end(),

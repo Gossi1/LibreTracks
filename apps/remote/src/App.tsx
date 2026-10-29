@@ -23,7 +23,9 @@ import {
   formatTransposeSemitones,
   METRONOME_SOUND_PRESETS,
   markerColor,
-  regionEffectiveKey,
+  regionKeySummary,
+  isVoiceGuideCountStyle,
+  VOICE_GUIDE_COUNT_STYLES,
   type AppSettings,
   type AudioMeterLevel,
   type PadsCatalog,
@@ -78,6 +80,8 @@ import {
   ProgressToSongWidget,
   useLiveMusicalContext,
 } from "./liveWidgets";
+import { LyricsWidget } from "./lyricsWidget";
+import { FEATURE_FLAGS } from "@libretracks/shared/featureFlags";
 import {
   DEFAULT_METRONOME_WIDGET_HEIGHT,
   DEFAULT_PADS_WIDGET_HEIGHT,
@@ -1685,6 +1689,7 @@ function TransportControlButtons() {
       <button className="pill-button" onClick={() => sendCommand({ cmd: "stop" })}>
         {STRINGS.stop}
       </button>
+      <FadeStopPill />
       {/* Keep Click + Voice guide grouped while giving each a full action slot. */}
       <div className="pill-button-split">
         <button
@@ -1738,6 +1743,27 @@ function StopButtonWidget() {
       <button className="pill-button" onClick={() => sendCommand({ cmd: "stop" })}>
         {STRINGS.stop}
       </button>
+    </div>
+  );
+}
+/** «Fade out y parar»: the desktop fades the song out and stops; pressing it
+ * again during the fade stops at once. Lit while the fade runs. */
+function FadeStopPill() {
+  const fading = useRemoteSyncStore((state) => state.snapshot?.fadingToStop === true);
+  return (
+    <button
+      className={`pill-button ${fading ? "is-active" : ""}`}
+      aria-pressed={fading}
+      onClick={() => sendCommand({ cmd: "fadeOutStop" })}
+    >
+      {STRINGS.fadeStop}
+    </button>
+  );
+}
+function FadeStopButtonWidget() {
+  return (
+    <div className="transport-controls transport-controls-inline transport-controls-solo">
+      <FadeStopPill />
     </div>
   );
 }
@@ -2284,9 +2310,9 @@ function ControlDeck({ section }: { section?: ControlDeckSection } = {}) {
                   }}
                 >
                   <span>{region.name}</span>
-                  {regionEffectiveKey(region) ? (
+                  {regionKeySummary(region) ? (
                     <em className="region-chip-key">
-                      {regionEffectiveKey(region)}
+                      {regionKeySummary(region)}
                     </em>
                   ) : null}
                   {region.transposeSemitones !== 0 ? (
@@ -2312,9 +2338,9 @@ function ControlDeck({ section }: { section?: ControlDeckSection } = {}) {
                     <strong>{formatTransposeSemitones(selectedRegion.transposeSemitones)} st</strong>
                     <button type="button" onClick={() => updateSelectedRegionTranspose(1)}>+</button>
                   </div>
-                  {regionEffectiveKey(selectedRegion) ? (
+                  {regionKeySummary(selectedRegion) ? (
                     <span className="selected-region-key">
-                      {regionEffectiveKey(selectedRegion)}
+                      {regionKeySummary(selectedRegion)}
                     </span>
                   ) : null}
                 </div>
@@ -2885,6 +2911,7 @@ function MixerStrip({
     lastNativeVolumeRef.current = null;
     commitDraftVolume(position);
   };
+  const volumePosition = gainToPosition(draftVolume, TRACK_FADER_SCALE);
 
   return (
     <article
@@ -2904,6 +2931,7 @@ function MixerStrip({
           <span className="pan-value">{formatRemotePan(draftPan)}</span>
         </div>
         <input
+          className="lt-fader is-pan"
           type="range"
           min={-1}
           max={1}
@@ -2941,29 +2969,41 @@ function MixerStrip({
             ))}
           </div>
           <MeterBar trackId={track.id} />
-          <input
-            className="volume-fader"
-            type="range"
-            min={0}
-            max={1}
-            step={0.001}
-            value={gainToPosition(draftVolume, TRACK_FADER_SCALE)}
-            onChange={handleVolumeChange}
-            onDoubleClick={resetVolumeToUnity}
-            onPointerDown={() => {
-              volumeInteractionRef.current = true;
-              lastNativeVolumeRef.current = null;
-            }}
-            onPointerUp={(event) =>
-              commitVolumeDrag(Number(event.currentTarget.value))
-            }
-            onPointerCancel={(event) =>
-              commitVolumeDrag(Number(event.currentTarget.value))
-            }
-            onLostPointerCapture={(event) =>
-              commitVolumeDrag(Number(event.currentTarget.value))
-            }
-          />
+          {/* El input nativo vertical (slider-vertical) no deja vestir su
+              pulgar: se queda encima, transparente, y sigue llevando el
+              arrastre, el teclado y el ajuste fino. Debajo se dibuja la
+              ranura, las marcas y el cap del fader de consola. */}
+          <div
+            className="volume-fader-stack"
+            style={{ "--p": volumePosition } as CSSProperties}
+          >
+            <div className="volume-fader-visual" aria-hidden="true">
+              <div className="volume-fader-cap" />
+            </div>
+            <input
+              className="volume-fader"
+              type="range"
+              min={0}
+              max={1}
+              step={0.001}
+              value={volumePosition}
+              onChange={handleVolumeChange}
+              onDoubleClick={resetVolumeToUnity}
+              onPointerDown={() => {
+                volumeInteractionRef.current = true;
+                lastNativeVolumeRef.current = null;
+              }}
+              onPointerUp={(event) =>
+                commitVolumeDrag(Number(event.currentTarget.value))
+              }
+              onPointerCancel={(event) =>
+                commitVolumeDrag(Number(event.currentTarget.value))
+              }
+              onLostPointerCapture={(event) =>
+                commitVolumeDrag(Number(event.currentTarget.value))
+              }
+            />
+          </div>
         </div>
       </div>
 
@@ -3001,6 +3041,30 @@ function MixerStrip({
  * by the mixer's "active song only" filter so toggling between songs
  * updates the visible strips without spinning a per-frame React render.
  */
+/** Live position read on demand: the lyrics poll it, React never sees it. */
+function readRemotePositionSeconds() {
+  return resolveLivePosition(useRemoteSyncStore.getState().visualAnchor);
+}
+
+function LyricsWidgetHost() {
+  if (!FEATURE_FLAGS.lyrics) return <></>;
+  return <LyricsWidgetLive />;
+}
+
+function LyricsWidgetLive() {
+  const songView = useRemoteSyncStore((state) => state.songView);
+  const pendingMarkerId = useRemoteSyncStore(
+    (state) => state.snapshot?.pendingMarkerJump?.targetMarkerId ?? null,
+  );
+  return (
+    <LyricsWidget
+      songView={songView}
+      getPositionSeconds={readRemotePositionSeconds}
+      pendingMarkerId={pendingMarkerId}
+    />
+  );
+}
+
 function useActiveRegionId(): string | null {
   const songView = useRemoteSyncStore((state) => state.songView);
   const [activeRegionId, setActiveRegionId] = useState<string | null>(null);
@@ -3088,7 +3152,7 @@ function SongMasterFader({ region }: { region: SongRegionSummary | null }) {
       </div>
       <div className="song-master-fader-area">
         <input
-          className="song-master-fader"
+          className="song-master-fader lt-fader is-master"
           type="range"
           min={MASTER_GAIN_MIN}
           max={MASTER_GAIN_MAX}
@@ -3577,6 +3641,7 @@ function PerformanceSettingsWidget({ mode = "combined" }: { mode?: "combined" | 
           <label className="performance-setting-field"><span>{STRINGS.guideLeadBars}</span><select value={settings.voiceGuideLeadBars} onChange={(event) => patch({ voiceGuideLeadBars: Number(event.currentTarget.value) })}>{[1, 2, 3, 4].map((bars) => <option key={bars} value={bars}>{bars}</option>)}</select></label>
         </div>
         <label className="performance-switch is-row"><input type="checkbox" checked={settings.voiceGuideCountInEnabled} onChange={(event) => patch({ voiceGuideCountInEnabled: event.currentTarget.checked })} /><span>{STRINGS.guideCountIn}</span></label>
+        <label className="performance-setting-field"><span>{STRINGS.guideCountStyle}</span><select value={settings.voiceGuideCountStyle ?? "full"} disabled={!settings.voiceGuideCountInEnabled} onChange={(event) => { const style = event.currentTarget.value; if (isVoiceGuideCountStyle(style)) patch({ voiceGuideCountStyle: style }); }}>{VOICE_GUIDE_COUNT_STYLES.map((style) => <option key={style} value={style}>{style === "halfThenFull" ? STRINGS.guideCountStyleHalfThenFull : style === "halfTime" ? STRINGS.guideCountStyleHalfTime : STRINGS.guideCountStyleFull}</option>)}</select></label>
       </section>
       ) : null}
     </div>
@@ -3948,6 +4013,7 @@ const WIDGET_REGISTRY: Record<WidgetType, WidgetDefinition> = {
   playButton: { labelKey: "play", Component: PlayButtonWidget, defaultW: 4, defaultH: 4 },
   pauseButton: { labelKey: "pause", Component: PauseButtonWidget, defaultW: 4, defaultH: 4 },
   stopButton: { labelKey: "stop", Component: StopButtonWidget, defaultW: 4, defaultH: 4 },
+  fadeStopButton: { labelKey: "fadeStop", Component: FadeStopButtonWidget, defaultW: 4, defaultH: 4 },
   clickButton: { labelKey: "click", Component: ClickButtonWidget, defaultW: 4, defaultH: 4 },
   guideButton: { labelKey: "guide", Component: GuideButtonWidget, defaultW: 4, defaultH: 4 },
   videoBlackButton: { labelKey: "videoBlack", Component: VideoBlackButtonWidget, defaultW: 6, defaultH: 4 },
@@ -3977,6 +4043,8 @@ const WIDGET_REGISTRY: Record<WidgetType, WidgetDefinition> = {
   nextMarker: { labelKey: "widgetNextMarker", Component: NextMarkerWidgetHost, defaultW: 4, defaultH: 4 },
   nextSong: { labelKey: "widgetNextSong", Component: NextSongWidgetHost, defaultW: 4, defaultH: 4 },
   currentKey: { labelKey: "widgetKey", Component: CurrentKeyWidgetHost, defaultW: 4, defaultH: 4 },
+  // Behind a flag: off, the palette does not offer it (see featureFlags).
+  lyrics: { labelKey: "widgetLyrics", Component: LyricsWidgetHost, defaultW: 12, defaultH: 20, palette: FEATURE_FLAGS.lyrics },
   progressMarker: { labelKey: "widgetProgressMarker", Component: ProgressToMarkerWidgetHost, defaultW: 4, defaultH: 4 },
   progressSong: { labelKey: "widgetProgressSong", Component: ProgressToSongWidgetHost, defaultW: 4, defaultH: 4 },
   countdownMarkerBars: { labelKey: "widgetCountdownMarker", Component: CountdownMarkerBarsHost, defaultW: 4, defaultH: 4 },
@@ -3997,6 +4065,7 @@ const WIDGET_CATEGORY: Record<WidgetType, WidgetCategory> = {
   playButton: "transport",
   pauseButton: "transport",
   stopButton: "transport",
+  fadeStopButton: "transport",
   clickButton: "transport",
   guideButton: "transport",
   videoBlackButton: "transport",
@@ -4017,6 +4086,7 @@ const WIDGET_CATEGORY: Record<WidgetType, WidgetCategory> = {
   countdownSongTime: "live",
   songHeader: "songs",
   clipList: "songs",
+  lyrics: "songs",
   mixer: "mixer",
   mixerSongFilter: "mixer",
   mixerSongMaster: "mixer",
@@ -4070,7 +4140,7 @@ function widgetDefaultSize(type: WidgetType, canvasWidth: number): WidgetDefault
     case "readoutSignature": case "readoutSong": case "readoutSession":
       return { w: 12, h: 5 };
     case "transportButtons": return { w: 24, h: 6 };
-    case "playButton": case "pauseButton": case "stopButton":
+    case "playButton": case "pauseButton": case "stopButton": case "fadeStopButton":
     case "clickButton": case "guideButton": case "videoBlackButton":
       return { w: 8, h: 5 };
     case "timeline": return { w: 24, h: 4 };
@@ -4085,6 +4155,7 @@ function widgetDefaultSize(type: WidgetType, canvasWidth: number): WidgetDefault
     case "mixerSongMaster": return { w: 24, h: 5 };
     case "mixerFaders": return { w: 24, h: 26 };
     case "songHeader": case "clipList": return { w: 24, h: 14 };
+    case "lyrics": return { w: 24, h: 18 };
     case "pads": return { w: 24, h: DEFAULT_PADS_WIDGET_HEIGHT };
     case "metronomeSettings": return { w: 24, h: DEFAULT_METRONOME_WIDGET_HEIGHT };
     case "voiceGuideSettings": return { w: 24, h: 14 };

@@ -40,41 +40,41 @@ import {
 } from "@libretracks/shared/models";
 import { useRenderCounter } from "../perf/useRenderCounter";
 import { PlayheadOverlay } from "./PlayheadOverlay";
-import {
-  MARKER_FLAG_GAP_PX,
-  markerFlagLabel,
-  measureMarkerFlagWidth,
-} from "../Renderer/markerFlagMetrics";
 import { describeAutomationCue } from "./describeAutomationCue";
 import { useAutomationCueHotspots } from "./useAutomationCueHotspots";
 import { useFollowerX } from "./useFollowerX";
 import { regionHotspotBounds } from "./regionHotspotBounds";
+import { SongFadeHandles } from "../songs/SongFadeHandles";
 import { useRegionDrag } from "./useRegionDrag";
 import { MidiClipHotspots, MidiDropGuide } from "../midi/MidiClipHotspots";
 import { VideoClipHotspots } from "../video/VideoClipHotspots";
 import { useMidiLane } from "../midi/useMidiLane";
 import { useMarkerMoveDrag } from "./useMarkerMoveDrag";
+import { RulerMarkerHotspots } from "../rulerMarkers/RulerMarkerHotspots";
+import type { RulerMarkerRef } from "../desktopApi";
 import { TOUR_TARGETS } from "../../tutorial/tourTargets";
 import { useTouchContextMenu } from "./useTouchContextMenu";
 import { rulerClientXToSeconds } from "../helpers";
 import { useTouchClipSelection } from "../mobile/touchClipSelection";
+import { useLaneAreaSelection } from "../mobile/useAreaSelection";
 import { armLaneTouchDrag, laneMouseDragAllowed } from "./laneDragStart";
 import { MobileEmptyLanes } from "../mobile/MobileEmptyLanes";
-import { useTimelineUIStore } from "../uiStore";
+import { selectedRulerMarkers, useTimelineUIStore } from "../uiStore";
 import { useBoundedTimelineScroll } from "./useBoundedTimelineScroll";
 import {
   LibraryPreviewLanes,
   type LibraryPreviewRow,
 } from "./LibraryPreviewLanes";
 import type { TrackRowLayout } from "../tracks/trackLayout";
+import { renderTrackRows } from "../tracks/trackRowWindowing";
+import { useTrackRowWindow } from "../tracks/useTrackRowWindow";
 import {
   LANE_CUES,
   LANE_REGIONS,
   LANE_SECTIONS,
-  TEMPO_FLAG_BAND,
-  TIME_SIGNATURE_FLAG_BAND,
 } from "../Renderer/drawBackground";
-import { markerCategory } from "../markerKinds";
+import { KeyChangeHotspots } from "../keyChanges/KeyChangeHotspots";
+import type { KeyChangeCallbacks } from "../keyChanges/keyChangeMenus";
 import {
   BASE_PIXELS_PER_SECOND,
   getElementScaleX,
@@ -99,6 +99,7 @@ import {
   externalDropBadgeColors,
   externalDropGuideColors,
 } from "./externalDropLook";
+import { TIMELINE_RULER_HEIGHT } from "../constants";
 
 // Must stay in sync with the lane layout in Renderer/drawBackground.ts and
 // the ruler heights in styles.css: 94px is the mobile lanes' bottom edge (87)
@@ -106,14 +107,10 @@ import {
 // lane's 92 + 34) plus the same. The desktop value grew from 122 so the cue
 // lane could move below the two-line bar/timecode labels instead of sharing
 // their band. Changing it here alone misaligns the ruler with the track
-// headers — the CSS row heights below must move with it.
-const RULER_HEIGHT = isMobileApp ? 94 : 134;
+// headers — the CSS row heights below must move with it. The value lives in
+// constants.ts because the track row window (tracks/useTrackRowWindow) needs it.
+const RULER_HEIGHT = TIMELINE_RULER_HEIGHT;
 
-/** Margen de agarre a la IZQUIERDA del mastil de una marca. La bandera se
- * dibuja a la derecha, asi que sin este margen el mastil en si mismo -que es lo
- * que el usuario apunta cuando quiere mover la marca- quedaria fuera de la zona
- * tactil. Un dedo no necesita mas: lo ancho del boton lo da la bandera. */
-const MARKER_HOTSPOT_PAD_LEFT_PX = 6;
 
 type LibraryClipPreviewState = {
   trackId: string | null;
@@ -197,10 +194,19 @@ type TimelineCanvasPaneProps = {
     event: ReactMouseEvent<HTMLButtonElement>,
     markerId: string,
   ) => void;
+  /** Clic derecho en una marca de una seleccion multiple: menu del grupo. */
+  onRulerMarkersContextMenu?: (
+    event: ReactMouseEvent<HTMLButtonElement>,
+    markers: RulerMarkerRef[],
+  ) => void;
+  /** Suelta el arrastre de una seleccion multiple de marcas. */
+  onRulerMarkersMoveCommit?: (markers: RulerMarkerRef[], deltaSeconds: number) => void;
   onRegionContextMenu: (
     event: ReactMouseEvent<HTMLButtonElement>,
     regionId: string,
   ) => void;
+  /** Tocar o arrastrar las muescas de cambio de nota (keyChanges/). */
+  keyChangeCallbacks?: KeyChangeCallbacks;
   onAutomationCueContextMenu: (
     event: ReactMouseEvent<HTMLButtonElement>,
     cueId: string,
@@ -377,7 +383,10 @@ export function TimelineCanvasPane({
   onMarkerContextMenu,
   onTempoMarkerContextMenu,
   onTimeSignatureMarkerContextMenu,
+  onRulerMarkersContextMenu,
+  onRulerMarkersMoveCommit,
   onRegionContextMenu,
+  keyChangeCallbacks,
   onAutomationCueContextMenu,
   onAutomationCueEdit,
   onAutomationLaneContextMenu,
@@ -470,6 +479,18 @@ export function TimelineCanvasPane({
     livePixelsPerSecondRef,
     () => onSelectRegion(null),
   );
+  // Same window as the headers: see ../tracks/useTrackRowWindow.
+  const rowWindow = useTrackRowWindow(trackLayout, visibleTracks);
+  const touchAreaSelect = useLaneAreaSelection({
+    surfaceRef: laneAreaRef,
+    rows: { layout: trackLayout, tracks: visibleTracks },
+    clipsByTrack,
+    cameraXRef,
+    pixelsPerSecondRef: livePixelsPerSecondRef,
+    previewCameraX: onNativeCameraXPreview,
+    commitCameraX: onNativeCameraXCommit,
+    onBegin: () => onSelectRegion(null),
+  });
 
   const rulerTouchContextMenu = useTouchContextMenu({
     captureSeconds: isMobileApp ? (clientX) => normalizePositionSeconds(rulerClientXToSeconds(
@@ -484,6 +505,16 @@ export function TimelineCanvasPane({
       ),
   });
   const markerTouchContextMenu = useTouchContextMenu();
+  // Lo que el canvas de la regla resalta: la seleccion de marcas entera.
+  const selectedMarkers = useTimelineUIStore((state) => state.selectedMarkers);
+  // En el modo area el tramo de la regla coge marcas: no es el rango del que
+  // sale una cancion, y no debe parecerlo.
+  const areaSelectMode = useTimelineUIStore((state) => isMobileApp && state.areaSelectMode);
+  const selectedTempoMarkerId = useTimelineUIStore((state) => state.selectedTempoMarkerId);
+  const selectedTimeSignatureMarkerId = useTimelineUIStore((state) => state.selectedTimeSignatureMarkerId);
+  const selectedMarkerIds = useMemo(() => selectedRulerMarkers({
+    selectedMarkers, selectedSectionId, selectedTempoMarkerId, selectedTimeSignatureMarkerId,
+  }).map((marker) => marker.id), [selectedMarkers, selectedSectionId, selectedTempoMarkerId, selectedTimeSignatureMarkerId]);
   // Los tres elementos que siguen al puntero durante un arrastre. Todos leen
   // refs y se mueven fuera de React; ver ./useFollowerX.
   const clipSnapIndicatorRef = useFollowerX(() => {
@@ -544,6 +575,7 @@ export function TimelineCanvasPane({
     pixelsPerSecond,
     onMarkerMoveCommit,
     onAutomationCueMoveCommit,
+    onGroupMoveCommit: onRulerMarkersMoveCommit,
   });
 
   // The canvas paints the flags, so a marker being dragged across lanes has to
@@ -761,7 +793,7 @@ export function TimelineCanvasPane({
             tempoMarkers={song?.tempoMarkers ?? []}
             timeSignatureMarkers={song?.timeSignatureMarkers ?? []}
             selectedRegionId={selectedRegionId}
-            selectedMarkerId={selectedSectionId}
+            selectedMarkerIds={selectedMarkerIds}
             pendingMarkerJump={pendingMarkerJump}
             pendingAutomationCue={pendingAutomationCue}
             activeVamp={activeVamp}
@@ -939,13 +971,14 @@ export function TimelineCanvasPane({
                     onPointerUp={endRegionResize}
                     onPointerCancel={endRegionResize}
                   />
+                  <SongFadeHandles region={region} pixelsPerSecond={pixelsPerSecond} />
                 </button>
               );
             })}
 
             {selectedTimelineRange ? (
               <div
-                className="lt-ruler-range-selection"
+                className={`lt-ruler-range-selection ${areaSelectMode ? "is-area" : ""}`}
                 style={{
                   left: selectedTimelineRange.startSeconds * pixelsPerSecond,
                   width: Math.max(
@@ -958,203 +991,32 @@ export function TimelineCanvasPane({
               />
             ) : null}
 
-            {song?.sectionMarkers.map((section) => {
-              // La zona tactil se mide contra la bandera QUE SE DIBUJA, con las
-              // mismas funciones que usa el canvas (ver Renderer/
-              // markerFlagMetrics). El ancho fijo anterior -68px en escritorio,
-              // una estimacion por caracteres en movil- sobraba por la derecha
-              // y se tragaba los toques dirigidos a la marca siguiente.
-              const flagWidth = measureMarkerFlagWidth(
-                markerFlagLabel(section),
-              );
-              const hotspotWidth =
-                MARKER_HOTSPOT_PAD_LEFT_PX + MARKER_FLAG_GAP_PX + flagWidth;
-              // El carril previsualizado SÍ pasa por React: cambia una o dos
-              // veces por gesto, no por píxel. La posición no: la escribe el
-              // bucle de hotspots leyendo el ref.
-              const isDraggingMarker =
-                markerMovePreviewLane?.markerId === section.id;
-              const renderStartSeconds = section.startSeconds;
-              // Cue markers live in their own lane above the section lane so a
-              // cue and a section sharing a position don't stack on one pixel.
-              // Mid-drag the hotspot follows the pointer across lanes, so the
-              // flag previews the category the drop would apply.
-              const renderCategory = isDraggingMarker
-                ? markerMovePreviewLane.category
-                : markerCategory(section);
-              const lane = renderCategory === "cue" ? LANE_CUES : LANE_SECTIONS;
-              return (
-              <button
-                key={section.id}
-                type="button"
-                className={`lt-marker-hotspot ${selectedSectionId === section.id ? "is-selected" : ""}${isDraggingMarker ? " is-dragging" : ""}`}
-                aria-label={`${section.name} - carril central`}
-                title={`Carril central: ${section.name}`}
-                style={{
-                  left: renderStartSeconds * pixelsPerSecond,
-                  top: lane.top,
-                  height: lane.height,
-                  width: hotspotWidth,
-                  // El desplazamiento va por variable, no por `margin-left`: el
-                  // envoltorio del ruler escala en X durante el zoom y la regla
-                  // de .lt-marker-hotspot lo contra-escala junto con el ancho.
-                  ["--lt-hotspot-offset-x" as string]:
-                    `${-MARKER_HOTSPOT_PAD_LEFT_PX}px`,
-                }}
-                onMouseDown={(event) => {
-                  event.preventDefault();
-                  event.stopPropagation();
-                }}
-                onPointerDown={(event) => {
-                  event.stopPropagation();
-                  if (event.altKey || event.ctrlKey || event.metaKey) return;
-                  markerTouchContextMenu.begin(event);
-                  beginMarkerMove(event, section.id, section.startSeconds);
-                }}
-                onPointerMove={(event) => {
-                  markerTouchContextMenu.move(event);
-                  updateMarkerMove(event);
-                }}
-                onPointerUp={(event) => {
-                  markerTouchContextMenu.cancel();
-                  endMarkerMove(event);
-                }}
-                onPointerCancel={(event) => {
-                  markerTouchContextMenu.cancel();
-                  endMarkerMove(event);
-                }}
-                onClick={(event) => {
-                  event.preventDefault();
-                  event.stopPropagation();
-                  if (markerTouchContextMenu.consumeTriggered()) {
-                    return;
-                  }
-                  // A drag just finished — swallow the synthetic click so the
-                  // marker isn't also triggered/seeked. (The drag ref is
-                  // already nulled by pointer-up, hence the separate flag.)
-                  if (markerDidDragRef.current) {
-                    markerDidDragRef.current = false;
-                    return;
-                  }
-                  if (midiLearnMode !== null) {
-                    // jump_marker_N indexes only section markers (cues are not
-                    // jump targets), so the index must match the section-only,
-                    // time-sorted order the jump dispatch uses.
-                    const chronologicalMarkers = [
-                      ...(song?.sectionMarkers ?? []),
-                    ]
-                      .filter(
-                        (candidate) => markerCategory(candidate) === "section",
-                      )
-                      .sort(
-                        (left, right) =>
-                          left.startSeconds - right.startSeconds,
-                      );
-                    const markerIndex = chronologicalMarkers.findIndex(
-                      (candidate) => candidate.id === section.id,
-                    );
-                    if (markerIndex >= 0) {
-                      onMidiLearnTarget(
-                        `action:jump_marker_${markerIndex + 1}`,
-                      );
-                    }
-                    return;
-                  }
-                  onMarkerPrimaryAction(section.id);
-                }}
-                onContextMenu={(event) => {
-                  event.stopPropagation();
-                  onMarkerContextMenu(event, section.id);
-                }}
-              >
-                <span className="lt-sr-only">{section.name}</span>
-              </button>
-              );
-            })}
-
-            {song?.tempoMarkers.map((marker) => (
-              <button
-                key={marker.id}
-                type="button"
-                className="lt-tempo-hotspot"
-                aria-label={`Carril inferior: tempo ${marker.bpm.toFixed(2)} BPM`}
-                title={`Carril inferior: tempo ${marker.bpm.toFixed(2)} BPM`}
-                // Su banda, no el carril entero: con un tempo y un compas en el
-                // mismo punto, la zona del compas -que se pinta despues- se
-                // comia todos los clics.
-                style={{
-                  left: marker.startSeconds * pixelsPerSecond,
-                  top: TEMPO_FLAG_BAND.top,
-                  height: TEMPO_FLAG_BAND.height,
-                }}
-                onMouseDown={(event) => {
-                  event.preventDefault();
-                  event.stopPropagation();
-                }}
-                onPointerDown={markerTouchContextMenu.begin}
-                onPointerMove={markerTouchContextMenu.move}
-                onPointerUp={markerTouchContextMenu.cancel}
-                onPointerCancel={markerTouchContextMenu.cancel}
-                onClick={(event) => {
-                  event.stopPropagation();
-                  if (markerTouchContextMenu.consumeTriggered()) {
-                    return;
-                  }
-                  // Tocarla la selecciona, y la barra tactil ensena sus
-                  // acciones. Solo en movil: en escritorio un clic aqui no
-                  // hacia nada y seguir haciendo nada es lo que se espera.
-                  if (isMobileApp) {
-                    useTimelineUIStore.getState().selectTempoMarker(marker.id);
-                  }
-                }}
-                onContextMenu={(event) => {
-                  event.stopPropagation();
-                  onTempoMarkerContextMenu(event, marker.id);
-                }}
-              >
-                <span className="lt-sr-only">{marker.bpm.toFixed(2)} BPM</span>
-              </button>
-            ))}
-
-            {song?.timeSignatureMarkers.map((marker) => (
-              <button
-                key={marker.id}
-                type="button"
-                className="lt-tempo-hotspot lt-time-signature-hotspot"
-                aria-label={`Carril inferior: compás ${marker.signature}`}
-                title={`Carril inferior: compás ${marker.signature}`}
-                style={{
-                  left: marker.startSeconds * pixelsPerSecond,
-                  top: TIME_SIGNATURE_FLAG_BAND.top,
-                  height: TIME_SIGNATURE_FLAG_BAND.height,
-                }}
-                onMouseDown={(event) => {
-                  event.preventDefault();
-                  event.stopPropagation();
-                }}
-                onPointerDown={markerTouchContextMenu.begin}
-                onPointerMove={markerTouchContextMenu.move}
-                onPointerUp={markerTouchContextMenu.cancel}
-                onPointerCancel={markerTouchContextMenu.cancel}
-                onClick={(event) => {
-                  event.stopPropagation();
-                  if (markerTouchContextMenu.consumeTriggered()) {
-                    return;
-                  }
-                  if (isMobileApp) {
-                    useTimelineUIStore
-                      .getState()
-                      .selectTimeSignatureMarker(marker.id);
-                  }
-                }}
-                onContextMenu={(event) => {
-                  event.stopPropagation();
-                  onTimeSignatureMarkerContextMenu(event, marker.id);
-                }}
-              >
-                <span className="lt-sr-only">{marker.signature}</span>
-              </button>
-            ))}
+            <RulerMarkerHotspots
+              song={song}
+              pixelsPerSecond={pixelsPerSecond}
+              markerMovePreviewLane={markerMovePreviewLane}
+              markerTouchContextMenu={markerTouchContextMenu}
+              beginMarkerMove={beginMarkerMove}
+              updateMarkerMove={updateMarkerMove}
+              endMarkerMove={endMarkerMove}
+              markerDidDragRef={markerDidDragRef}
+              midiLearnMode={midiLearnMode}
+              onMidiLearnTarget={onMidiLearnTarget}
+              onMarkerPrimaryAction={onMarkerPrimaryAction}
+              onMarkerContextMenu={onMarkerContextMenu}
+              onTempoMarkerContextMenu={onTempoMarkerContextMenu}
+              onTimeSignatureMarkerContextMenu={onTimeSignatureMarkerContextMenu}
+              onRulerMarkersContextMenu={onRulerMarkersContextMenu}
+            />
+            {keyChangeCallbacks ? (
+              <KeyChangeHotspots
+                song={song}
+                pixelsPerSecond={pixelsPerSecond}
+                livePixelsPerSecondRef={livePixelsPerSecondRef}
+                snapEnabled={snapEnabled}
+                callbacks={keyChangeCallbacks}
+              />
+            ) : null}
 
             {/* Snap guide showing where the dragged marker will land. Lives
                 INSIDE the ruler canvas so it inherits the same
@@ -1269,6 +1131,7 @@ export function TimelineCanvasPane({
               interactionContainerRef={laneAreaRef}
               onTouchShouldEdit={touchClips.shouldEdit}
               onTouchTap={touchClips.onTap}
+              touchAreaSelect={touchAreaSelect}
               rulerHeight={RULER_HEIGHT}
               timelineGrid={timelineGrid}
               selectedClipId={selectedClipId}
@@ -1382,7 +1245,7 @@ export function TimelineCanvasPane({
           ) : null}
 
           {song?.tracks &&
-            visibleTracks.map((track) => {
+            renderTrackRows(visibleTracks, trackLayout, rowWindow, (track) => {
               const trackClips = clipsByTrack[track.id] ?? [];
               const isPendingTrack = Boolean(track.isPending);
               const isAutomationTrack = Boolean(track.isAutomation);

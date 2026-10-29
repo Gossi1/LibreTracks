@@ -29,6 +29,10 @@ export type E2ESongView = {
     solo: boolean;
     transposeEnabled: boolean;
     color?: string | null;
+    autoCreated?: boolean;
+    /** The song a track was made for, in the per-song track layouts. */
+    songRegionId?: string | null;
+    matchAliases?: string[];
   }>;
   clips: Array<{
     id: string;
@@ -84,6 +88,8 @@ export type E2ETransportSnapshot = {
 export type E2ESettings = {
   metronomeEnabled: boolean;
   voiceGuideEnabled: boolean;
+  /** Where the track meters measure; absent in builds older than the setting. */
+  trackMeterMode?: "postFader" | "postPan" | "preFader";
 };
 
 export type E2ETimelineView = {
@@ -276,6 +282,13 @@ class AppPage {
     const button = await this.libraryNavButton;
     await button.waitForClickable({ timeout: 20_000 });
     await button.click();
+    // The classic panel lives folded under «En esta sesión» (an accordion that
+    // starts closed, and remembers the last state): unfold it if needed.
+    const toggle = await $(".lt-folder-library-session-toggle");
+    await toggle.waitForDisplayed({ timeout: 15_000 });
+    if ((await toggle.getAttribute("aria-expanded")) !== "true") {
+      await toggle.click();
+    }
     await (await this.libraryPanel).waitForDisplayed({ timeout: 15_000 });
   }
 
@@ -924,6 +937,63 @@ class AppPage {
     );
   }
 
+  /** Save the default song template and the song track layout settings. */
+  async setSongTemplateSettings(
+    defaultSongTemplate: string | null,
+    songTrackLayout: "shared" | "songFolder" | "separate",
+  ): Promise<void> {
+    await browser.execute(
+      (tpl: string | null, layout: string) =>
+        (
+          window as unknown as {
+            __ltE2E: {
+              setSongTemplateSettings: (
+                template: string | null,
+                layout: string,
+              ) => Promise<void>;
+            };
+          }
+        ).__ltE2E.setSongTemplateSettings(tpl, layout),
+      defaultSongTemplate,
+      songTrackLayout,
+    );
+  }
+
+  /** «+ Nueva canción», from `template` or (null) the default template. */
+  async createEmptySong(name: string | null, template: string | null): Promise<void> {
+    await browser.execute(
+      (n: string | null, tpl: string | null) =>
+        (
+          window as unknown as {
+            __ltE2E: {
+              createEmptySong: (name: string | null, template: string | null) => Promise<void>;
+            };
+          }
+        ).__ltE2E.createEmptySong(n, tpl),
+      name,
+      template,
+    );
+  }
+
+  /** Drop audio files into a compact-view song column at one position. */
+  async createClipsWithAutoTracks(
+    filePaths: string[],
+    timelineStartSeconds: number,
+  ): Promise<void> {
+    await browser.execute(
+      (paths: string[], at: number) =>
+        (
+          window as unknown as {
+            __ltE2E: {
+              createClipsWithAutoTracks: (paths: string[], at: number) => Promise<void>;
+            };
+          }
+        ).__ltE2E.createClipsWithAutoTracks(paths, at),
+      filePaths,
+      timelineStartSeconds,
+    );
+  }
+
   /**
    * Create a new session from a template (no dialog) and wait for the timeline
    * shell to mount — the project-load flow unmounts the landing on completion.
@@ -1374,7 +1444,11 @@ class AppPage {
     );
   }
 
-  /** Read the latest pre-pan per-track peaks emitted by the native engine. */
+  /**
+   * Read the latest per-track peaks emitted by the native engine. They measure
+   * where the app setting `trackMeterMode` says: post-fader by default (pan,
+   * volume, mute and solo), so a muted or soloed-away track reads 0.
+   */
   async trackMeters(): Promise<E2ETrackMeters> {
     return browser.execute(
       () =>
@@ -1502,12 +1576,23 @@ class AppPage {
     );
   }
 
-  /** Require several native meter samples at zero to reject transient silence. */
+  /**
+   * Require several native meter samples at zero to reject transient silence.
+   * Mute/solo only silence the meter in the default post-fader mode. Specs do
+   * not write the user's real settings (wdio runs on them), so a machine set to
+   * another meter point fails here with a clear message instead of a timeout.
+   */
   async waitForTrackSilence(
     trackId: string,
     consecutiveSamples = 3,
     timeout = 30_000,
   ) {
+    const meterMode = (await this.settings()).trackMeterMode ?? "postFader";
+    if (meterMode !== "postFader") {
+      throw new Error(
+        `waitForTrackSilence needs post-fader track meters, but this machine's settings use "${meterMode}". Set Settings > Audio > Track meters to post-fader to run this spec.`,
+      );
+    }
     let silentSamples = 0;
     await browser.waitUntil(
       async () => {

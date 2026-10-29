@@ -18,6 +18,99 @@ type NativeZoomView = {
 
 export type TimelineNavigationScheme = "ableton" | "libretracks";
 
+const TRACKPAD_PINCH_ZOOM_GAIN = 4;
+const TRACKPAD_PINCH_MAX_DELTA = 40;
+const WHEEL_DEBUG_STORAGE_KEY = "lt:debug:timeline-wheel";
+
+export type TimelineWheelDebugRecord = {
+  deltaX: number;
+  deltaY: number;
+  deltaMode: number;
+  ctrlKey: boolean;
+  metaKey: boolean;
+  shiftKey: boolean;
+  altKey: boolean;
+  navigationScheme: TimelineNavigationScheme;
+  canZoom: boolean;
+  zoomLevel: number;
+  pinchLike: boolean;
+  target: string;
+};
+
+const MAX_WHEEL_DEBUG_RECORDS = 120;
+let latestWheelDebugRecord: TimelineWheelDebugRecord | null = null;
+const wheelDebugRecords: TimelineWheelDebugRecord[] = [];
+
+export function readLatestTimelineWheelDebugRecord(): TimelineWheelDebugRecord | null {
+  return latestWheelDebugRecord;
+}
+
+export function readTimelineWheelDebugRecords(): TimelineWheelDebugRecord[] {
+  return [...wheelDebugRecords];
+}
+
+export function setTimelineWheelDebugEnabled(enabled: boolean): void {
+  if (typeof window === "undefined") return;
+  try {
+    if (enabled) {
+      window.localStorage.setItem(WHEEL_DEBUG_STORAGE_KEY, "1");
+    } else {
+      window.localStorage.removeItem(WHEEL_DEBUG_STORAGE_KEY);
+    }
+    latestWheelDebugRecord = null;
+    wheelDebugRecords.length = 0;
+  } catch {
+    // Debug logging is optional when storage is unavailable.
+  }
+}
+
+function isTrackpadPinchWheel(event: WheelEvent): boolean {
+  // WebView2 pinch deltas can reach 36px; discrete Ctrl+wheel notches are much larger.
+  return (
+    event.deltaMode === 0 &&
+    event.deltaY !== 0 &&
+    Math.abs(event.deltaY) <= TRACKPAD_PINCH_MAX_DELTA
+  );
+}
+
+function logWheelEvent(event: WheelEvent, state: InputManagerState): void {
+  try {
+    if (window.localStorage.getItem(WHEEL_DEBUG_STORAGE_KEY) !== "1") return;
+  } catch {
+    return;
+  }
+
+  const target = event.target;
+  const targetLabel =
+    target instanceof Element
+      ? `${target.tagName.toLowerCase()}${
+          typeof target.className === "string" && target.className
+            ? `.${target.className.trim().replace(/\s+/g, ".")}`
+            : ""
+        }`
+      : "unknown";
+
+  latestWheelDebugRecord = {
+    deltaX: event.deltaX,
+    deltaY: event.deltaY,
+    deltaMode: event.deltaMode,
+    ctrlKey: event.ctrlKey,
+    metaKey: event.metaKey,
+    shiftKey: event.shiftKey,
+    altKey: event.altKey,
+    navigationScheme: state.navigationScheme,
+    canZoom: state.canZoom,
+    zoomLevel: state.zoomLevel,
+    pinchLike: isTrackpadPinchWheel(event),
+    target: targetLabel,
+  };
+  wheelDebugRecords.push(latestWheelDebugRecord);
+  if (wheelDebugRecords.length > MAX_WHEEL_DEBUG_RECORDS) {
+    wheelDebugRecords.shift();
+  }
+  console.debug("[timeline-wheel]", latestWheelDebugRecord);
+}
+
 type InputManagerState = {
   cameraX: number;
   zoomLevel: number;
@@ -38,6 +131,7 @@ type InputManagerOptions = {
     // arriba (ver el spread del constructor).
     | "onScrollVertical"
     | "onScrollVerticalSeed"
+    | "areaSelect"
   >;
   container: HTMLElement;
   getState: () => InputManagerState;
@@ -294,6 +388,7 @@ export class InputManager {
 
   private handleWheel = (event: WheelEvent) => {
     const state = this.options.getState();
+    logWheelEvent(event, state);
 
     if (state.navigationScheme === "ableton") {
       this.handleWheelAbleton(event, state);
@@ -305,6 +400,14 @@ export class InputManager {
 
   private handleWheelLibreTracks(event: WheelEvent, state: InputManagerState) {
     if (event.ctrlKey || event.metaKey) {
+      if (isTrackpadPinchWheel(event)) {
+        if (!state.canZoom) {
+          event.preventDefault();
+          return;
+        }
+        this.applyZoomFromWheel(event, state, TRACKPAD_PINCH_ZOOM_GAIN);
+        return;
+      }
       event.preventDefault();
       this.applyGlobalTrackHeightStep(event, state);
       return;
@@ -343,7 +446,11 @@ export class InputManager {
         event.preventDefault();
         return;
       }
-      this.applyZoomFromWheel(event, state);
+      this.applyZoomFromWheel(
+        event,
+        state,
+        isTrackpadPinchWheel(event) ? TRACKPAD_PINCH_ZOOM_GAIN : 1,
+      );
       return;
     }
 
@@ -383,7 +490,11 @@ export class InputManager {
     }
   }
 
-  private applyZoomFromWheel(event: WheelEvent, state: InputManagerState) {
+  private applyZoomFromWheel(
+    event: WheelEvent,
+    state: InputManagerState,
+    deltaMultiplier = 1,
+  ) {
     event.preventDefault();
     const bounds = this.container.getBoundingClientRect();
     const viewportWidth = this.container.offsetWidth || bounds.width;
@@ -392,7 +503,11 @@ export class InputManager {
       0,
       viewportWidth,
     );
-    const nextZoomLevel = this.computeNextZoomLevel(event, state.zoomLevel);
+    const nextZoomLevel = this.computeNextZoomLevel(
+      event,
+      state.zoomLevel,
+      deltaMultiplier,
+    );
     const nextView = this.options.onPreviewZoom(nextZoomLevel, anchorViewportX);
     if (!nextView) {
       return;
@@ -430,7 +545,11 @@ export class InputManager {
     this.options.onTrackRowHeightStep?.(localY, step);
   }
 
-  private computeNextZoomLevel(event: WheelEvent, currentZoomLevel: number) {
+  private computeNextZoomLevel(
+    event: WheelEvent,
+    currentZoomLevel: number,
+    deltaMultiplier = 1,
+  ) {
     // Trackpad pinch gestures fire many wheel events with very small deltaY
     // values (often 1-10), while a real mouse wheel notch is ~100. Using a
     // fixed per-event multiplier (the legacy behaviour) makes pinch zoom feel
@@ -447,7 +566,7 @@ export class InputManager {
           : event.deltaY;
     // Cap a single event's contribution so an OS that bursts a huge delta
     // (e.g. macOS momentum scroll) can't snap multiple stops at once.
-    const cappedDelta = clamp(normalizedDelta, -200, 200);
+    const cappedDelta = clamp(normalizedDelta * deltaMultiplier, -200, 200);
     // Map a full mouse notch (~100px) to roughly the legacy 1.2x factor.
     const stepReference = 100;
     const baseStep = Math.log(Math.max(1.01, this.options.zoomMultiplier));

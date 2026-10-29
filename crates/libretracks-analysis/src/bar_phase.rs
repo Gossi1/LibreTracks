@@ -1,0 +1,437 @@
+//! Where the bar starts in a click without accent, from the guide.
+//!
+//! Every click sounds the same, so the click alone counts bars from its first
+//! beat: a song whose bar 1 comes two beats after the first click ("Es Él",
+//! Felipe S. Santos: the click starts on beat 3) got every bar, and with them
+//! every guide marker, half a bar off. The guide knows better: it speaks in
+//! the bar before its section and finishes right before the section's
+//! downbeat ("Coro, dos, tres, cuatro"). So, among the beats of a bar, the
+//! downbeat is the one the announcements end closest before.
+//!
+//! The announcement STARTS do not tell: a guide speaks on beats 1 and 3 alike.
+//! And a guide that speaks at the start of the bar before ("La bondad de
+//! Dios", Church of the City) ends its words two beats or more before the
+//! downbeat, closer to the wrong one. Its counts are surer: the beat after a
+//! count's last number ("…tres, cuatro") is a downbeat, so when the guide
+//! counts, the counts decide.
+//!
+//! Before the guide, the click's own tempo changes: a click jumps to a new
+//! tempo on a bar line. "Fiesta en el desierto" (Montesanto) goes from 125
+//! to 140 and back on its first click's bars; the guide, two beats off,
+//! left the change on beat 3 and a bar of 132 off the click by 50 ms.
+
+use crate::guide::GuideAnalysis;
+
+/// Fragments closer than this (in beats) are one announcement: "Coro" and
+/// its count-in, or the numbers of a count. The intro's "Intro… uno, dos"
+/// leaves 1.3 beats between them.
+const CHAIN_GAP_BEATS: f64 = 1.5;
+/// The last word can run a little past the downbeat (see
+/// `ANNOUNCEMENT_TAIL_BEATS` in songAnalysisPlan.ts): that downbeat still
+/// follows it.
+const TAIL_BEATS: f64 = 0.3;
+/// Fewer announcements than this is too little to move the bar.
+const MIN_ANNOUNCEMENTS: usize = 2;
+/// The best phase must beat the runner-up by this much (mean beats from an
+/// announcement's end to the next downbeat). On the real guide above the
+/// right phase averages ~1 beat and the one two beats off ~3.
+const MIN_MARGIN_BEATS: f64 = 0.75;
+
+/// How many beats of `beat_times` (one run of a click without accent, with
+/// no gap) come before its first downbeat: 0..beats_per_bar. None when the
+/// guide does not say clearly, and the bars stay counted from the first beat.
+/// Guide and click must share a time base (the same render).
+pub(crate) fn pickup_from_guide(
+    beat_times: &[f64],
+    beats_per_bar: usize,
+    guide: &GuideAnalysis,
+) -> Option<usize> {
+    if beats_per_bar < 2 || beat_times.len() < beats_per_bar * 2 {
+        return None;
+    }
+    let first = beat_times[0];
+    let last = *beat_times.last()?;
+    let beat = (last - first) / (beat_times.len() - 1) as f64;
+    if !(beat > 0.0) {
+        return None;
+    }
+    if let Some(phase) = phase_from_counts(beat_times, beats_per_bar, beat, guide) {
+        return Some(phase);
+    }
+    let ends = announcement_ends(guide, beat);
+    let ends: Vec<f64> = ends
+        .into_iter()
+        .filter(|&end| end > first && end < last - beat * beats_per_bar as f64)
+        .collect();
+    if ends.len() < MIN_ANNOUNCEMENTS {
+        return None;
+    }
+    let mut scores: Vec<(usize, f64)> = (0..beats_per_bar)
+        .map(|phase| {
+            let total: f64 = ends
+                .iter()
+                .map(|&end| {
+                    let from = end - TAIL_BEATS * beat;
+                    // The first beat at or after `from`, then on to a downbeat.
+                    let index = beat_times.partition_point(|&t| t < from);
+                    let ahead = (beats_per_bar + phase - index % beats_per_bar) % beats_per_bar;
+                    let downbeat = beat_times
+                        .get(index + ahead)
+                        .copied()
+                        .unwrap_or(last + beat * ahead as f64);
+                    (downbeat - end) / beat
+                })
+                .sum();
+            (phase, total / ends.len() as f64)
+        })
+        .collect();
+    scores.sort_by(|a, b| a.1.total_cmp(&b.1));
+    (scores[1].1 - scores[0].1 >= MIN_MARGIN_BEATS).then_some(scores[0].0)
+}
+
+/// The numbers of one count can be a half note apart ("uno . dos . | uno,
+/// dos, tres, cuatro"): two beats and a breath.
+const COUNT_CHAIN_GAP_BEATS: f64 = 2.5;
+
+/// The phase every count of the guide agrees on: the first beat after a
+/// count's last fragment ends is a downbeat. None without counts, or when
+/// they disagree.
+fn phase_from_counts(
+    beat_times: &[f64],
+    beats_per_bar: usize,
+    beat: f64,
+    guide: &GuideAnalysis,
+) -> Option<usize> {
+    let is_count = |group: usize| {
+        guide.groups.get(group).is_some_and(|group| {
+            group
+                .labels
+                .iter()
+                .any(|label| label == "count" || label == "spoken_count")
+        })
+    };
+    let mut announcements: Vec<_> = guide.announcements.iter().collect();
+    announcements.sort_by(|a, b| a.start_seconds.total_cmp(&b.start_seconds));
+    let (first, last) = (beat_times[0], *beat_times.last()?);
+    let mut phase: Option<usize> = None;
+    for (index, announcement) in announcements.iter().enumerate() {
+        if !is_count(announcement.group) {
+            continue;
+        }
+        // Only where the speech stops: a fragment a breath later is the
+        // count going on (its "uno, dos" may not have matched a clip), or
+        // more words.
+        let goes_on = announcements.get(index + 1).is_some_and(|next| {
+            next.start_seconds - announcement.end_seconds < COUNT_CHAIN_GAP_BEATS * beat
+        });
+        let from = announcement.end_seconds - TAIL_BEATS * beat;
+        if goes_on || from <= first || from >= last {
+            continue;
+        }
+        let here = beat_times.partition_point(|&t| t < from) % beats_per_bar;
+        if phase.is_some_and(|known| known != here) {
+            return None;
+        }
+        phase = Some(here);
+    }
+    phase
+}
+
+/// Beats in each window either side of a tempo change, all at one tempo.
+const STEADY_BEATS: usize = 4;
+/// Within a window, beats this far apart from its mean (share of a beat) are
+/// still one tempo: onset noise. Ramps and a click following the band are
+/// not steady, and say nothing.
+const STEADY_SHARE: f64 = 0.006;
+/// A jump in beat length of this share at least is a tempo change (70 → 71
+/// is 1.4 %).
+const CHANGE_SHARE: f64 = 0.012;
+
+/// How many beats of `beat_times` (one run of a click without accent) come
+/// before its first downbeat, from where its tempo jumps: there a bar starts.
+/// None without such a jump, or when the jumps disagree on the bar.
+pub(crate) fn pickup_from_tempo_changes(beat_times: &[f64], beats_per_bar: usize) -> Option<usize> {
+    if beats_per_bar < 2 || beat_times.len() < 2 * STEADY_BEATS + 1 {
+        return None;
+    }
+    let lengths: Vec<f64> = beat_times.windows(2).map(|w| w[1] - w[0]).collect();
+    let steady = |window: &[f64]| -> Option<f64> {
+        let mean = window.iter().sum::<f64>() / window.len() as f64;
+        (mean > 0.0
+            && window
+                .iter()
+                .all(|&l| (l - mean).abs() <= STEADY_SHARE * mean))
+        .then_some(mean)
+    };
+    let mut phase: Option<usize> = None;
+    let mut index = STEADY_BEATS;
+    while index + STEADY_BEATS <= lengths.len() {
+        let before = steady(&lengths[index - STEADY_BEATS..index]);
+        let after = steady(&lengths[index..index + STEADY_BEATS]);
+        if let (Some(before), Some(after)) = (before, after) {
+            // At once, from one beat to the next: a ramp moves a little each
+            // beat and adds up to as much.
+            let jump = (lengths[index] - lengths[index - 1]).abs();
+            if (after - before).abs() >= CHANGE_SHARE * before && jump >= CHANGE_SHARE * before {
+                // Beat `index` is the first at the new tempo: a downbeat.
+                let here = index % beats_per_bar;
+                if phase.is_some_and(|known| known != here) {
+                    return None;
+                }
+                phase = Some(here);
+                index += STEADY_BEATS;
+                continue;
+            }
+        }
+        index += 1;
+    }
+    phase
+}
+
+/// Where each announcement ends: the end of its last fragment.
+fn announcement_ends(guide: &GuideAnalysis, beat: f64) -> Vec<f64> {
+    let mut fragments: Vec<(f64, f64)> = guide
+        .announcements
+        .iter()
+        .map(|a| (a.start_seconds, a.end_seconds))
+        .collect();
+    fragments.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut ends: Vec<f64> = Vec::new();
+    for (index, &(_, end)) in fragments.iter().enumerate() {
+        let chained = fragments
+            .get(index + 1)
+            .is_some_and(|&(next_start, _)| next_start - end < CHAIN_GAP_BEATS * beat);
+        if !chained {
+            ends.push(end);
+        }
+    }
+    ends
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::guide::GuideAnnouncement;
+
+    fn guide(fragments: &[(f64, f64)]) -> GuideAnalysis {
+        GuideAnalysis {
+            announcements: fragments
+                .iter()
+                .map(|&(start_seconds, end_seconds)| GuideAnnouncement {
+                    start_seconds,
+                    end_seconds,
+                    group: 0,
+                    count_words: Vec::new(),
+                })
+                .collect(),
+            groups: Vec::new(),
+        }
+    }
+
+    /// The fragments the guide analysis found on "Es Él" (Felipe S. Santos,
+    /// 70 BPM): its bars start at 1.714 s, two beats after the click's first.
+    const ES_EL: &[(f64, f64)] = &[
+        (0.08, 0.57),
+        (1.71, 2.12),
+        (2.57, 3.02),
+        (3.43, 4.71),
+        (22.30, 25.28),
+        (51.43, 52.12),
+        (77.15, 77.57),
+        (78.00, 80.14),
+        (97.72, 100.71),
+        (126.86, 127.55),
+        (152.58, 153.00),
+        (153.42, 154.73),
+        (155.14, 155.57),
+        (174.86, 175.29),
+        (193.72, 195.02),
+        (195.43, 196.71),
+        (216.01, 217.15),
+        (234.86, 235.29),
+        (235.71, 237.86),
+        (257.15, 257.57),
+        (276.01, 278.16),
+        (278.57, 279.00),
+        (296.58, 298.73),
+        (299.14, 299.57),
+        (318.86, 319.40),
+        (337.72, 338.15),
+        (338.57, 339.02),
+        (339.43, 340.71),
+        (360.00, 360.43),
+        (380.58, 381.05),
+    ];
+
+    fn beats(start: f64, bpm: f64, count: usize) -> Vec<f64> {
+        (0..count).map(|i| start + i as f64 * 60.0 / bpm).collect()
+    }
+
+    #[test]
+    fn a_real_guide_finds_the_bar_two_beats_after_the_click() {
+        assert_eq!(
+            pickup_from_guide(&beats(0.0, 70.0, 460), 4, &guide(ES_EL)),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn a_click_already_on_the_bar_keeps_it() {
+        let shifted: Vec<(f64, f64)> = ES_EL
+            .iter()
+            .map(|&(s, e)| (s + 120.0 / 70.0, e + 120.0 / 70.0))
+            .collect();
+        assert_eq!(
+            pickup_from_guide(&beats(0.0, 70.0, 460), 4, &guide(&shifted)),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn too_little_guide_says_nothing() {
+        assert_eq!(
+            pickup_from_guide(&beats(0.0, 70.0, 460), 4, &guide(&[(51.43, 52.12)])),
+            None
+        );
+        assert_eq!(
+            pickup_from_guide(&beats(0.0, 70.0, 460), 4, &guide(&[])),
+            None
+        );
+    }
+
+    /// "Fiesta en el desierto": 16 bars of 125 from the first click, then 140.
+    fn fiesta(pickup: usize) -> Vec<f64> {
+        let mut times = beats(0.061, 125.0, 64 + pickup);
+        times.extend(beats(
+            0.061 + (64 + pickup) as f64 * 60.0 / 125.0,
+            140.0,
+            400,
+        ));
+        times
+    }
+
+    #[test]
+    fn a_tempo_change_starts_a_bar() {
+        assert_eq!(pickup_from_tempo_changes(&fiesta(0), 4), Some(0));
+        // The change two beats into the click: the bars start two beats in.
+        assert_eq!(pickup_from_tempo_changes(&fiesta(2), 4), Some(2));
+    }
+
+    #[test]
+    fn a_steady_click_or_a_ramp_says_nothing() {
+        assert_eq!(pickup_from_tempo_changes(&beats(0.0, 70.0, 460), 4), None);
+        // 120 → 100 a little every beat.
+        let mut ramp = vec![0.0];
+        for i in 0..60 {
+            let bpm = 120.0 - i as f64 / 3.0;
+            ramp.push(ramp[i] + 60.0 / bpm);
+        }
+        assert_eq!(pickup_from_tempo_changes(&ramp, 4), None);
+    }
+
+    #[test]
+    fn tempo_changes_that_disagree_say_nothing() {
+        // On a bar at 64, then two beats into one at 202.
+        let mut times = fiesta(0);
+        times.truncate(202);
+        let change = times[201] + 60.0 / 140.0;
+        times.extend(beats(change, 115.0, 40));
+        assert_eq!(pickup_from_tempo_changes(&times, 4), None);
+        times.truncate(200);
+        let change = times[199] + 60.0 / 140.0;
+        times.extend(beats(change, 115.0, 40));
+        assert_eq!(pickup_from_tempo_changes(&times, 4), Some(0));
+    }
+
+    fn counted(fragments: &[(f64, f64, bool)]) -> GuideAnalysis {
+        GuideAnalysis {
+            announcements: fragments
+                .iter()
+                .map(|&(start_seconds, end_seconds, count)| GuideAnnouncement {
+                    start_seconds,
+                    end_seconds,
+                    group: usize::from(count),
+                    count_words: Vec::new(),
+                })
+                .collect(),
+            groups: [vec![], vec!["count".to_string()]]
+                .into_iter()
+                .map(|labels| crate::guide::GuideGroup {
+                    labels,
+                    transcript: None,
+                    match_cost: None,
+                    counted_in: false,
+                    occurrences: 1,
+                    first_start_seconds: 0.0,
+                    first_end_seconds: 0.0,
+                })
+                .collect(),
+        }
+    }
+
+    /// The fragments the guide analysis found on "La bondad de Dios" (Church
+    /// of the City, 68 BPM, bars from the click's first beat at 0.028 s): a
+    /// count "1 . 2 . 1 2 3 4" and then announcements said at the start of
+    /// the bar before their section.
+    const BONDAD: &[(f64, f64, bool)] = &[
+        (0.03, 0.44, true),
+        (1.79, 2.24, true),
+        // "uno, dos": no clip matched it.
+        (3.56, 4.89, false),
+        (5.32, 5.77, true),
+        (6.20, 6.66, true),
+        (17.67, 18.49, false),
+        (47.68, 48.10, false),
+        (72.38, 73.20, false),
+        (74.14, 74.92, false),
+        (86.51, 87.36, false),
+        (114.74, 115.88, false),
+        (116.50, 116.93, false),
+        (141.20, 142.03, false),
+        (155.33, 155.86, false),
+        (178.27, 179.41, false),
+        (183.56, 184.10, false),
+        (185.32, 186.10, false),
+        (210.03, 210.85, false),
+        (211.79, 212.68, false),
+        (224.15, 224.58, false),
+    ];
+
+    #[test]
+    fn a_guide_that_counts_puts_the_bar_after_its_count() {
+        let click = beats(0.028, 68.0, 380);
+        assert_eq!(pickup_from_guide(&click, 4, &counted(BONDAD)), Some(0));
+        // Without the count to go by, its announcements say another bar.
+        let words: Vec<(f64, f64)> = BONDAD[5..].iter().map(|&(s, e, _)| (s, e)).collect();
+        assert_ne!(pickup_from_guide(&click, 4, &guide(&words)), Some(0));
+    }
+
+    #[test]
+    fn es_el_counts_agree_with_its_announcements() {
+        // "Intro… uno, dos, tres, cuatro" and the counts after "Coro": the
+        // bars two beats after the click's first.
+        let fragments: Vec<(f64, f64, bool)> = ES_EL
+            .iter()
+            .map(|&(s, e)| (s, e, [1.71, 2.57, 3.43, 155.14, 339.43].contains(&s)))
+            .collect();
+        assert_eq!(
+            pickup_from_guide(&beats(0.0, 70.0, 460), 4, &counted(&fragments)),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn announcements_spread_over_the_bar_say_nothing() {
+        // Ends on every beat alike: no phase stands out.
+        let spread: Vec<(f64, f64)> = (0..16)
+            .map(|i| {
+                let end = 10.0 + i as f64 * (3.0 * 60.0 / 70.0 * 4.0 + 60.0 / 70.0) + 0.4;
+                (end - 0.5, end)
+            })
+            .collect();
+        assert_eq!(
+            pickup_from_guide(&beats(0.0, 70.0, 460), 4, &guide(&spread)),
+            None
+        );
+    }
+}

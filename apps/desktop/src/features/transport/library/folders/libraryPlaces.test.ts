@@ -1,0 +1,51 @@
+import { describe, expect, it } from "vitest";
+
+import type { LibraryDirEntry } from "../../desktopApi";
+import { classifyDroppedPaths } from "../dragDrop";
+import { addPlace, filterEntries, placeLabel, removePlace } from "./libraryPlaces";
+
+const entry = (name: string, kind: LibraryDirEntry["kind"] = "audio"): LibraryDirEntry => ({
+  name,
+  path: `D:/Stems/${name}`,
+  kind,
+});
+
+describe("library places", () => {
+  it("does not add the same folder twice, whatever the case or separators", () => {
+    const places = ["D:\\Stems"];
+    expect(addPlace(places, "d:/stems/")).toBe(places);
+    expect(addPlace(places, "E:\\Pads")).toEqual(["D:\\Stems", "E:\\Pads"]);
+  });
+
+  it("removes a place matched the same way", () => {
+    expect(removePlace(["D:\\Stems", "E:\\Pads"], "d:/stems")).toEqual(["E:\\Pads"]);
+  });
+
+  it("labels a place by its folder name, and a drive by its path", () => {
+    expect(placeLabel("D:\\Music\\Stems\\")).toBe("Stems");
+    expect(placeLabel("/Users/me/Stems")).toBe("Stems");
+    expect(placeLabel("D:\\")).toBe("D:\\");
+  });
+
+  // Android hands over SAF tree URIs, not paths.
+  it("labels an Android folder by its decoded name", () => {
+    expect(
+      placeLabel(
+        "content://com.android.externalstorage.documents/tree/primary%3AMusic%2FStems",
+      ),
+    ).toBe("Stems");
+  });
+
+  it("recognises audio inside an Android tree by the document's extension", () => {
+    const uri =
+      "content://com.android.externalstorage.documents/tree/primary%3AMusic%2FStems" +
+      "/document/primary%3AMusic%2FStems%2FDrums.wav";
+    expect(classifyDroppedPaths([uri])).toEqual({ kind: "audio", audioPaths: [uri] });
+  });
+
+  it("searches without case or accents", () => {
+    const entries = [entry("Batería.wav"), entry("Bajo.wav")];
+    expect(filterEntries(entries, "bateria").map((e) => e.name)).toEqual(["Batería.wav"]);
+    expect(filterEntries(entries, "  ")).toBe(entries);
+  });
+});

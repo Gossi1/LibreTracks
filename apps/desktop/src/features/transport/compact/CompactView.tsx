@@ -1,4 +1,5 @@
 import { useTranslation } from "react-i18next";
+import { FEATURE_FLAGS } from "@libretracks/shared/featureFlags";
 import {
   memo,
   useCallback,
@@ -35,6 +36,8 @@ import type { SongReorderHandleProps } from "../songs/SongReorderHandle";
 import { isMobileApp } from "../desktopApi";
 import { LIBRARY_ASSET_DRAG_MIME } from "../library/dragDrop";
 import { clientToZoomedCoords } from "../../../shared/uiZoom";
+import { useTouchContextMenu } from "../timeline/useTouchContextMenu";
+import { NewSongTemplateMenu } from "../templates/NewSongTemplateMenu";
 import {
   COMPACT_COLUMN_MAX_WIDTH_REM,
   COMPACT_COLUMN_MIN_WIDTH_REM,
@@ -323,16 +326,22 @@ function CompactViewComponent({
     onReorder: onReorderSong,
     disabled: resizingRegionId !== null,
   });
+  const canRenderSongReorder = Boolean(onReorderSong) && regionIds.length > 1;
 
-  const handleAddSong = useCallback(async () => {
-    try {
-      const snapshot = await createEmptySong();
-      onSnapshotApplied(snapshot);
-    } catch {
-      // Surface failures via the parent's runAction wrapper if needed;
-      // for now we swallow so the button doesn't crash the view.
-    }
-  }, [onSnapshotApplied]);
+  // `template` comes from the arrow next to the button; without it the
+  // backend applies the default template in Settings, if any.
+  const handleAddSong = useCallback(
+    async (template?: string) => {
+      try {
+        const snapshot = await createEmptySong(undefined, template);
+        onSnapshotApplied(snapshot);
+      } catch {
+        // Surface failures via the parent's runAction wrapper if needed;
+        // for now we swallow so the button doesn't crash the view.
+      }
+    },
+    [onSnapshotApplied],
+  );
 
   // Build a "move to track" submenu list once per snapshot — every clip's
   // context menu uses the same set, sorted by the project's track order.
@@ -416,10 +425,10 @@ function CompactViewComponent({
             key={region.id}
             region={region}
             reorderHandleProps={
-              songReorder.enabled ? songReorder.handleProps : undefined
+              canRenderSongReorder ? songReorder.handleProps : undefined
             }
             reorderSurfaceProps={
-              songReorder.enabled ? songReorder.surfaceProps : undefined
+              canRenderSongReorder ? songReorder.surfaceProps : undefined
             }
             clips={clipsByRegion[region.id] ?? []}
             moveTargets={moveTargets}
@@ -470,13 +479,20 @@ function CompactViewComponent({
           </div>
         ) : null}
         <div className="lt-compact-view-song-actions">
-          <button
-            type="button"
-            className="lt-compact-view-add-song"
-            onClick={handleAddSong}
-          >
-            {t("compactView.newSong")}
-          </button>
+          <div className="lt-compact-view-add-song-group">
+            <button
+              type="button"
+              className="lt-compact-view-add-song"
+              onClick={() => void handleAddSong()}
+            >
+              {t("compactView.newSong")}
+            </button>
+            {FEATURE_FLAGS.songTemplates ? (
+              <NewSongTemplateMenu
+                onCreate={(template) => void handleAddSong(template)}
+              />
+            ) : null}
+          </div>
           <button
             type="button"
             className="lt-compact-view-import-song"
@@ -609,6 +625,13 @@ function CompactSongColumnComponent({
   onResizingChange,
 }: CompactSongColumnProps) {
   const { t } = useTranslation();
+  const clipTouchContextMenu = useTouchContextMenu({
+    ignoreTarget: (target) =>
+      !(target instanceof Element) ||
+      target.closest(
+        ".lt-compact-clip-entry:not(.is-drop-placeholder)",
+      ) === null,
+  });
   const regionId = region.id;
   const headerReorderHandleProps = useMemo(
     () => reorderHandleProps?.(regionId),
@@ -733,10 +756,20 @@ function CompactSongColumnComponent({
     : null;
 
   return (
+    <>
     <div
       className={`lt-compact-song-column ${isActive ? "is-active" : ""} ${isQueued ? "is-queued" : ""} ${columnDensityClass(
         widthRem,
       )}`}
+      onPointerDownCapture={clipTouchContextMenu.begin}
+      onPointerMoveCapture={clipTouchContextMenu.move}
+      onPointerUpCapture={clipTouchContextMenu.cancel}
+      onPointerCancelCapture={clipTouchContextMenu.cancel}
+      onClickCapture={(event) => {
+        if (!clipTouchContextMenu.consumeTriggered()) return;
+        event.preventDefault();
+        event.stopPropagation();
+      }}
       /* data-region-id lets the library asset pointer-drag pipeline in
          TransportPanelContent identify which song the user just dropped
          onto without having to plumb a per-column React ref through the
@@ -876,11 +909,8 @@ function CompactSongColumnComponent({
           </button>
         </div>
       ) : null}
-
-      {/* Drag the right edge to widen / narrow this song's column;
-          double-click restores the default width. Rendered as a button so
-          it is focusable and the arrow-key fallback works without a
-          pointer. */}
+    </div>
+    <div className="lt-compact-column-resize-slot">
       <div
         role="separator"
         aria-orientation="vertical"
@@ -889,6 +919,7 @@ function CompactSongColumnComponent({
         aria-valuemin={COMPACT_COLUMN_MIN_WIDTH_REM}
         aria-valuemax={COMPACT_COLUMN_MAX_WIDTH_REM}
         tabIndex={0}
+        data-no-song-reorder=""
         title={t("compactView.resizeColumn")}
         className={
           isResizing
@@ -898,8 +929,17 @@ function CompactSongColumnComponent({
         onPointerDown={handleResizePointerDown}
         onKeyDown={handleResizeKeyDown}
         onDoubleClick={handleResizeDoubleClick}
-      />
+        onClick={(event) => event.stopPropagation()}
+      >
+        <span
+          className="lt-compact-column-resizer-icon material-symbols-outlined"
+          aria-hidden="true"
+        >
+          width
+        </span>
+      </div>
     </div>
+    </>
   );
 }
 

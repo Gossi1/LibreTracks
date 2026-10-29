@@ -1,5 +1,6 @@
 import {
   useEffect,
+  useMemo,
   useRef,
   type CSSProperties,
   type MouseEvent as ReactMouseEvent,
@@ -20,6 +21,10 @@ import { VideoTrackHeader } from "../video/VideoTrackHeader";
 import { useVideoStore } from "../video/videoStore";
 import { useTouchContextMenu } from "../timeline/useTouchContextMenu";
 import { useTimelineUIStore } from "../uiStore";
+import { useHeaderAreaSelection } from "../mobile/useAreaSelection";
+import { useRenderCounter } from "../perf/useRenderCounter";
+import { renderTrackRows } from "./trackRowWindowing";
+import { useTrackRowWindow } from "./useTrackRowWindow";
 
 const TRACK_HEADER_CONTROL_SELECTOR =
   "button, input, label, textarea, select, .lt-track-toggle-group, .lt-track-volume, .lt-track-pan";
@@ -110,6 +115,7 @@ export function TrackHeadersPane({
   midiLanes,
   headerActions,
 }: TrackHeadersPaneProps) {
+  useRenderCounter("TrackHeadersPane");
   const { t } = useTranslation();
   // Same rule as the video lanes (`useVideoFeature`): on a phone video is
   // read-only only while its native players have not started.
@@ -118,14 +124,24 @@ export function TrackHeadersPane({
   // so it no longer re-renders on every unrelated mutation of `song`.
   const hasSong = useSongStore((state) => state.song !== null);
   const headersListRef = useRef<HTMLDivElement | null>(null);
+  const paneRef = useRef<HTMLDivElement | null>(null);
   const trackReorderMode = useTimelineUIStore(
     (state) => state.trackReorderMode,
   );
+  const areaSelectMode = useTimelineUIStore((state) => state.areaSelectMode);
   const touchContextMenu = useTouchContextMenu({
     ignoreTarget: (target) =>
       target instanceof Element &&
       target.closest(TRACK_HEADER_CONTROL_SELECTOR) !== null,
   });
+  const areaRows = useMemo(
+    () => ({ layout: trackLayout, tracks: visibleTracks }),
+    [trackLayout, visibleTracks],
+  );
+  useHeaderAreaSelection(paneRef, touchContextMenu.cancel, areaRows);
+  // Only the rows near the viewport are mounted in a big session; the lanes
+  // read the same window. See ./useTrackRowWindow.
+  const rowWindow = useTrackRowWindow(trackLayout, visibleTracks);
 
   useEffect(() => {
     const headersList = headersListRef.current;
@@ -141,7 +157,8 @@ export function TrackHeadersPane({
 
   return (
     <div
-      className={`lt-track-headers-pane ${trackReorderMode ? "is-track-reorder-mode" : ""}`}
+      ref={paneRef}
+      className={`lt-track-headers-pane ${trackReorderMode ? "is-track-reorder-mode" : ""} ${areaSelectMode ? "is-area-select" : ""}`}
       data-lt-tour={TOUR_TARGETS.trackHeaders}
       onPointerDownCapture={touchContextMenu.begin}
       onPointerMoveCapture={touchContextMenu.move}
@@ -193,7 +210,7 @@ export function TrackHeadersPane({
         aria-hidden={!hasSong}
         ref={headersListRef}
       >
-        {hasSong && visibleTracks.map((track) => {
+        {hasSong && renderTrackRows(visibleTracks, trackLayout, rowWindow, (track) => {
           const automationEnabled = midiLanes?.automationEnabled !== false;
           const isTrackSelected = selectedTrackIds.includes(track.id);
           const childCount = getTrackChildCount(track.id);
@@ -209,6 +226,7 @@ export function TrackHeadersPane({
                 key={track.id}
                 className="lt-track-header-row"
                 data-track-id={track.id}
+                data-area-skip
                 style={{ height: rowHeight }}
               >
                 <div
@@ -276,6 +294,7 @@ export function TrackHeadersPane({
                 key={track.id}
                 className="lt-track-header-row"
                 data-track-id={track.id}
+                data-area-skip
                 style={{ height: rowHeight }}
               >
                 <div

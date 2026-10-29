@@ -1,7 +1,6 @@
 import {
   formatBpm,
   isMobileApp,
-  transposeKey,
   type ActiveVampSummary,
   type SectionMarkerSummary,
   type SongRegionSummary,
@@ -9,6 +8,11 @@ import {
 } from "../desktopApi";
 import type { TimelineGrid } from "../timeline/timelineMath";
 import { appliedArrangementName } from "../structure/arrangementName";
+import {
+  drawKeyChangeNotches,
+  keyAtScreenX,
+  keyChangeNotches,
+} from "../keyChanges/drawKeyChanges";
 import { markerCategory, markerColor } from "../markerKinds";
 import {
   MARKER_FLAG_FONT,
@@ -498,20 +502,23 @@ export function drawRulerRegion(
   context.fill();
   context.stroke();
 
+  // El nombre se queda pegado al borde izquierdo; la primera muesca de cambio
+  // de nota que tenga delante lo recorta (ver keyChanges/drawKeyChanges).
+  const textLeft = blockLeft + 7;
+  const notches = keyChangeNotches(region, cameraX, pixelsPerSecond);
+  const nextNotchX =
+    notches.find((notch) => notch.x > textLeft)?.x ?? Infinity;
+  const clipRight = Math.min(blockLeft + blockWidth - 6, nextNotchX - 3);
+
+  context.save();
   context.beginPath();
-  context.rect(
-    blockLeft + 6,
-    blockTop,
-    Math.max(0, blockWidth - 12),
-    blockHeight,
-  );
+  context.rect(blockLeft + 6, blockTop, Math.max(0, clipRight - blockLeft - 6), blockHeight);
   context.clip();
   // Fully opaque in both states — the resting name used to sit at 92% alpha on
   // top of a translucent block, which is where it lost its edge.
   context.fillStyle = isSelected ? "#fff4d6" : "#ffefc9";
   context.font = '700 10px "Space Grotesk", sans-serif';
   context.textBaseline = "middle";
-  const textLeft = blockLeft + 7;
   const textCenterY = blockTop + blockHeight / 2 + 0.5;
   context.fillText(region.name, textLeft, textCenterY);
 
@@ -519,8 +526,9 @@ export function drawRulerRegion(
   const badges: string[] = [];
   // The transpose always shifts the key, warp or not (warp = time-ratio,
   // transpose = pitch-scale, both independent on the same Bungee voice). Shown
-  // first as the key is the primary musical cue for a live performer.
-  const effectiveKey = transposeKey(region.key, region.transposeSemitones);
+  // first as the key is the primary musical cue for a live performer. It is
+  // the key sounding at the band's left edge, so it follows the key changes.
+  const effectiveKey = keyAtScreenX(region, textLeft, cameraX, pixelsPerSecond);
   if (effectiveKey) {
     badges.push(effectiveKey);
   }
@@ -564,6 +572,16 @@ export function drawRulerRegion(
     context.fillText(badgeText, badgeLeft + badgePaddingX, textCenterY + 0.1);
     badgeLeft += badgeWidth + 5;
   }
+  context.restore();
+
+  drawKeyChangeNotches(
+    context,
+    notches,
+    blockLeft,
+    blockLeft + blockWidth,
+    blockTop,
+    blockHeight,
+  );
   context.restore();
 }
 
@@ -704,6 +722,47 @@ export function drawRulerMarker(
   context.restore();
 }
 
+/**
+ * A tempo ramp in the tempo lane: a slope from one marker to the next, up
+ * when it speeds up, as Ableton draws a sloped tempo-automation segment.
+ * Drawn under the flags, in the gap between the tempo and meter flags.
+ */
+export function drawRulerTempoRamp(
+  context: CanvasRenderingContext2D,
+  from: TempoMarkerSummary,
+  to: TempoMarkerSummary,
+  width: number,
+  cameraX: number,
+  pixelsPerSecond: number,
+) {
+  const x0 = secondsToScreenX(from.startSeconds, cameraX, pixelsPerSecond);
+  const x1 = secondsToScreenX(to.startSeconds, cameraX, pixelsPerSecond);
+  if (x1 < 0 || x0 > width || x1 - x0 < 2) {
+    return;
+  }
+  const high = TEMPO_FLAG_TOP + TEMPO_FLAG_HEIGHT + 1;
+  const low = BAND_SPLIT + 3;
+  const rising = to.bpm > from.bpm;
+  const y0 = rising ? low : high;
+  const y1 = rising ? high : low;
+  context.save();
+  context.fillStyle = "rgba(87, 241, 219, 0.14)";
+  context.beginPath();
+  context.moveTo(x0, low);
+  context.lineTo(x0, y0);
+  context.lineTo(x1, y1);
+  context.lineTo(x1, low);
+  context.closePath();
+  context.fill();
+  context.strokeStyle = "rgba(87, 241, 219, 0.85)";
+  context.lineWidth = 1.5;
+  context.beginPath();
+  context.moveTo(x0, y0);
+  context.lineTo(x1, y1);
+  context.stroke();
+  context.restore();
+}
+
 export function drawRulerTempoMarker(
   context: CanvasRenderingContext2D,
   marker: TempoMarkerSummary,
@@ -712,6 +771,7 @@ export function drawRulerTempoMarker(
   cameraX: number,
   pixelsPerSecond: number,
   overrideLabel?: string,
+  isSelected = false,
 ) {
   const x = secondsToScreenX(marker.startSeconds, cameraX, pixelsPerSecond);
   const label =
@@ -743,15 +803,19 @@ export function drawRulerTempoMarker(
   }
 
   context.save();
-  context.strokeStyle = overrideLabel
-    ? "rgba(255, 184, 107, 0.85)"
-    : "rgba(87, 241, 219, 0.85)";
+  // Seleccionada: borde blanco y cuerpo mas lleno, como las banderas de
+  // seccion. Hasta la seleccion multiple nada las marcaba como elegidas.
+  context.strokeStyle = isSelected
+    ? "rgba(255, 255, 255, 0.95)"
+    : overrideLabel
+      ? "rgba(255, 184, 107, 0.85)"
+      : "rgba(87, 241, 219, 0.85)";
   // Opaque, for the same reason as the section flags: a translucent body let
   // the grid lines show through the number.
   context.fillStyle = overrideLabel
-    ? blendOnRulerBackdrop("#ffb86b", 0.24)
-    : blendOnRulerBackdrop("#57f1db", 0.24);
-  context.lineWidth = 1.2;
+    ? blendOnRulerBackdrop("#ffb86b", isSelected ? 0.42 : 0.24)
+    : blendOnRulerBackdrop("#57f1db", isSelected ? 0.42 : 0.24);
+  context.lineWidth = isSelected ? 1.8 : 1.2;
   context.beginPath();
   context.moveTo(snappedX, flagTop + 2);
   context.lineTo(

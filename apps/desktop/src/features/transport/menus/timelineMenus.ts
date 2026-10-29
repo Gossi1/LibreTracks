@@ -1,4 +1,5 @@
 import type { MouseEvent as ReactMouseEvent } from "react";
+import { FEATURE_FLAGS } from "@libretracks/shared/featureFlags";
 import {
   getEffectiveBpmAt,
   type AppSettings,
@@ -22,6 +23,7 @@ import {
   promptDialog,
 } from "../../../shared/dialog/dialogService";
 import { clientToZoomedCoords } from "../../../shared/uiZoom";
+import { songSettingsSubmenus } from "../songs/songSubmenus";
 import {
   parseBpmDraft,
   parseTimeSignatureDraft,
@@ -93,9 +95,13 @@ import { colorPickerActions } from "./colorPickerMenu";
 import { clipContextMenuActions } from "./clipMenu";
 import type { ExportSongTarget } from "../panels/ExportSongModal";
 import { openRenderSong } from "../render/renderStore";
+import { openSongAnalysis } from "../songAnalysis/songAnalysisStore";
 import { openStructureEditor } from "../structure/structureEditor";
+import { tempoRampAction } from "../tempo/tempoRampAction";
+import { createKeyChangeCallbacks, keyChangeAtCursorAction } from "../keyChanges/keyChangeMenus";
 import type { ShortcutActionId } from "../keyboard/actions";
 import { createVideoMenus } from "./videoMenus";
+import { matchAliasesAction } from "../templates/matchAliases";
 
 type Translate = (key: string, options?: Record<string, unknown>) => string;
 
@@ -632,6 +638,7 @@ export function createTimelineMenus(getDeps: () => TimelineMenuDeps) {
         label: `${t("transport.menu.songKey", { defaultValue: "Nota de la canción" })} ▸`,
         onSelect: () => openSongRegionKeyMenu(region),
       },
+      keyChangeAtCursorAction(region, cursorSeconds, d),
       {
         label: t("transport.structure.menuItem"),
         onSelect: () => openStructureEditor(region.id),
@@ -686,6 +693,11 @@ export function createTimelineMenus(getDeps: () => TimelineMenuDeps) {
           });
         },
       },
+      ...songSettingsSubmenus(region, {
+        ...d,
+        globalCountStyle: d.appSettings.voiceGuideCountStyle,
+        nextPosition: bumpContextMenuPosition,
+      }),
       {
         label: t("transport.menu.exportSong", {
           defaultValue: "Exportar Cancion",
@@ -703,6 +715,16 @@ export function createTimelineMenus(getDeps: () => TimelineMenuDeps) {
           openRenderSong({ regionId: region.id, regionName: region.name });
         },
       },
+      ...(FEATURE_FLAGS.songAnalysis
+        ? [
+            {
+              label: t("transport.menu.analyzeSong"),
+              onSelect: () => {
+                openSongAnalysis({ regionId: region.id, regionName: region.name });
+              },
+            },
+          ]
+        : []),
       {
         label: t("transport.menu.deleteSong"),
         shortcut: d.shortcutHint("edit.delete"),
@@ -795,7 +817,7 @@ export function createTimelineMenus(getDeps: () => TimelineMenuDeps) {
 
           await d.runAction(async () => {
             const nextSnapshot = await upsertSongTempoMarker(
-              marker.sourceStartSeconds ?? marker.startSeconds,
+              marker.startSeconds,
               nextBpm,
             );
             d.optimisticallyAppliedRevisionsRef.current.add(
@@ -813,6 +835,7 @@ export function createTimelineMenus(getDeps: () => TimelineMenuDeps) {
           });
         },
       },
+      tempoRampAction(marker, { ...d, song: d.songRef.current }),
       {
         label: t("transport.menu.deleteMarker"),
         onSelect: async () => {
@@ -1121,6 +1144,8 @@ export function createTimelineMenus(getDeps: () => TimelineMenuDeps) {
             d.handleSetTrackColor(track, color).then(() => undefined),
           ),
       },
+      // Las palabras con las que una plantilla manda stems aquí al soltarlos.
+      ...(FEATURE_FLAGS.songTemplates ? [matchAliasesAction(track, d)] : []),
       // Sumar a mono: solo pistas de audio (una carpeta no tiene canales
       // propios que sumar). No toca el fichero, asi que es reversible.
       ...(isFolder
@@ -1403,6 +1428,7 @@ export function createTimelineMenus(getDeps: () => TimelineMenuDeps) {
     midiLaneContextMenu,
     openMidiClipMenu,
     midiClipCallbacks,
+    keyChangeCallbacks: createKeyChangeCallbacks(getDeps),
     openVideoClipMenu,
     rulerContextMenu,
     songRegionContextMenu,

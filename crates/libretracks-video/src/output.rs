@@ -83,12 +83,20 @@ pub enum OutputCommand {
     /// −100 (black) … 0 (normal). Fades and "black" ride on this: it answers
     /// at once, while unloading takes time and leaves a stale frame.
     SetBrightness(f64),
+    /// The brightness `slot` must already have when a swap shows it: the
+    /// hidden player draws its preloaded frame with it, so the swap does not
+    /// flash that frame at the brightness of the clip it replaces. Only
+    /// backends whose players have separate brightness use it.
+    PrepareBrightness { slot: Slot, value: f64 },
     /// Per-clip fit override; `None` returns to the settings' fit.
     SetFit(Option<VideoFit>),
     /// Show the idle screen (image or black) on the visible slot.
     ShowIdle,
     /// Show an image (the test pattern) until `None`.
     Overlay(Option<String>),
+    /// Raise the open output above the windows covering it, without taking
+    /// the keyboard focus from the app.
+    BringToFront,
     Shutdown,
 }
 
@@ -156,6 +164,11 @@ pub trait OutputBackend: Send {
     fn player(&mut self, slot: Slot, command: &PlayerCommand) -> Result<(), BackendError>;
     fn show_slot(&mut self, slot: Slot) -> Result<(), BackendError>;
     fn set_brightness(&mut self, value: f64) -> Result<(), BackendError>;
+    /// See [`OutputCommand::PrepareBrightness`]. A backend with one black
+    /// layer over both players (mobile) has nothing to prepare.
+    fn prepare_brightness(&mut self, _slot: Slot, _value: f64) -> Result<(), BackendError> {
+        Ok(())
+    }
     fn set_fit(&mut self, fit: VideoFit) -> Result<(), BackendError>;
     /// Show a still image (idle picture or test pattern) on `slot`, or clear
     /// it (black background) with `None`.
@@ -187,6 +200,9 @@ pub trait OutputBackend: Send {
     }
     /// The session's video came or went (a phone's keep-awake follows it).
     fn content_changed(&mut self, _has_content: bool) {}
+    /// See [`OutputCommand::BringToFront`]. A phone's output is the whole
+    /// external display: nothing can cover it.
+    fn bring_to_front(&mut self, _plan: &SurfacePlan) {}
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -584,6 +600,11 @@ impl<B: OutputBackend> OutputController<B> {
                     let _ = self.backend.set_brightness(value);
                 }
             }
+            OutputCommand::PrepareBrightness { slot, value } => {
+                if self.backend.is_open() {
+                    let _ = self.backend.prepare_brightness(slot, value.clamp(-100.0, 0.0));
+                }
+            }
             OutputCommand::SetFit(fit) => {
                 if fit == self.fit_override {
                     return;
@@ -622,6 +643,11 @@ impl<B: OutputBackend> OutputController<B> {
                 self.status.players[slot.index()].file = path.clone();
                 if let Err(error) = self.backend.show_image(slot, path.as_deref()) {
                     self.fail(error);
+                }
+            }
+            OutputCommand::BringToFront => {
+                if let Some(plan) = self.plan.as_ref().filter(|_| self.backend.is_open()) {
+                    self.backend.bring_to_front(plan);
                 }
             }
             OutputCommand::Shutdown => {
@@ -892,11 +918,13 @@ pub(crate) mod fake {
         pub commands: Vec<(Slot, PlayerCommand)>,
         pub fits: Vec<VideoFit>,
         pub brightness: Vec<f64>,
+        pub prepared: Vec<(Slot, f64)>,
         pub visible: Vec<Slot>,
         pub images: Vec<(Slot, Option<String>)>,
         pub delay: Duration,
         pub pending_events: Vec<BackendEvent>,
         pub polls: Arc<AtomicU32>,
+        pub raises: u32,
     }
 
     impl OutputBackend for FakeBackend {
@@ -936,6 +964,10 @@ pub(crate) mod fake {
             self.brightness.push(value);
             Ok(())
         }
+        fn prepare_brightness(&mut self, slot: Slot, value: f64) -> Result<(), BackendError> {
+            self.prepared.push((slot, value));
+            Ok(())
+        }
         fn set_fit(&mut self, fit: VideoFit) -> Result<(), BackendError> {
             self.fits.push(fit);
             Ok(())
@@ -948,6 +980,9 @@ pub(crate) mod fake {
             self.polls.fetch_add(1, Ordering::Relaxed);
             std::thread::sleep(max_wait.min(Duration::from_millis(1)));
             std::mem::take(&mut self.pending_events)
+        }
+        fn bring_to_front(&mut self, _plan: &SurfacePlan) {
+            self.raises += 1;
         }
     }
 }
@@ -1178,6 +1213,23 @@ mod tests {
         controller.handle(OutputCommand::SetContent(false));
         assert_eq!(controller.status().state, OutputState::Standby);
         assert!(!controller.backend().open);
+    }
+
+    #[test]
+    fn bring_to_front_only_raises_an_open_output() {
+        let mut controller = OutputController::new(FakeBackend::default());
+        controller.handle(OutputCommand::Displays {
+            monitors: monitors(),
+            app_monitor: Some("M1".into()),
+        });
+        controller.handle(OutputCommand::ApplySettings(enabled_on_m2()));
+        controller.handle(OutputCommand::BringToFront);
+        assert_eq!(controller.backend().raises, 0);
+
+        controller.handle(OutputCommand::SetContent(true));
+        assert!(controller.backend().open);
+        controller.handle(OutputCommand::BringToFront);
+        assert_eq!(controller.backend().raises, 1);
     }
 
     /// The wizard's step 3 showed black: opening the output for the test

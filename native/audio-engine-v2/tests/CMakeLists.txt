@@ -23,6 +23,8 @@ add_executable(lt_engine_tests
     test_audio_decoder.cpp
     test_streaming_source_cache.cpp
     test_resampler_seek_continuity.cpp
+    test_sinc_interpolator.cpp
+    test_realtime_resample.cpp
     test_audio_fixtures.cpp
     test_fade_processor.cpp
     test_metronome_renderer.cpp
@@ -47,6 +49,8 @@ add_executable(lt_engine_tests
     test_render_pool_step08.cpp
     test_render_threads_step09.cpp
     test_offline_renderer.cpp
+    test_loudness_meter.cpp
+    test_region_envelope.cpp
 )
 
 target_link_libraries(lt_engine_tests

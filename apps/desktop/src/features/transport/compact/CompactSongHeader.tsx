@@ -8,20 +8,14 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import { useTranslation } from "react-i18next";
-
-import {
-  meterDbToDisplayScale,
-  peakToMeterDb,
-  stepMeterDb,
-  DEFAULT_METER_FALLOFF_DB_PER_SECOND,
-  METER_ACTIVE_EPSILON_DB,
-  METER_MIN_DB,
-} from "@libretracks/shared/meterBallistics";
+import { FEATURE_FLAGS } from "@libretracks/shared/featureFlags";
 
 import { clientToZoomedCoords } from "../../../shared/uiZoom";
 import { useDismissOnBack } from "../mobile/backNavigation";
 import { openRenderSong } from "../render/renderStore";
+import { openSongAnalysis } from "../songAnalysis/songAnalysisStore";
 import { ArrangementBadge } from "../structure/ArrangementBadge";
+import { KeySequenceLabel } from "../keyChanges/SoundingKeyLabel";
 import { openStructureEditor } from "../structure/structureEditor";
 import {
   regionEffectiveKey,
@@ -29,11 +23,13 @@ import {
   type SongRegionSummary,
 } from "../desktopApi";
 import { useTransportStore } from "../store";
+import { useTouchContextMenu } from "../timeline/useTouchContextMenu";
 import {
   SongReorderHandle,
   type SongReorderHandleProps,
 } from "../songs/SongReorderHandle";
 import { SONG_REORDER_IGNORE_ATTRIBUTE } from "../songs/useSongReorder";
+import { SongMasterMeter } from "../tracks/TrackMeter";
 
 /** Spread onto the fader: dragging it must never start a song reorder from
  * the header surface. (The context menu already stops pointerdown.) */
@@ -103,6 +99,13 @@ export function CompactSongHeaderComponent({
   reorderSurfaceProps,
 }: CompactSongHeaderProps) {
   const { t } = useTranslation();
+  const touchContextMenu = useTouchContextMenu({
+    ignoreTarget: (target) =>
+      target instanceof Element &&
+      target.closest(
+        "button, input, select, [data-song-reorder-ignore], [data-no-song-reorder], .lt-compact-clip-menu",
+      ) !== null,
+  });
   const [contextMenu, setContextMenu] = useState<{
     x: number;
     y: number;
@@ -161,62 +164,6 @@ export function CompactSongHeaderComponent({
   );
   const gain = optimistic ?? region.master?.gain ?? 1.0;
 
-  const meterFillRef = useRef<HTMLDivElement | null>(null);
-  const animationStateRef = useRef({
-    frameId: null as number | null,
-    lastFrameAt: 0,
-    currentDb: METER_MIN_DB,
-    targetDb: METER_MIN_DB,
-  });
-
-  // Same animation loop the toolbar's RegionMasterFader uses. The store
-  // update arrives via the shared useRegionMeters hook already wired in
-  // TransportPanelContent.
-  const driveAnimation = useCallback(() => {
-    const animationState = animationStateRef.current;
-    const applyFill = () => {
-      const element = meterFillRef.current;
-      if (!element) return;
-      const scale = meterDbToDisplayScale(animationState.currentDb);
-      element.style.width = `${(scale * 100).toFixed(2)}%`;
-      element.style.opacity = scale > 0 ? "1" : "0";
-    };
-    const step = (now: number) => {
-      const elapsed =
-        animationState.lastFrameAt > 0 ? now - animationState.lastFrameAt : 16.67;
-      animationState.lastFrameAt = now;
-      animationState.currentDb = stepMeterDb(
-        animationState.currentDb,
-        animationState.targetDb,
-        elapsed,
-        DEFAULT_METER_FALLOFF_DB_PER_SECOND,
-      );
-      applyFill();
-      const settled =
-        Math.abs(animationState.currentDb - animationState.targetDb) <
-        METER_ACTIVE_EPSILON_DB;
-      if (settled) {
-        animationState.currentDb = animationState.targetDb;
-        applyFill();
-        animationState.frameId = null;
-        animationState.lastFrameAt = 0;
-        return;
-      }
-      animationState.frameId = requestAnimationFrame(step);
-    };
-    if (animationState.frameId === null) {
-      animationState.frameId = requestAnimationFrame(step);
-    }
-  }, []);
-
-  useTransportStore.subscribe(
-    (state) => state.regionMeters[region.id] ?? 0,
-    (peak) => {
-      animationStateRef.current.targetDb = peakToMeterDb(peak);
-      driveAnimation();
-    },
-  );
-
   // Click on the header (anywhere but the play button or the fader)
   // selects the region. We listen on the root with a check that the
   // event reached us un-stopped — the play button and master fader
@@ -233,6 +180,15 @@ export function CompactSongHeaderComponent({
       } ${
         isSelected ? "is-selected" : ""
       }`}
+      onPointerDownCapture={touchContextMenu.begin}
+      onPointerMoveCapture={touchContextMenu.move}
+      onPointerUpCapture={touchContextMenu.cancel}
+      onPointerCancelCapture={touchContextMenu.cancel}
+      onClickCapture={(event) => {
+        if (!touchContextMenu.consumeTriggered()) return;
+        event.preventDefault();
+        event.stopPropagation();
+      }}
       onContextMenu={openMenu}
       onClick={handleHeaderClick}
       onPointerDown={reorderSurfaceProps?.onPointerDown}
@@ -278,7 +234,7 @@ export function CompactSongHeaderComponent({
             className="lt-compact-song-key"
             title={t("compactView.songKeyTitle")}
           >
-            {regionEffectiveKey(region)}
+            <KeySequenceLabel region={region} />
           </div>
         ) : null}
       </div>
@@ -392,6 +348,18 @@ export function CompactSongHeaderComponent({
               >
                 {t("transport.menu.renderSong")}
               </button>
+              {FEATURE_FLAGS.songAnalysis ? (
+                <button
+                  type="button"
+                  className="lt-compact-clip-menu-item"
+                  onClick={() => {
+                    setContextMenu(null);
+                    openSongAnalysis({ regionId: region.id, regionName: region.name });
+                  }}
+                >
+                  {t("transport.menu.analyzeSong")}
+                </button>
+              ) : null}
               <div className="lt-compact-clip-menu-divider" aria-hidden="true" />
               <button
                 type="button"
@@ -415,11 +383,9 @@ export function CompactSongHeaderComponent({
         // re-fire the header's selection handler.
         onClick={(event) => event.stopPropagation()}
       >
-        <div className="lt-compact-song-meter" aria-hidden="true">
-          <div className="lt-compact-song-meter-fill" ref={meterFillRef} />
-        </div>
+        <SongMasterMeter regionId={region.id} className="lt-compact-song-meter" />
         <input
-          className="lt-compact-song-fader"
+          className="lt-compact-song-fader lt-fader is-master"
           type="range"
           min={0}
           max={2}

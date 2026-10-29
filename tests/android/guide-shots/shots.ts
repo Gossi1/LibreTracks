@@ -41,6 +41,8 @@ import {
   sleep,
   tap,
   touch,
+  uiNodes,
+  uiTap,
   viewport,
   waitFor,
 } from "../lib/device.ts";
@@ -159,6 +161,31 @@ const inv = (cmd: string, args: Record<string, unknown> = {}) =>
     args,
   );
 
+/**
+ * Walks Android's folder picker (DocumentsUI) from the device's storage root
+ * down `dirs` and grants access to the last one.
+ */
+async function pickSafFolder(dirs: string[]) {
+  await sleep(2500);
+  const has = (label: string) => uiNodes().some((n) => n.text === label || n.desc === label);
+  if (!has(dirs[0])) {
+    await uiTap("Show roots");
+    const root = uiNodes().find((n) => /sdk_gphone|Android SDK|Internal storage|Almacenamiento interno/i.test(n.text));
+    if (!root) throw new Error("saf: no storage root in the drawer");
+    adb(`shell input tap ${Math.round(root.x)} ${Math.round(root.y)}`);
+    await sleep(1500);
+  }
+  for (const dir of dirs) await uiTap(dir);
+  // "Use this folder" / "Usar esta carpeta", then the access prompt.
+  const use = uiNodes().find((n) => /use this folder|usar esta carpeta/i.test(n.text));
+  if (!use) throw new Error("saf: no 'use this folder' button");
+  adb(`shell input tap ${Math.round(use.x)} ${Math.round(use.y)}`);
+  await sleep(1500);
+  const allow = uiNodes().find((n) => /^(allow|permitir)$/i.test(n.text));
+  if (allow) adb(`shell input tap ${Math.round(allow.x)} ${Math.round(allow.y)}`);
+  await sleep(2000);
+}
+
 const steps: Record<string, () => Promise<void>> = {
   /** Spanish UI and no telemetry prompt, through the app's own settings. */
   /**
@@ -260,7 +287,7 @@ const steps: Record<string, () => Promise<void>> = {
       { selector: `${bar} .lt-mobile-selection-action`, nth: 0, n: 3, badge: "above" },
       { selector: `${bar} button[aria-label="${L("Más acciones")}"]`, n: 4, badge: "above" },
       { selector: `${bar} button[aria-label="${L("Mezcla")}"]`, n: 5, badge: "above" },
-      { selector: `${bar} button[aria-label="${L("Seleccionar varias pistas")}"]`, n: 6, badge: "above" },
+      { selector: `${bar} button[aria-label="${L("Seleccionar por área")}"]`, n: 6, badge: "above" },
       { selector: `${bar} button[aria-label="${L("Quitar selección")}"]`, n: 7, badge: "above" },
       { selector: `${bar} button[aria-label="${L("Ocultar acciones")}"]`, n: 8, badge: "above" },
     ]);
@@ -289,13 +316,6 @@ const steps: Record<string, () => Promise<void>> = {
 
   async longPressSong() {
     await longPress(".lt-region-hotspot", { nth: 0 });
-    // Song arrangements are in the build but not announced yet (2026-10):
-    // keep "Arreglo" out of the published capture until the feature ships.
-    await run((label: string) => {
-      document.querySelectorAll<HTMLElement>(".lt-context-menu button").forEach((el) => {
-        if ((el.textContent ?? "").trim() === label) el.style.display = "none";
-      });
-    }, L("Arreglo"));
     await sleep(300);
     await shot("song-sheet");
     await back();
@@ -304,10 +324,93 @@ const steps: Record<string, () => Promise<void>> = {
     await back();
   },
 
+  /** Song arrangements (1.14.0): long-press the song → "Arreglo". */
+  async arrangement() {
+    // A run that died inside the editor leaves it open over the timeline.
+    if (await rectOf(".lt-structure-mobile")) {
+      await tap(".lt-structure-mobile-header .lt-structure-icon-button", { nth: 0, settle: 1200 });
+      if (await rectOf("button", { text: L("Descartar") })) await tap("button", { text: L("Descartar"), settle: 1200 });
+    }
+    await longPress(".lt-region-hotspot", { nth: 0 });
+    await sleep(500);
+    await tap(".lt-context-menu button", { text: L("Arreglo") });
+    await waitFor(".lt-structure-mobile", { timeout: 10_000 });
+    await sleep(800);
+    if (await rectOf(".lt-structure-capture-button")) {
+      await annotatedShot("arrangement-capture", [
+        { selector: ".lt-structure-detected", n: 1, pad: 4 },
+        { selector: ".lt-structure-capture-button", n: 2, pad: 3 },
+      ]);
+      await tap(".lt-structure-capture-button");
+      await sleep(1500);
+    }
+    await annotatedShot("arrangement-editor", [
+      { selector: ".lt-structure-mobile-picker", n: 1, pad: 3 },
+      { selector: ".lt-structure-mobile-list", n: 2, pad: 3 },
+      { selector: ".lt-structure-gap", n: 3, pad: 3 },
+      { selector: ".lt-structure-mobile-header .lt-structure-icon-button", nth: 1, n: 4, pad: 3 },
+    ]);
+    // Below the fold on a phone: bring it up before tapping it.
+    await run(() => document.querySelector(".lt-structure-add-row")?.scrollIntoView({ block: "center" }));
+    await sleep(600);
+    await tap(".lt-structure-add-row");
+    await waitFor(".lt-structure-tap-palette", { timeout: 5_000 });
+    await sleep(600);
+    await tap(".lt-structure-tap-row", { nth: 1 });
+    await sleep(500);
+    await shot("arrangement-add-sheet");
+    await tap(".lt-structure-sheet-footer .is-primary");
+    await sleep(800);
+    if (await rectOf(".lt-structure-mobile .is-primary.is-attention")) {
+      await tap(".lt-structure-mobile .is-primary.is-attention");
+      await sleep(2000);
+    }
+    // Applying closes the editor and shows the song with its arrangement.
+    await shot("arrangement-applied");
+    if (await rectOf(".lt-structure-mobile")) {
+      await tap(".lt-structure-mobile-header .lt-structure-icon-button", { nth: 0 });
+      await sleep(1200);
+    }
+  },
+
   async panels() {
     await tap(tour("side-nav-library"));
     await sleep(900);
-    await shot("library");
+    // "Your folders" needs a folder picked through Android's own picker
+    // (SAF). Push one first: adb push <stems> "/sdcard/Music/Multitracks/<song>/".
+    if (!(await rectOf(".lt-folder-library-place"))) {
+      await tap(".lt-library-panel-header .lt-folder-library-add");
+      await pickSafFolder(["Music", "Multitracks"]);
+      await waitFor(".lt-folder-library-place", { timeout: 15_000 });
+    }
+    if (!(await rectOf(".lt-folder-library-place[aria-expanded=true]"))) {
+      await tap(".lt-folder-library-place-toggle");
+      await sleep(1500);
+    }
+    if (!(await rectOf(".lt-folder-library-row.is-file"))) {
+      await tap(".lt-folder-library-row.is-folder", { nth: 0 });
+      await sleep(1500);
+    }
+    await tap(".lt-folder-library-row.is-file", { nth: 0 });
+    await tap(".lt-folder-library-row.is-file", { nth: 1 });
+    await sleep(600);
+    await annotatedShot("library", [
+      { selector: ".lt-library-panel-header .lt-folder-library-add", n: 1 },
+      { selector: ".lt-folder-library-search", n: 2 },
+      { selector: ".lt-folder-library-row.is-place", n: 3 },
+      { selector: ".lt-folder-library-row.is-folder .lt-folder-library-icon", nth: 0, n: 4, pad: 2 },
+      { selector: ".lt-folder-library-row.is-file.is-selected", nth: 0, n: 5 },
+      { selector: ".lt-folder-library-actionbar .lt-folder-library-add", n: 6, badge: "corner" },
+      // At the bottom edge of the screen: a badge below it would be cut off.
+      { selector: ".lt-folder-library-session-toggle", n: 7, badge: "corner" },
+    ], { crop: { selector: ".lt-folder-library", margin: 0 } });
+    await tap(".lt-folder-library-actionbar .lt-folder-library-icon");
+    // The accordion: "In this session" open takes the whole library.
+    await tap(".lt-folder-library-session-toggle");
+    await sleep(1200);
+    await shot("library-session", { selector: ".lt-folder-library", margin: 0 });
+    await tap(".lt-folder-library-session-toggle");
+    await sleep(600);
     // The library is a docked panel, not an overlay: Back would leave the
     // session instead of closing it. Its own button toggles it shut.
     await tap(tour("side-nav-library"));

@@ -5,6 +5,7 @@ sidebar:
   order: 2
 ---
 
+import Legend from "../../../../../components/guide/Legend.astro";
 import Clip from "../../../../../components/guide/Clip.astro";
 
 Una sesión de LibreTracks es un **repertorio**: varias canciones seguidas en la
@@ -92,6 +93,8 @@ o usa su menú (clic derecho):
 - **Nota de la canción**: su tonalidad. Aparece junto al nombre, en la Vista
   Live y en el Remote, y **se transpone sola** cuando cambias el tono: una
   canción en *D* subida 2 semitonos se muestra en *E*.
+- **Cambio de nota en el cursor ▸**: la canción cambia de nota a mitad. Ver
+  [Cambios de nota](#cambios-de-nota).
 - **Master**: el volumen de toda la canción. No afecta al metrónomo ni a la voz
   guía.
 - **Transposición** y **warp**: ver
@@ -99,6 +102,107 @@ o usa su menú (clic derecho):
   transponer cambia la velocidad, así que la canción se alarga o se acorta, y
   las siguientes se desplazan para no solaparse.
 - **Cambiar BPM original**: el tempo al que se grabó el audio, que usa el warp.
+- **Fades de la canción ▸**: fundido de entrada y de salida. Ver
+  [abajo](#fade-de-entrada-y-de-salida).
+- **Arreglo**: repetir, quitar o reordenar secciones de la canción sin tocar
+  los audios. Ver [Arreglos de canción](/es/docs/arrangements/).
+- **Conteo de la voz guía ▸**: cómo cuenta la entrada la voz guía en esta
+  canción. Ver [Voz guía](/es/docs/voice-guide/#encenderla-y-ajustarla).
+- **Analizar canción (tempo, nota y secciones)…**: LibreTracks te propone el
+  tempo, la nota y las marcas. Ver [Analizar canción](/es/docs/song-analysis/).
+
+## Cambios de nota
+
+Una canción puede **cambiar de nota a mitad**, como el último coro que sube un
+tono. La **Nota de la canción** es la de su inicio, y cada cambio es una muesca
+lila en la banda de la canción, con la nota nueva:
+
+![Un cambio de nota a E en la banda de la canción](/guide/desktop/key-change-notch.png)
+
+- **Crear**: pon el cursor donde cambia, clic derecho sobre la canción ›
+  **Cambio de nota en el cursor ▸** y elige la nota.
+- **Editar o quitar**: clic en la muesca para cambiar la nota o
+  **Quitar cambio de nota**; arrástrala para moverla.
+- Los cambios van con la canción: al moverla, partirla, montar un arreglo o
+  exportarla no se descolocan.
+
+En la **Vista Live** se ve la nota que suena y un aviso **→ E** antes de que
+llegue el cambio; en la Vista Compacta y en el Remote, la secuencia **D → E**.
+Si el [pad de ambiente](/es/docs/ambient-pads/) sigue la nota de la canción,
+cambia con ella. Y la [letra y acordes](/es/docs/live-view/#letra-y-acordes)
+escribe los acordes en la nota que suena en cada parte.
+
+[Analizar canción](/es/docs/song-analysis/) también detecta las modulaciones y
+las propone como cambios de nota.
+
+## Fade de entrada y de salida
+
+Cada canción puede **entrar y salir con un fundido** sin tener que ponérselo a
+cada clip. Afecta solo a las pistas: el click y la voz guía suenan a su volumen
+desde el primer compás.
+
+![Esquinas de fade de una canción en la regla](/guide/desktop/song-fade-handles.png)
+
+<Legend>
+
+1. **Fade de entrada**: arrastra la esquina superior izquierda de la canción
+   hacia la derecha. La rampa se dibuja sobre la barra de la canción.
+2. **Fade de salida**: arrastra la esquina superior derecha hacia la izquierda.
+
+</Legend>
+
+Las esquinas se ven al pasar el ratón por la canción, con la canción
+seleccionada o cuando ya tiene un fundido. Si prefieres escribir los segundos,
+usa clic derecho en la canción › **Fades de la canción**:
+
+![Menú «Fades de la canción»](/guide/desktop/menu-song-fades.png)
+
+- El fundido va **por posición**, como el de un clip: si saltas a mitad de la
+  canción suena a volumen completo; si empiezas desde su principio, entra con
+  el fundido.
+- **0** quita el fundido. Ninguno puede pasar del largo de la canción.
+- Viaja con la canción al exportarla (`.ltpkg`) y se oye igual al
+  [renderizar](#exportar-renderizar-y-borrar).
+- Para cortar una canción **en directo** en cualquier momento, usa
+  [Fade out y parar](/es/docs/interface/main-screen/#fade-out-y-parar).
+
+## Nivelar el volumen de las canciones
+
+Cada multitrack viene mezclado a su manera, y en directo se nota: una canción
+llega a la mesa más fuerte que la anterior. **Nivelar volumen de canciones…**
+mide lo fuerte que suena cada canción en sus partes fuertes (el coro, no el
+puente suave) y propone el **master** de cada una para que todas lleguen al
+mismo nivel. Está en el menú **Archivo** (en el móvil, en el menú de archivo de
+la barra lateral), porque afecta a todo el repertorio.
+
+![Nivelar canciones: las pistas que cuentan y el botón Medir](/guide/desktop/level-songs-setup.png)
+
+<Legend>
+
+1. **Pistas que cuentan**: solo lo que va a la PA, agrupado por canción.
+   LibreTracks deja fuera el click, los cues, lo que va a los in-ears y las
+   pistas silenciadas, y te dice por qué; puedes cambiar la selección.
+2. **Medir**: mide todas las canciones. Tarda unos segundos por canción.
+
+</Legend>
+
+![Resultado de la medición con el master propuesto para cada canción](/guide/desktop/level-songs-result.png)
+
+<Legend>
+
+1. **Nivel objetivo**: *Sin saturar (recomendado)* lleva todas las canciones al
+   nivel más alto que todas alcanzan sin saturar. También puedes igualarlas a
+   la mediana del repertorio o a una canción concreta.
+2. **La propuesta**: la sonoridad medida, el master actual, el propuesto y el
+   cambio de cada canción.
+3. **Aplicar**: ajusta el master de las canciones de un golpe. Se deshace con
+   <kbd>Ctrl</kbd>+<kbd>Z</kbd> (en el móvil, con el botón Deshacer).
+
+</Legend>
+
+Normalmente la propuesta baja canciones en vez de subirlas: es lo esperado, y
+se compensa una sola vez con la ganancia de la mesa. El master no afecta al
+metrónomo ni a la voz guía.
 
 ## Reordenar el repertorio
 
@@ -106,7 +210,9 @@ o usa su menú (clic derecho):
 - En la **Vista Compacta** y en la **Vista Live**, arrastra la canción por su
   **asa** (los seis puntos a su izquierda) a su nuevo puesto. Mientras
   arrastras ves dónde va a caer. Con el asa seleccionada, las flechas del
-  teclado la mueven de una en una. La canción se mueve entera, con su audio,
+  teclado la mueven de una en una. En el móvil, **mantén el dedo** un momento
+  sobre el asa antes de arrastrar (notarás una vibración donde el teléfono la
+  tiene): así un deslizamiento rápido no reordena por error. La canción se mueve entera, con su audio,
   marcas y tempo, y los huecos entre canciones se conservan.
 
 ## Pasar de una canción a otra en directo
@@ -115,6 +221,25 @@ Por defecto, al terminar una canción la reproducción sigue con la siguiente.
 Si prefieres parar entre canciones (para hablar, por ejemplo), activa **Pausar
 al terminar cada canción** en Configuración › General: la reproducción se para
 justo en el último fotograma de cada canción, y *Play* empieza la siguiente.
+
+Si prefieres que la banda no se quede sin referencia entre canciones, activa el
+**Vamp entre canciones**: al terminar cada canción la reproducción espera igual
+que con la pausa, pero el **click sigue al tempo de la canción que acaba** y el
+**pad sigue sonando** todo el tiempo que haga falta. *Play* empieza la
+siguiente; *Stop* para el click. Se activa con el botón **Entre canciones** de
+la [Vista Live](/es/docs/live-view/), en el panel de Vamp de la barra de
+herramientas o en Configuración › General › **Vamp entre canciones (click y
+pad)**.
+
+![Botón Entre canciones junto a VAMP en la Vista Live](/guide/desktop/live-vamp-between-songs.png)
+
+<Legend>
+
+1. **Entre canciones**: activa el vamp entre canciones. Mientras está
+   sonando, el botón late para que sepas por qué no ha empezado la siguiente.
+2. **VAMP**: el vamp de siempre, dentro de una canción.
+
+</Legend>
 
 Para saltar a otra canción: los botones **Anterior** y **Siguiente**,
 <kbd>Mayús</kbd>+número (<kbd>Mayús</kbd>+<kbd>0</kbd> es la primera canción),

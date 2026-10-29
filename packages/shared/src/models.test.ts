@@ -19,6 +19,10 @@ import {
   DEFAULT_VIDEO_OUTPUT_SETTINGS,
   parseSongKey,
   regionEffectiveKey,
+  regionEffectiveKeyAt,
+  regionKeySequence,
+  regionKeySummary,
+  regionNextKeyChange,
   regionPadKey,
   transposeKey,
   type AppSettings,
@@ -235,6 +239,27 @@ describe("normalizeAppSettings", () => {
     expect(normalized.videoAudioOnImport).toBe("extract");
   });
 
+  it("keeps the voice-guide count style and defaults old or unknown ones to 1-2-3-4", () => {
+    expect(
+      normalizeAppSettings({
+        ...DEFAULT_APP_SETTINGS,
+        voiceGuideCountStyle: "halfThenFull",
+      }).voiceGuideCountStyle,
+    ).toBe("halfThenFull");
+    // Settings saved before the field existed.
+    const legacy = { ...DEFAULT_APP_SETTINGS } as Partial<AppSettings>;
+    delete legacy.voiceGuideCountStyle;
+    expect(
+      normalizeAppSettings(legacy as AppSettings).voiceGuideCountStyle,
+    ).toBe("full");
+    expect(
+      normalizeAppSettings({
+        ...DEFAULT_APP_SETTINGS,
+        voiceGuideCountStyle: "triplets" as AppSettings["voiceGuideCountStyle"],
+      }).voiceGuideCountStyle,
+    ).toBe("full");
+  });
+
   it("clamps metronome volume into [0, +20 dB headroom]", () => {
     // The click fader is an aux dB fader reaching +20 dB (linear gain ≈ 10),
     // so anything above that headroom clamps to it, not to unity.
@@ -430,6 +455,35 @@ describe("normalizeAppSettings", () => {
     ).toBe(false);
   });
 
+  it("reads the track layout from the old merge switch until one is chosen", () => {
+    const { songTrackLayout: _omitted, ...withoutLayout } = DEFAULT_APP_SETTINGS;
+    expect(
+      normalizeAppSettings(withoutLayout as AppSettings).songTrackLayout,
+    ).toBe("shared");
+    expect(
+      normalizeAppSettings({
+        ...(withoutLayout as AppSettings),
+        importMergeMatchingTracks: false,
+      }).songTrackLayout,
+    ).toBe("separate");
+    // A chosen layout wins over the old switch.
+    expect(
+      normalizeAppSettings({
+        ...DEFAULT_APP_SETTINGS,
+        importMergeMatchingTracks: true,
+        songTrackLayout: "songFolder",
+      }).songTrackLayout,
+    ).toBe("songFolder");
+    // A newer version's value falls back to the switch.
+    expect(
+      normalizeAppSettings({
+        ...DEFAULT_APP_SETTINGS,
+        importMergeMatchingTracks: false,
+        songTrackLayout: "fromTheFuture" as AppSettings["songTrackLayout"],
+      }).songTrackLayout,
+    ).toBe("separate");
+  });
+
   it("defaults autosave to on every 5 minutes for older settings files", () => {
     const {
       autoSaveEnabled: _enabled,
@@ -592,6 +646,20 @@ describe("getEffectiveBpmAt", () => {
     expect(getEffectiveBpmAt(song, 25)).toBe(80);
   });
 
+  it("follows a tempo ramp to the next marker", () => {
+    const song = makeSong({
+      bpm: 100,
+      tempoMarkers: [
+        { id: "m1", startSeconds: 10, bpm: 60, ramp: true },
+        { id: "m2", startSeconds: 20, bpm: 120 },
+      ],
+    });
+    expect(getEffectiveBpmAt(song, 5)).toBe(100);
+    expect(getEffectiveBpmAt(song, 10)).toBe(60);
+    expect(getEffectiveBpmAt(song, 15)).toBeCloseTo(90, 9);
+    expect(getEffectiveBpmAt(song, 25)).toBe(120);
+  });
+
   it("applies varispeed scaling inside a transposed non-warp region", () => {
     const song = makeSong({
       bpm: 120,
@@ -703,5 +771,55 @@ describe("markerCategory", () => {
     expect(markerCategory({ kind: "build", categoryOverride: null })).toBe(
       "cue",
     );
+  });
+});
+
+describe("key changes", () => {
+  const modulating = () =>
+    makeRegion({
+      startSeconds: 100,
+      endSeconds: 400,
+      key: "D",
+      transposeSemitones: 0,
+      keyChanges: [
+        { id: "up", startSeconds: 280, key: "E" },
+        { id: "back", startSeconds: 350, key: "D" },
+      ],
+    });
+
+  it("lists the starting key and each change in order", () => {
+    expect(regionKeySequence(modulating())).toEqual([
+      { startSeconds: 100, key: "D" },
+      { startSeconds: 280, key: "E" },
+      { startSeconds: 350, key: "D" },
+    ]);
+    expect(regionKeySummary(modulating())).toBe("D → E → D");
+  });
+
+  it("reads the key sounding at a position, the starting one before the song", () => {
+    const region = modulating();
+    expect(regionEffectiveKeyAt(region, 50)).toBe("D");
+    expect(regionEffectiveKeyAt(region, 279.9)).toBe("D");
+    expect(regionEffectiveKeyAt(region, 280)).toBe("E");
+    expect(regionEffectiveKeyAt(region, 360)).toBe("D");
+  });
+
+  it("transposes every change with the song", () => {
+    const region = { ...modulating(), transposeSemitones: 2 };
+    expect(regionKeySummary(region)).toBe("E → F# → E");
+    expect(regionEffectiveKeyAt(region, 300)).toBe("F#");
+  });
+
+  it("finds the next change strictly after a position", () => {
+    expect(regionNextKeyChange(modulating(), 280)).toEqual({ startSeconds: 350, key: "D" });
+    expect(regionNextKeyChange(modulating(), 360)).toBeNull();
+  });
+
+  it("is just the key for a song that never modulates (or a host without the field)", () => {
+    const region = makeRegion({ key: "Am" });
+    expect(regionKeySummary(region)).toBe("Am");
+    expect(regionEffectiveKeyAt(region, 5)).toBe("Am");
+    expect(regionNextKeyChange(region, 0)).toBeNull();
+    expect(regionKeySummary(makeRegion({ key: null }))).toBeNull();
   });
 });

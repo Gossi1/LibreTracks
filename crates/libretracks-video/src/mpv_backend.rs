@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use libretracks_core::VideoFit;
 
+use crate::diagnostics::{trace, trace_error};
 use crate::monitors::SurfacePlan;
 use crate::mpv::{EndFileReason, Mpv, MpvEvent, MpvLibrary, ObserveAs, PropertyValue};
 use crate::output::{BackendError, BackendEvent, OutputBackend, PlayerCommand, Slot};
@@ -55,6 +56,16 @@ pub struct MpvOutputBackend {
     #[cfg(target_os = "macos")]
     main_thread: Option<crate::surface_macos::MainThread>,
     players: [Option<Mpv>; 2],
+    /// Index of the player on screen.
+    visible: usize,
+    /// The level each player was last given (`None` = mpv's default, 0).
+    levels: [Option<f64>; 2],
+    /// Last level written to the crash trail per player: a fade moves it
+    /// every tick, and the trail only needs its shape.
+    traced_levels: [Option<f64>; 2],
+    /// The level the picture on screen should have: a slot made visible
+    /// takes it.
+    picture: f64,
     /// Linux: one player (mpv's own window) serves both slots.
     single_player: bool,
     open: bool,
@@ -71,6 +82,10 @@ impl MpvOutputBackend {
             #[cfg(target_os = "macos")]
             main_thread: None,
             players: [None, None],
+            visible: 0,
+            levels: [None, None],
+            traced_levels: [None, None],
+            picture: 0.0,
             single_player: !cfg!(any(windows, target_os = "macos")),
             open: false,
         }
@@ -203,6 +218,9 @@ impl MpvOutputBackend {
             mpv.set_option(name, value).map_err(failed)?;
         }
         mpv.initialize().map_err(failed)?;
+        // mpv's own warnings and errors (decoder, GPU, hwdec) go to the crash
+        // trail; best effort.
+        let _ = mpv.request_log_messages("warn");
         // Best effort: without it (an old libmpv) the mode is still changed
         // from the settings.
         if MPV_OWNS_POINTER {
@@ -215,6 +233,30 @@ impl MpvOutputBackend {
         mpv.observe_property(PROP_HWDEC, "hwdec-current", ObserveAs::String)
             .map_err(failed)?;
         Ok(mpv)
+    }
+
+    /// Fades, forced black and "black when stopped" as a GAIN on the
+    /// picture: −100 → black, 0 → untouched. mpv's `contrast` scales every
+    /// channel keeping black at black (both renderers, `gpu` and `gpu-next`),
+    /// so a dark scene fades as a whole. `brightness` only subtracted: a mid
+    /// grey stayed black until half the fade had gone.
+    fn set_level(&mut self, index: usize, value: f64) -> Result<(), BackendError> {
+        if self.levels[index] == Some(value) {
+            return Ok(());
+        }
+        let Some(player) = &self.players[index] else {
+            return Ok(());
+        };
+        player
+            .set_property_async("contrast", &format!("{value:.3}"))
+            .map_err(failed)?;
+        self.levels[index] = Some(value);
+        let endpoint = value == 0.0 || value == -100.0;
+        if endpoint || self.traced_levels[index].is_none_or(|traced| (traced - value).abs() >= 10.0) {
+            self.traced_levels[index] = Some(value);
+            trace(|| format!("video: nivel reproductor {index} = {value:.0}"));
+        }
+        Ok(())
     }
 
     fn each_player(&self, mut action: impl FnMut(&Mpv) -> Result<(), crate::VideoError>) -> Result<(), BackendError> {
@@ -233,15 +275,31 @@ impl MpvOutputBackend {
                 (PROP_FRAME_DROPS, PropertyValue::Int(count)) => {
                     Some(BackendEvent::FrameDrops { slot, count })
                 }
-                (PROP_HWDEC, PropertyValue::String(name)) => Some(BackendEvent::Hwdec { slot, name }),
+                (PROP_HWDEC, PropertyValue::String(name)) => {
+                    trace(|| format!("video: {slot:?} hwdec = {name}"));
+                    Some(BackendEvent::Hwdec { slot, name })
+                }
                 _ => None,
             },
+            MpvEvent::LogMessage { prefix, level, text } => {
+                let line = || format!("mpv {slot:?} [{prefix}] {level}: {text}");
+                if level == "error" || level == "fatal" {
+                    trace_error(line);
+                } else {
+                    trace(line);
+                }
+                None
+            }
             MpvEvent::PlaybackRestart => Some(BackendEvent::PlaybackRestart { slot }),
             // Only the user makes a player quit (Linux: closing mpv's window);
             // ours are destroyed without being polled again.
             MpvEvent::Shutdown => Some(BackendEvent::Closed),
-            MpvEvent::FileLoaded => Some(BackendEvent::FileLoaded { slot }),
+            MpvEvent::FileLoaded => {
+                trace(|| format!("video: {slot:?} archivo cargado"));
+                Some(BackendEvent::FileLoaded { slot })
+            }
             MpvEvent::EndFile(EndFileReason::Error(reason)) => {
+                trace_error(|| format!("video: {slot:?} no se pudo reproducir: {reason}"));
                 Some(BackendEvent::LoadFailed { slot, reason })
             }
             MpvEvent::ClientMessage(args) if args.first().map(String::as_str) == Some(TOGGLE_MESSAGE) => {
@@ -255,6 +313,16 @@ impl MpvOutputBackend {
 impl OutputBackend for MpvOutputBackend {
     fn open(&mut self, plan: &SurfacePlan, settings: &VideoOutputSettings) -> Result<(), BackendError> {
         self.close();
+        trace(|| {
+            format!(
+                "video: abrir salida en {} (fullscreen {}, hwdec {})",
+                plan.monitor_name,
+                plan.fullscreen,
+                settings.hwdec.mpv_value()
+            )
+        });
+        self.visible = 0;
+        self.levels = [None, None];
 
         #[cfg(target_os = "macos")]
         if let Err(error) = self.open_macos(plan, settings) {
@@ -332,6 +400,27 @@ impl OutputBackend for MpvOutputBackend {
         Ok(())
     }
 
+    fn bring_to_front(&mut self, plan: &SurfacePlan) {
+        #[cfg(windows)]
+        if let Some(surface) = self.surface.as_ref() {
+            surface.bring_to_front(plan);
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(surface) = self.surface.as_mut() {
+            surface.show();
+            return;
+        }
+        // Linux: mpv's own window. Putting it on top for a moment raises it;
+        // then it goes back to what the plan says.
+        #[cfg(not(any(windows, target_os = "macos")))]
+        if let Some(player) = &self.players[0] {
+            let _ = player.set_property_flag("ontop", true);
+            let _ = player.set_property_flag("ontop", plan.on_top);
+        }
+        let _ = plan;
+    }
+
     fn close(&mut self) {
         // macOS: stop drawing first — each render context must be freed
         // before its player is destroyed (render.h) — and keep the panel.
@@ -340,8 +429,12 @@ impl OutputBackend for MpvOutputBackend {
             surface.detach(0);
             surface.detach(1);
         }
+        if self.open {
+            trace(|| "video: cerrar salida".to_string());
+        }
         // Players first: mpv must let go of its child windows before they die.
         self.players = [None, None];
+        self.levels = [None, None];
         #[cfg(windows)]
         {
             self.surface = None;
@@ -360,6 +453,21 @@ impl OutputBackend for MpvOutputBackend {
     fn player(&mut self, slot: Slot, command: &PlayerCommand) -> Result<(), BackendError> {
         let player = self.mpv_for(slot)?;
         match command {
+            // Sync nudges the speed all the time; the trail does not need it.
+            PlayerCommand::SetSpeed(_) => {}
+            PlayerCommand::Load {
+                path,
+                start_seconds,
+                paused,
+            } => trace(|| {
+                let name = std::path::Path::new(path)
+                    .file_name()
+                    .map_or_else(|| path.clone(), |name| name.to_string_lossy().into_owned());
+                format!("video: {slot:?} cargar {name} en {start_seconds:.3}s (pausa {paused})")
+            }),
+            other => trace(|| format!("video: {slot:?} {other:?}")),
+        }
+        match command {
             PlayerCommand::Load {
                 path,
                 start_seconds,
@@ -376,12 +484,15 @@ impl OutputBackend for MpvOutputBackend {
                     .command_async(0, &["seek", &format!("{:.6}", seconds.max(0.0)), "absolute+exact"])
                     .map_err(failed)?;
             }
+            // Async: see `Mpv::set_property_async`. The sync sends these often.
             PlayerCommand::SetPause(paused) => {
-                player.set_property_flag("pause", *paused).map_err(failed)?;
+                player
+                    .set_property_async("pause", if *paused { "yes" } else { "no" })
+                    .map_err(failed)?;
             }
             PlayerCommand::SetSpeed(speed) => {
                 player
-                    .set_property_f64("speed", speed.clamp(0.01, 100.0))
+                    .set_property_async("speed", &format!("{:.6}", speed.clamp(0.01, 100.0)))
                     .map_err(failed)?;
             }
             PlayerCommand::Stop => {
@@ -392,6 +503,15 @@ impl OutputBackend for MpvOutputBackend {
     }
 
     fn show_slot(&mut self, slot: Slot) -> Result<(), BackendError> {
+        // Give the player the picture's level BEFORE it is on screen; when
+        // its preload was prepared (the usual case) it already has it.
+        let index = self.slot_index(slot);
+        if index != self.visible {
+            trace(|| format!("video: mostrar {slot:?}"));
+        }
+        self.visible = index;
+        let picture = self.picture;
+        let _ = self.set_level(index, picture);
         #[cfg(windows)]
         if let Some(surface) = &self.surface {
             surface.show_slot(self.slot_index(slot));
@@ -407,8 +527,20 @@ impl OutputBackend for MpvOutputBackend {
         Ok(())
     }
 
+    /// Only the player on screen: the hidden one keeps the level of the
+    /// frame it holds for the next swap (`prepare_brightness`).
     fn set_brightness(&mut self, value: f64) -> Result<(), BackendError> {
-        self.each_player(|player| player.set_property_f64("brightness", value))
+        self.picture = value;
+        self.set_level(self.visible, value)
+    }
+
+    fn prepare_brightness(&mut self, slot: Slot, value: f64) -> Result<(), BackendError> {
+        let index = self.slot_index(slot);
+        // One player for both slots (Linux): it is the one on screen.
+        if index == self.visible {
+            return Ok(());
+        }
+        self.set_level(index, value)
     }
 
     fn set_fit(&mut self, fit: VideoFit) -> Result<(), BackendError> {
@@ -422,6 +554,7 @@ impl OutputBackend for MpvOutputBackend {
 
     fn show_image(&mut self, slot: Slot, path: Option<&str>) -> Result<(), BackendError> {
         let player = self.mpv_for(slot)?;
+        trace(|| format!("video: {slot:?} imagen {path:?}"));
         match path {
             Some(path) => {
                 player.set_property_string("start", "0").map_err(failed)?;

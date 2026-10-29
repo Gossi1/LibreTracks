@@ -3,6 +3,7 @@
 //! just functions that read or rewrite a `Song`'s timeline. Shared by the
 //! region/tempo methods in `mod.rs` and the import paths.
 
+use libretracks_core::tempo_ramp::{bpm_at, tempo_span_at, TempoSpan};
 use libretracks_core::{
     audible_clip_duration_seconds, effective_bpm_at, source_seconds_at_view,
     warp_timeline_seconds_at, Clip, Song, SongRegion, TempoMarker,
@@ -17,7 +18,7 @@ use super::timestamp_suffix;
 /// numerator. Used by create_empty_song to space new songs by one bar of
 /// silence regardless of tempo.
 pub(super) fn bar_seconds_at(song: &Song, position_seconds: f64) -> f64 {
-    let bpm = libretracks_core::effective_bpm_at(song, position_seconds).max(1.0);
+    let bpm = bpm_at(song, position_seconds).max(1.0);
     let beats_per_bar = song
         .time_signature
         .split_once('/')
@@ -38,17 +39,6 @@ pub(super) fn next_downbeat_after_in_song(song: &Song, position_seconds: f64) ->
     if position_seconds <= 0.0 {
         return 0.0;
     }
-    // Build the set of tempo segments: from each tempo marker (sorted by
-    // start) to the next marker's start (or +infinity for the last one).
-    // Within a segment the BPM is constant so the local downbeat math is
-    // a simple rounding.
-    let mut markers = song.tempo_markers.clone();
-    markers.sort_by(|a, b| {
-        a.start_seconds
-            .partial_cmp(&b.start_seconds)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
     let beats_per_bar = song
         .time_signature
         .split_once('/')
@@ -56,30 +46,18 @@ pub(super) fn next_downbeat_after_in_song(song: &Song, position_seconds: f64) ->
         .filter(|n| *n > 0)
         .unwrap_or(4) as f64;
 
-    // Walk segments in order to find the one containing position_seconds: the
-    // segment whose start_seconds is the greatest <= position_seconds (or the
-    // implicit "before-any-marker" segment anchored at 0 with the song's base
-    // BPM). Only that segment's start and BPM matter for the result below.
-    let mut segment_start_seconds = 0.0_f64;
-    let mut segment_bpm = song.bpm.max(1.0);
-
-    for marker in &markers {
-        if marker.start_seconds > position_seconds {
-            break;
-        }
-        segment_start_seconds = marker.start_seconds;
-        segment_bpm = marker.bpm.max(1.0);
-    }
-
-    let segment_bar_seconds = (beats_per_bar * 60.0) / segment_bpm.max(1.0);
-    if segment_bar_seconds <= 0.0 {
+    // The stretch of the tempo map holding `position_seconds` (a step, or a
+    // ramp to the next marker): bars count from its start.
+    let span = tempo_span_at(song, position_seconds);
+    let quarters_per_bar = beats_per_bar;
+    let local_bars = span.quarters_between(span.start, position_seconds) / quarters_per_bar;
+    if !local_bars.is_finite() {
         return position_seconds;
     }
-    let local_bars = (position_seconds - segment_start_seconds) / segment_bar_seconds;
     // Ceil with a tiny epsilon so positions already on a downbeat don't
     // jump to the next one due to floating drift.
     let target_local_bars = (local_bars - 1e-9).ceil().max(0.0);
-    segment_start_seconds + target_local_bars * segment_bar_seconds
+    span.seconds_after(span.start, target_local_bars * quarters_per_bar)
 }
 
 const REGION_DOWNBEAT_ALIGNMENT_EPSILON_SECONDS: f64 = 0.15;
@@ -87,7 +65,6 @@ const REGION_DOWNBEAT_ALIGNMENT_EPSILON_SECONDS: f64 = 0.15;
 #[derive(Clone, Copy)]
 pub(super) struct ViewTempoBoundary<'a> {
     start_seconds: f64,
-    bpm: Option<f64>,
     time_signature: Option<&'a str>,
 }
 
@@ -172,6 +149,99 @@ pub(super) fn snap_regions_after_to_downbeats(song: &mut Song, moved_region_id: 
         pusher_start = victim_region.start_seconds;
         pusher_id = victim_id;
     }
+}
+
+/// Pone una canción (región) a `target_bpm` en su arranque multiplicando por
+/// el mismo factor TODAS las marcas de tempo que caen dentro de ella, para que
+/// una canción con varias marcas (o rampas del análisis) acelere entera y no
+/// solo su primer tramo. El warp usa una sola relación por región (tempo al
+/// inicio / BPM original), así que las marcas interiores tienen que moverse con
+/// ella o el clic se separa del audio a partir de la segunda marca.
+///
+/// Lo que va después de la región no cambia: si la canción siguiente heredaba
+/// el tempo (no tiene marca propia en su arranque) se le fija una con el tempo
+/// que tenía, y si la región heredaba el suyo se le crea una marca de arranque.
+pub(super) fn scale_region_tempo(
+    song: &mut Song,
+    region_id: &str,
+    target_bpm: f64,
+) -> Result<(), DesktopError> {
+    const EPS: f64 = 0.0001;
+    let (start, end) = song
+        .regions
+        .iter()
+        .find(|region| region.id == region_id)
+        .map(|region| (region.start_seconds, region.end_seconds))
+        .ok_or_else(|| DesktopError::RegionNotFound(region_id.to_string()))?;
+    let current_bpm = effective_bpm_at(song, start);
+    if !(current_bpm.is_finite() && current_bpm > 0.0) {
+        return Ok(());
+    }
+    let factor = target_bpm / current_bpm;
+    if (factor - 1.0).abs() < 1e-9 {
+        return Ok(());
+    }
+
+    let inside = |seconds: f64| seconds >= start - EPS && seconds < end - EPS;
+    let starts_at_zero = start <= EPS;
+    let out_of_range = |bpm: f64| !(20.0..=300.0).contains(&bpm);
+    if song
+        .tempo_markers
+        .iter()
+        .any(|marker| inside(marker.start_seconds) && out_of_range(marker.bpm * factor))
+        || (starts_at_zero && out_of_range(song.bpm * factor))
+    {
+        return Err(DesktopError::AudioCommand(
+            "song bpm must be between 20.0 and 300.0".into(),
+        ));
+    }
+
+    // Antes de tocar nada: la canción siguiente conserva el tempo que tenía.
+    let next_start = song
+        .regions
+        .iter()
+        .map(|region| region.start_seconds)
+        .filter(|seconds| *seconds >= end - EPS)
+        .fold(f64::INFINITY, f64::min);
+    if next_start.is_finite()
+        && !song
+            .tempo_markers
+            .iter()
+            .any(|marker| (marker.start_seconds - next_start).abs() < EPS)
+    {
+        song.tempo_markers.push(TempoMarker {
+            id: format!("tempo_marker_{}_next", timestamp_suffix()),
+            start_seconds: next_start,
+            bpm: effective_bpm_at(song, next_start),
+            ramp: false,
+        });
+    }
+
+    for marker in song.tempo_markers.iter_mut() {
+        if inside(marker.start_seconds) {
+            marker.bpm *= factor;
+        }
+    }
+    if starts_at_zero {
+        song.bpm *= factor;
+    } else if !song
+        .tempo_markers
+        .iter()
+        .any(|marker| (marker.start_seconds - start).abs() < EPS)
+    {
+        song.tempo_markers.push(TempoMarker {
+            id: format!("tempo_marker_{}", timestamp_suffix()),
+            start_seconds: start,
+            bpm: target_bpm,
+            ramp: false,
+        });
+    }
+    song.tempo_markers.sort_by(|left, right| {
+        left.start_seconds
+            .partial_cmp(&right.start_seconds)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Ok(())
 }
 
 pub(super) fn realign_regions_after_warp_tempo_change(previous_song: &Song, song: &mut Song) {
@@ -296,7 +366,6 @@ pub(super) fn next_downbeat_after_in_view_timeline(song: &Song, position_seconds
         if marker.start_seconds > 0.0 {
             boundaries.push(ViewTempoBoundary {
                 start_seconds: warp_timeline_seconds_at(song, marker.start_seconds),
-                bpm: Some(marker.bpm),
                 time_signature: None,
             });
         }
@@ -305,7 +374,6 @@ pub(super) fn next_downbeat_after_in_view_timeline(song: &Song, position_seconds
         if marker.start_seconds > 0.0 {
             boundaries.push(ViewTempoBoundary {
                 start_seconds: warp_timeline_seconds_at(song, marker.start_seconds),
-                bpm: None,
                 time_signature: Some(marker.signature.as_str()),
             });
         }
@@ -315,14 +383,12 @@ pub(super) fn next_downbeat_after_in_view_timeline(song: &Song, position_seconds
             if region.start_seconds > 0.0 {
                 boundaries.push(ViewTempoBoundary {
                     start_seconds: warp_timeline_seconds_at(song, region.start_seconds),
-                    bpm: None,
                     time_signature: None,
                 });
             }
             if region.end_seconds > 0.0 {
                 boundaries.push(ViewTempoBoundary {
                     start_seconds: warp_timeline_seconds_at(song, region.end_seconds),
-                    bpm: None,
                     time_signature: None,
                 });
             }
@@ -335,24 +401,19 @@ pub(super) fn next_downbeat_after_in_view_timeline(song: &Song, position_seconds
     });
 
     let mut segment_start_seconds = 0.0_f64;
-    let mut segment_bpm = song.bpm.max(1.0);
     let mut segment_time_signature = song.time_signature.as_str();
     let mut cumulative_bars = 0.0_f64;
+    let mut segment_end_seconds = f64::INFINITY;
 
     for boundary in boundaries {
         if boundary.start_seconds > position_seconds {
+            segment_end_seconds = boundary.start_seconds;
             break;
         }
         if boundary.start_seconds > segment_start_seconds {
-            let bar_seconds = view_bar_seconds_at(
-                song,
-                segment_start_seconds,
-                segment_bpm,
-                segment_time_signature,
-            );
-            if bar_seconds > 0.0 {
-                cumulative_bars += (boundary.start_seconds - segment_start_seconds) / bar_seconds;
-            }
+            let span = view_tempo_span(song, segment_start_seconds, boundary.start_seconds);
+            cumulative_bars += span.quarters_between(segment_start_seconds, boundary.start_seconds)
+                / quarters_per_bar(segment_time_signature);
             segment_start_seconds = boundary.start_seconds;
         }
         if let Some(next_signature) = boundary.time_signature {
@@ -361,39 +422,48 @@ pub(super) fn next_downbeat_after_in_view_timeline(song: &Song, position_seconds
             }
             segment_time_signature = next_signature;
         }
-        if let Some(next_bpm) = boundary.bpm {
-            segment_bpm = next_bpm.max(1.0);
-        }
     }
 
-    let bar_seconds = view_bar_seconds_at(
-        song,
-        segment_start_seconds,
-        segment_bpm,
-        segment_time_signature,
-    );
-    if bar_seconds <= 0.0 {
+    let span = view_tempo_span(song, segment_start_seconds, segment_end_seconds);
+    let per_bar = quarters_per_bar(segment_time_signature);
+    let local_bars = span.quarters_between(segment_start_seconds, position_seconds) / per_bar;
+    if !local_bars.is_finite() {
         return position_seconds;
     }
-    let local_bars = (position_seconds - segment_start_seconds) / bar_seconds;
     let target_total_bars = (cumulative_bars + local_bars - 1e-9).ceil().max(0.0);
-    segment_start_seconds + (target_total_bars - cumulative_bars) * bar_seconds
+    span.seconds_after(
+        segment_start_seconds,
+        (target_total_bars - cumulative_bars) * per_bar,
+    )
 }
 
-pub(super) fn view_bar_seconds_at(
-    song: &Song,
-    view_seconds: f64,
-    bpm: f64,
-    time_signature: &str,
-) -> f64 {
-    let source_seconds = source_seconds_at_view(song, view_seconds);
-    let display_bpm = bpm.max(1.0) * varispeed_scale_at_source(song, source_seconds);
-    let beats_per_bar = time_signature
+fn quarters_per_bar(time_signature: &str) -> f64 {
+    let part = |text: &str| text.trim().parse::<u32>().ok().filter(|n| *n > 0);
+    let (beats, unit) = time_signature
         .split_once('/')
-        .and_then(|(num, _)| num.trim().parse::<u32>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(4) as f64;
-    (beats_per_bar * 60.0) / display_bpm.max(1.0)
+        .map(|(num, den)| (part(num).unwrap_or(4), part(den).unwrap_or(4)))
+        .unwrap_or((4, 4));
+    f64::from(beats) * 4.0 / f64::from(unit)
+}
+
+/// The view-time tempo between two view instants with no tempo, meter or
+/// varispeed boundary between them: the source map's tempo (a ramp's line
+/// included) scaled by the varispeed in force.
+fn view_tempo_span(song: &Song, view_start: f64, view_end: f64) -> TempoSpan {
+    let source_start = source_seconds_at_view(song, view_start);
+    let scale = varispeed_scale_at_source(song, source_start);
+    let source_span = tempo_span_at(song, source_start);
+    let start_bpm = (source_span.bpm_at(source_start) * scale).max(1.0);
+    if !source_span.is_ramp() || !view_end.is_finite() {
+        return TempoSpan::constant(view_start, start_bpm);
+    }
+    let source_end = source_seconds_at_view(song, view_end);
+    TempoSpan {
+        start: view_start,
+        end: view_end,
+        start_bpm,
+        end_bpm: (source_span.bpm_at(source_end) * scale).max(1.0),
+    }
 }
 
 pub(super) fn varispeed_scale_at_source(song: &Song, source_seconds: f64) -> f64 {
@@ -533,15 +603,20 @@ pub(super) fn add_varispeed_tempo_boundaries(source_song: &Song, runtime: &mut S
         }
         let view_start = warp_timeline_seconds_at(source_song, region.start_seconds);
         let view_end = warp_timeline_seconds_at(source_song, region.end_seconds).max(view_start);
+        // A boundary inside a ramp carries it on (its own bpm is the ramp's
+        // there), or it would flatten the rest of the ramp into a step.
+        let in_ramp = |at: f64| tempo_span_at(source_song, at).is_ramp();
         synthetic_markers.push(TempoMarker {
             id: format!("{}_varispeed_start", region.id),
             start_seconds: view_start,
             bpm: effective_bpm_at(source_song, region.start_seconds) * scale,
+            ramp: in_ramp(region.start_seconds),
         });
         synthetic_markers.push(TempoMarker {
             id: format!("{}_varispeed_end", region.id),
             start_seconds: view_end,
             bpm: effective_bpm_at(source_song, region.end_seconds),
+            ramp: in_ramp(region.end_seconds),
         });
     }
     runtime.tempo_markers.extend(synthetic_markers);
@@ -612,6 +687,7 @@ pub(super) fn replace_song_region_range(song: &mut Song, replacement: SongRegion
 
         if region.start_seconds < replacement.start_seconds {
             fragment_index += 1;
+            let keys = region.key_map_between(region.start_seconds, replacement.start_seconds);
             next_regions.push(SongRegion {
                 id: format!(
                     "{}_fragment_{}_{}",
@@ -623,17 +699,21 @@ pub(super) fn replace_song_region_range(song: &mut Song, replacement: SongRegion
                 start_seconds: region.start_seconds,
                 end_seconds: replacement.start_seconds,
                 transpose_semitones: region.transpose_semitones,
-                key: region.key.clone(),
+                key: keys.key,
+                key_changes: keys.changes,
                 warp_enabled: region.warp_enabled,
                 warp_source_bpm: region.warp_source_bpm,
                 master: region.master.clone(),
                 compact_column_width_rem: region.compact_column_width_rem,
+                chart: region.chart.clone(),
+                voice_guide_count_style: region.voice_guide_count_style,
                 structure: None,
             });
         }
 
         if region.end_seconds > replacement.end_seconds {
             fragment_index += 1;
+            let keys = region.key_map_between(replacement.end_seconds, region.end_seconds);
             next_regions.push(SongRegion {
                 id: format!(
                     "{}_fragment_{}_{}",
@@ -645,11 +725,14 @@ pub(super) fn replace_song_region_range(song: &mut Song, replacement: SongRegion
                 start_seconds: replacement.end_seconds,
                 end_seconds: region.end_seconds,
                 transpose_semitones: region.transpose_semitones,
-                key: region.key.clone(),
+                key: keys.key,
+                key_changes: keys.changes,
                 warp_enabled: region.warp_enabled,
                 warp_source_bpm: region.warp_source_bpm,
                 master: region.master.clone(),
                 compact_column_width_rem: region.compact_column_width_rem,
+                chart: region.chart.clone(),
+                voice_guide_count_style: region.voice_guide_count_style,
                 structure: None,
             });
         }
@@ -673,42 +756,56 @@ pub(super) fn sort_song_regions(regions: &mut Vec<SongRegion>) {
     });
 }
 
-/// Split every clip whose span strictly contains `split_seconds_view` into two
-/// clips at that point. Same cut math as `split_clips` (warp-aware via
-/// `source_seconds_at_view`), but applied to whichever clips cross the point
-/// rather than a caller-chosen set. Used when splitting a song region so no clip
-/// straddles the new song boundary (the engine rejects boundary-crossing clips).
-pub(super) fn split_clips_crossing_point(song: &mut Song, split_seconds_view: f64) {
+/// Cut `clip` at `split_seconds_source`, or `None` if the point isn't strictly
+/// inside it. Clip positions and durations are stored in source time (the view
+/// maps them through `warp_timeline_seconds_at`), so the cut point must be
+/// converted from view time by the caller — comparing a view-time cursor
+/// against them lands the cut early once a stretched song precedes the clip.
+pub(super) fn split_clip_at_source(
+    clip: &Clip,
+    split_seconds_source: f64,
+    left_id: String,
+    right_id: String,
+) -> Option<(Clip, Clip)> {
+    let clip_end = clip.timeline_start_seconds + clip.duration_seconds;
+    if split_seconds_source <= clip.timeline_start_seconds || split_seconds_source >= clip_end {
+        return None;
+    }
+    let left_duration = split_seconds_source - clip.timeline_start_seconds;
+    let left_clip = Clip {
+        id: left_id,
+        duration_seconds: left_duration,
+        ..clip.clone()
+    };
+    let right_clip = Clip {
+        id: right_id,
+        timeline_start_seconds: split_seconds_source,
+        source_start_seconds: clip.source_start_seconds + left_duration,
+        duration_seconds: clip_end - split_seconds_source,
+        ..clip.clone()
+    };
+    Some((left_clip, right_clip))
+}
+
+/// Split every clip whose span strictly contains `split_seconds_source` into
+/// two clips at that point. Same cut as `split_clips`, but applied to whichever
+/// clips cross the point rather than a caller-chosen set. Used when splitting a
+/// song region (and reconciling imports) so no clip straddles a song boundary
+/// (the engine rejects boundary-crossing clips). Takes source time, like the
+/// region bounds it is cut against.
+pub(super) fn split_clips_crossing_point(song: &mut Song, split_seconds_source: f64) {
     let suffix_base = timestamp_suffix();
     let mut index = 0;
     let mut counter = 0;
     while index < song.clips.len() {
-        let clip = song.clips[index].clone();
-        let clip_end = clip.timeline_start_seconds + clip.duration_seconds;
-        if split_seconds_view <= clip.timeline_start_seconds || split_seconds_view >= clip_end {
+        let Some((left_clip, right_clip)) = split_clip_at_source(
+            &song.clips[index],
+            split_seconds_source,
+            format!("clip_{}_{}_l", suffix_base, counter),
+            format!("clip_{}_{}_r", suffix_base, counter),
+        ) else {
             index += 1;
             continue;
-        }
-
-        let left_duration = split_seconds_view - clip.timeline_start_seconds;
-        let right_duration = clip_end - split_seconds_view;
-        let split_seconds_source_clip =
-            source_seconds_at_view(song, clip.timeline_start_seconds + left_duration);
-        let source_left_duration = (split_seconds_source_clip
-            - source_seconds_at_view(song, clip.timeline_start_seconds))
-        .max(0.0);
-
-        let left_clip = Clip {
-            id: format!("clip_{}_{}_l", suffix_base, counter),
-            duration_seconds: left_duration,
-            ..clip.clone()
-        };
-        let right_clip = Clip {
-            id: format!("clip_{}_{}_r", suffix_base, counter),
-            timeline_start_seconds: split_seconds_view,
-            source_start_seconds: clip.source_start_seconds + source_left_duration,
-            duration_seconds: right_duration,
-            ..clip
         };
 
         song.clips.splice(index..=index, [left_clip, right_clip]);
@@ -782,6 +879,7 @@ mod snap_regions_after_to_downbeats_tests {
 
     fn region(id: &str, start: f64, end: f64) -> SongRegion {
         SongRegion {
+            key_changes: Vec::new(),
             id: id.into(),
             name: id.into(),
             start_seconds: start,
@@ -792,6 +890,8 @@ mod snap_regions_after_to_downbeats_tests {
             warp_source_bpm: None,
             master: SongMaster::default(),
             compact_column_width_rem: None,
+            chart: None,
+            voice_guide_count_style: None,
             structure: None,
         }
     }

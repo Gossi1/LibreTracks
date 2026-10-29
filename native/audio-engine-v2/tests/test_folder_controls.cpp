@@ -554,3 +554,306 @@ TEST_CASE("folder_track_does_not_produce_audio") {
     mixer.render(out, 2, kBlock, kSR);
     CHECK(peak(left) < 1.0e-7f);
 }
+
+// ---------------------------------------------------------------------------
+// Medidor de pista POST-PANEO (bug: "al panear no cambian los vumetros").
+// El medidor se tomaba del bus crudo del renderer, antes del paneo: con el
+// paneo a tope a la derecha el canal izquierdo del medidor seguia lleno. La
+// referencia es Ableton: el lado del que se aleja el paneo se queda en
+// silencio. Sigue siendo pre-fader (ver measure_track_post_pan en mixer.cpp).
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Fuente ESTEREO con solo el canal izquierdo (p. ej. una guitarra grabada a un
+// lado). No es una pista mono: el derecho debe seguir en silencio.
+void add_left_only_source(SourceManager& sources, const Id& id, float amplitude = 0.5f,
+                          Frame dur = kSR * 4) {
+    auto samples = test::make_stereo_sine(dur, 440.0, amplitude);
+    for (Frame f = 0; f < dur; ++f)
+        samples[static_cast<std::size_t>(f * 2 + 1)] = 0.0f;
+    sources.register_source(id, "");
+    REQUIRE(sources.store_decoded_source(id, std::move(samples), 2, kSR, dur).is_ok());
+}
+
+// Fuente MONO de verdad: un solo canal.
+void add_mono_source(SourceManager& sources, const Id& id, float amplitude = 0.5f,
+                     Frame dur = kSR * 4) {
+    const auto stereo = test::make_stereo_sine(dur, 440.0, amplitude);
+    std::vector<float> mono(static_cast<std::size_t>(dur));
+    for (Frame f = 0; f < dur; ++f)
+        mono[static_cast<std::size_t>(f)] = stereo[static_cast<std::size_t>(f * 2)];
+    sources.register_source(id, "");
+    REQUIRE(sources.store_decoded_source(id, std::move(mono), 1, kSR, dur).is_ok());
+}
+
+} // namespace
+
+TEST_CASE("track_meter_follows_pan_for_a_stereo_track") {
+    SourceManager sources;
+    add_source(sources, "src-0", 0.5f);
+    auto session = std::make_shared<Session>(folder_session(1));
+    TransportClock clock(kSR);
+    JumpScheduler scheduler;
+    Mixer mixer(session, &sources, &clock, &scheduler);
+    clock.play();
+
+    std::vector<float> left, right;
+    render_blocks(mixer, clock, 10, left, right);
+    auto meters = mixer.track_meters();
+    REQUIRE(meters.size() == 2);
+    REQUIRE(meters[1].track_id == "child-0");
+    // Centrado (ley de balance): los dos lados a nivel completo.
+    CHECK(meters[1].left_peak == doctest::Approx(meters[1].right_peak));
+    CHECK(meters[1].left_peak > 0.4f);
+
+    mixer.set_track_pan("child-0", 1.0f);
+    render_blocks(mixer, clock, 30, left, right);   // deja asentar la rampa de 10 ms
+    meters = mixer.track_meters();
+    CHECK(meters[1].right_peak > 0.4f);
+    CHECK(meters[1].left_peak < 0.005f);
+    CHECK(meters[1].left_rms < 0.005f);
+    CHECK(meters[1].right_rms > 0.1f);
+    // La carpeta acumula lo que marcan sus hijas: tambien post-paneo.
+    CHECK(meters[0].left_peak < 0.005f);
+    CHECK(meters[0].right_peak > 0.4f);
+
+    mixer.set_track_pan("child-0", -1.0f);
+    render_blocks(mixer, clock, 30, left, right);
+    meters = mixer.track_meters();
+    CHECK(meters[1].left_peak > 0.4f);
+    CHECK(meters[1].right_peak < 0.005f);
+
+    // Paneo parcial: el lado contrario baja en proporcion (1 - pan).
+    mixer.set_track_pan("child-0", 0.5f);
+    render_blocks(mixer, clock, 30, left, right);
+    meters = mixer.track_meters();
+    CHECK(meters[1].left_peak == doctest::Approx(0.5f * meters[1].right_peak).epsilon(0.02));
+}
+
+// Un estereo con un lado en silencio NO salta al centro (antes el mezclador lo
+// detectaba por bloque y copiaba el lado con senal encima del otro).
+TEST_CASE("stereo_source_with_a_silent_side_is_not_duplicated") {
+    SourceManager sources;
+    add_left_only_source(sources, "src-0", 0.5f);
+    auto session = std::make_shared<Session>(folder_session(1));
+    TransportClock clock(kSR);
+    JumpScheduler scheduler;
+    Mixer mixer(session, &sources, &clock, &scheduler);
+    clock.play();
+
+    std::vector<float> left, right;
+    render_blocks(mixer, clock, 10, left, right);
+    auto meters = mixer.track_meters();
+    REQUIRE(meters.size() == 2);
+    CHECK(peak(left) > 0.4f);
+    CHECK(peak(right) < 1.0e-6f);
+    CHECK(meters[1].left_peak > 0.4f);
+    CHECK(meters[1].right_peak < 1.0e-6f);
+
+    // Paneada a la derecha: el lado izquierdo (el unico con senal) se apaga y
+    // el derecho sigue en silencio. Con la regla vieja sonaba por la derecha.
+    mixer.set_track_pan("child-0", 1.0f);
+    render_blocks(mixer, clock, 30, left, right);
+    meters = mixer.track_meters();
+    CHECK(peak(left) < 0.005f);
+    CHECK(peak(right) < 1.0e-6f);
+    CHECK(meters[1].right_peak < 1.0e-6f);
+}
+
+// Una fuente MONO suena por los dos lados y el paneo la mueve.
+TEST_CASE("mono_source_sounds_on_both_sides_and_follows_the_pan") {
+    SourceManager sources;
+    add_mono_source(sources, "src-0", 0.5f);
+    auto session = std::make_shared<Session>(folder_session(1));
+    TransportClock clock(kSR);
+    JumpScheduler scheduler;
+    Mixer mixer(session, &sources, &clock, &scheduler);
+    clock.play();
+
+    std::vector<float> left, right;
+    render_blocks(mixer, clock, 10, left, right);
+    auto meters = mixer.track_meters();
+    REQUIRE(meters.size() == 2);
+    CHECK(peak(left) > 0.4f);
+    CHECK(peak(right) == doctest::Approx(peak(left)));
+    CHECK(meters[1].left_peak > 0.4f);
+    CHECK(meters[1].right_peak == doctest::Approx(meters[1].left_peak));
+
+    mixer.set_track_pan("child-0", 1.0f);
+    render_blocks(mixer, clock, 30, left, right);
+    meters = mixer.track_meters();
+    CHECK(peak(left) < 0.005f);
+    CHECK(peak(right) > 0.4f);
+    CHECK(meters[1].left_peak < 0.005f);
+    CHECK(meters[1].right_peak == doctest::Approx(peak(right)).epsilon(0.02));
+}
+
+// La decision es por clip: en la misma pista, un clip mono suena por los dos
+// lados y uno estereo de un solo lado se queda en su lado.
+TEST_CASE("mono_or_stereo_is_decided_per_clip_not_per_track") {
+    SourceManager sources;
+    add_mono_source(sources, "src-mono", 0.5f, kSR * 2);
+    add_left_only_source(sources, "src-left", 0.5f, kSR * 2);
+    Session session;
+    session.id = "session";
+    session.sample_rate = kSR;
+    session.sources.push_back(Source{"src-mono", ""});
+    session.sources.push_back(Source{"src-left", ""});
+    Song song;
+    song.id = "song";
+    song.start_frame = 0;
+    song.end_frame = kSR * 8;
+    Track track;
+    track.id = "t";
+    track.name = "T";
+    track.kind = TrackKind::Audio;
+    track.clips.push_back(Clip{"clip-mono", "src-mono", 0, 0, kSR * 2});
+    track.clips.push_back(Clip{"clip-left", "src-left", kSR * 2, 0, kSR * 2});
+    song.tracks.push_back(track);
+    session.songs.push_back(song);
+    auto shared = std::make_shared<Session>(session);
+    TransportClock clock(kSR);
+    JumpScheduler scheduler;
+    Mixer mixer(shared, &sources, &clock, &scheduler);
+    clock.play();
+
+    std::vector<float> left, right;
+    render_blocks(mixer, clock, 10, left, right);   // dentro del clip mono
+    CHECK(peak(left) > 0.4f);
+    CHECK(peak(right) == doctest::Approx(peak(left)));
+
+    clock.seek(kSR * 2 + kBlock * 4);              // dentro del clip estereo
+    render_blocks(mixer, clock, 10, left, right);
+    CHECK(peak(left) > 0.4f);
+    CHECK(peak(right) < 1.0e-6f);
+}
+
+// ---------------------------------------------------------------------------
+// Punto de medida configurable (TrackMeterMode). Por defecto POST-FADER, como
+// Ableton: paneo + volumen + mute + solo de la propia pista. El fader de la
+// carpeta no entra en el medidor de la hija, pero si en el de la carpeta.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("track_meter_defaults_to_post_fader") {
+    SourceManager sources;
+    add_source(sources, "src-0", 0.5f);
+    add_source(sources, "src-1", 0.5f);
+    auto session = std::make_shared<Session>(folder_session(2));
+    TransportClock clock(kSR);
+    JumpScheduler scheduler;
+    Mixer mixer(session, &sources, &clock, &scheduler);
+    CHECK(mixer.track_meter_mode() == TrackMeterMode::PostFader);
+    clock.play();
+
+    // Volumen 0.5 y paneo a la derecha: el medidor sigue a los dos.
+    mixer.set_track_gain("child-0", 0.5f);
+    mixer.set_track_pan("child-0", 1.0f);
+    std::vector<float> left, right;
+    render_blocks(mixer, clock, 30, left, right);
+    auto meters = mixer.track_meters();
+    REQUIRE(meters.size() == 3);
+    CHECK(meters[1].right_peak == doctest::Approx(0.25f).epsilon(0.02));
+    CHECK(meters[1].left_peak < 0.005f);
+
+    // Muteada: no suena y el medidor marca 0.
+    mixer.set_track_mute("child-0", true);
+    render_blocks(mixer, clock, 30, left, right);
+    meters = mixer.track_meters();
+    CHECK(meters[1].left_peak == 0.0f);
+    CHECK(meters[1].right_peak == 0.0f);
+    CHECK(meters[1].right_rms == 0.0f);
+    CHECK(meters[2].left_peak > 0.4f);       // la otra hija sigue marcando
+    mixer.set_track_mute("child-0", false);
+
+    // Silenciada por el solo de otra pista: tambien 0.
+    mixer.set_track_solo("child-1", true);
+    render_blocks(mixer, clock, 30, left, right);
+    meters = mixer.track_meters();
+    CHECK(meters[1].right_peak == 0.0f);
+    CHECK(meters[2].left_peak > 0.4f);
+}
+
+TEST_CASE("post_fader_folder_fader_moves_the_folder_meter_not_the_child") {
+    SourceManager sources;
+    add_source(sources, "src-0", 0.5f);
+    auto session = std::make_shared<Session>(folder_session(1));
+    TransportClock clock(kSR);
+    JumpScheduler scheduler;
+    Mixer mixer(session, &sources, &clock, &scheduler);
+    clock.play();
+
+    mixer.set_track_gain("folder", 0.5f);
+    std::vector<float> left, right;
+    render_blocks(mixer, clock, 30, left, right);
+    auto meters = mixer.track_meters();
+    REQUIRE(meters.size() == 2);
+    // La hija mide tras SU fader (1.0); la carpeta, tras el suyo (0.5), que
+    // es lo que de verdad sale.
+    CHECK(meters[1].left_peak > 0.45f);
+    CHECK(meters[0].left_peak == doctest::Approx(0.5f * meters[1].left_peak).epsilon(0.01));
+    CHECK(meters[0].left_peak == doctest::Approx(peak(left)).epsilon(0.02));
+
+    // Carpeta muteada: la hija sigue marcando, la carpeta no.
+    mixer.set_track_mute("folder", true);
+    render_blocks(mixer, clock, 30, left, right);
+    meters = mixer.track_meters();
+    CHECK(peak(left) < 0.005f);
+    CHECK(meters[1].left_peak > 0.45f);
+    CHECK(meters[0].left_peak == 0.0f);
+}
+
+TEST_CASE("post_pan_meter_ignores_volume_mute_and_solo") {
+    SourceManager sources;
+    add_source(sources, "src-0", 0.5f);
+    auto session = std::make_shared<Session>(folder_session(1));
+    TransportClock clock(kSR);
+    JumpScheduler scheduler;
+    Mixer mixer(session, &sources, &clock, &scheduler);
+    mixer.set_track_meter_mode(TrackMeterMode::PostPan);
+    clock.play();
+
+    mixer.set_track_gain("child-0", 0.25f);
+    mixer.set_track_mute("child-0", true);
+    mixer.set_track_pan("child-0", 1.0f);
+    mixer.set_track_gain("folder", 0.5f);
+    std::vector<float> left, right;
+    render_blocks(mixer, clock, 30, left, right);
+    const auto meters = mixer.track_meters();
+    // Muteada no suena, pero el medidor sigue marcando la senal (post-paneo).
+    CHECK(peak(right) < 0.005f);
+    CHECK(meters[1].right_peak > 0.4f);
+    CHECK(meters[1].left_peak < 0.005f);
+    // La carpeta acumula lo que marcan sus hijas, sin su fader.
+    CHECK(meters[0].right_peak == doctest::Approx(meters[1].right_peak));
+}
+
+TEST_CASE("pre_fader_meter_is_the_raw_track_input") {
+    SourceManager sources;
+    add_left_only_source(sources, "src-0", 0.5f);
+    auto session = std::make_shared<Session>(folder_session(1));
+    TransportClock clock(kSR);
+    JumpScheduler scheduler;
+    Mixer mixer(session, &sources, &clock, &scheduler);
+    mixer.set_track_meter_mode(TrackMeterMode::PreFader);
+    clock.play();
+
+    // Paneada a la derecha, con volumen bajo y sumada a mono: el medidor
+    // ignora todo eso y muestra lo que entregan los clips (solo L).
+    mixer.set_track_pan("child-0", 1.0f);
+    mixer.set_track_gain("child-0", 0.1f);
+    session->songs[0].tracks[1].mono_downmix = true;
+    std::vector<float> left, right;
+    render_blocks(mixer, clock, 30, left, right);
+    auto meters = mixer.track_meters();
+    CHECK(meters[1].left_peak > 0.45f);
+    CHECK(meters[1].right_peak < 1.0e-6f);
+    CHECK(meters[0].left_peak == doctest::Approx(meters[1].left_peak));
+
+    // Volver a post-fader en caliente: el siguiente bloque ya mide alli.
+    mixer.set_track_meter_mode(TrackMeterMode::PostFader);
+    render_blocks(mixer, clock, 2, left, right);
+    meters = mixer.track_meters();
+    CHECK(meters[1].left_peak < 0.005f);
+    CHECK(meters[1].right_peak == doctest::Approx(peak(right)).epsilon(0.02));
+}

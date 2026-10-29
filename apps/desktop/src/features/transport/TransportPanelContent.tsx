@@ -11,6 +11,7 @@ import {
 import { flushSync } from "react-dom";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { useTranslation } from "react-i18next";
+import { FEATURE_FLAGS } from "@libretracks/shared/featureFlags";
 import { open } from "@tauri-apps/plugin-dialog";
 import { confirmDialog, promptDialog } from "../../shared/dialog/dialogService";
 import {
@@ -22,7 +23,6 @@ import {
   getSongBaseTimeSignature,
   getSongTempoRegionAtPosition,
   getSongRegionAtPosition,
-  regionPadKey,
   normalizeAppSettings,
   type AppSettings,
   type AudioBackendKind,
@@ -71,6 +71,7 @@ import {
   deleteLibraryAsset,
   deleteLibraryFolder,
   deleteSectionMarker,
+  removeMissingFile,
   deleteSongRegion,
   deleteSongTempoMarker,
   deleteSongTimeSignatureMarker,
@@ -124,6 +125,7 @@ import {
   setMetronomeVolumeRealtime,
   setMetronomeSoundRealtime,
   setVoiceGuideVolumeRealtime,
+  isGuestMirrorMode,
   setVoiceGuideConfigRealtime,
   setPadVolumeRealtime,
   setPadConfigRealtime,
@@ -144,10 +146,12 @@ import {
   updateLiveRegionMasterGain,
   moveSongRegion,
   reorderSongRegion,
+  setSongRegionChart,
   updateSongRegion,
   updateSongRegionMasterGain,
   updateSongRegionTranspose,
   updateSongRegionWarp,
+  setSongRegionTempo,
   updateSongRegionKey,
   setSongRegionCompactWidth,
   updateSongTempo,
@@ -265,7 +269,11 @@ import {
   type ExportSongTarget,
 } from "./panels/ExportSongModal";
 import { RenderSongModal } from "./render/RenderSongModal";
+import { LevelSongsModal } from "./levelSongs/LevelSongsModal";
+import { SongAnalysisModal } from "./songAnalysis/SongAnalysisModal";
+import { LevelSongsMenuItem } from "./levelSongs/LevelSongsMenuItem";
 import { ExportSessionModal } from "./panels/ExportSessionModal";
+import { TemplateDropToast } from "./templates/TemplateDropToast";
 import { beginExportWithChoice, cancelExportChoice, CloudLandingButton, CloudMenuItem, CloudSurfaces, confirmSessionExport, confirmSongExport, importSessionWithChoice, importSongWithChoice, useCloudStore } from "./cloud";
 import {
   AutomationCueModal,
@@ -279,6 +287,7 @@ import { useVideoFeature } from "./video/useVideoFeature";
 import { VideoSetupLayer } from "./video/VideoSetupLayer";
 import { MixSceneModal } from "./panels/MixSceneModal";
 import { RemotePanel } from "./panels/RemotePanel";
+import { NetworkSessionRoot } from "../network/NetworkSessionRoot";
 import { MobileLanding } from "./compact/MobileLanding";
 import { TOUR_TARGETS } from "../tutorial/tourTargets";
 import {
@@ -388,6 +397,7 @@ import {
   resolveVisualPositionAcrossVamp,
 } from "@libretracks/shared/playbackClock";
 import { resolveFollowCameraX, syncTimelineScrollElement } from "./followCamera";
+import { snapshotAgeSeconds } from "./snapshotRoundTrip";
 import {
   buildAudioRoutingOptions,
   buildMemoizedClipsByTrack,
@@ -453,10 +463,13 @@ import {
 } from "./menus/timelineMenus";
 import { createTrackHandlers } from "./tracks/trackHandlers";
 import { useTrackDragPreview } from "./tracks/useTrackDragPreview";
+import { useTrackRowWindowController } from "./tracks/useTrackRowWindow";
+import { mergeSongView } from "./songs/mergeSongView";
 import { createTrackHeaderHandlers } from "./tracks/trackHeaderHandlers";
 import { useTrackHeights } from "./tracks/useTrackHeights";
 import { createCompactSongHandlers } from "./compact/compactSongHandlers";
 import { createMarkerMoveHandlers } from "./timeline/markerMoveHandlers";
+import { createRulerMarkerHandlers } from "./rulerMarkers/rulerMarkerHandlers";
 import { useLibraryState } from "./hooks/useLibraryState";
 import { useSongWaveforms } from "./hooks/useSongWaveforms";
 import { useWaveformProgress } from "./hooks/useWaveformProgress";
@@ -466,15 +479,21 @@ import { useAutoSave } from "./hooks/useAutoSave";
 import { useDragListeners } from "./hooks/useDragListeners";
 import { usePlaybackUiDiagnostics } from "./hooks/usePlaybackUiDiagnostics";
 import { useSongViewLoader } from "./hooks/useSongViewLoader";
+import { useAutomationMixSync } from "./hooks/useAutomationMixSync";
+import { cameraXAfterStoppedJump } from "./timeline/revealPlayheadOnJump";
+import { createBrowserDrop } from "./library/folders/browserDrop";
 import { useWindowTitle } from "./hooks/useWindowTitle";
 import { useSongStore } from "./songStore";
 import { createMidiLearnHandlers } from "./midi/midiLearnHandlers";
 import { createTapTempoHandler } from "./tempo/tapTempoHandler";
+import { createRegionTempoHandler } from "./tempo/regionTempoHandler";
 import { AndroidBackGuard } from "./mobile/AndroidBackGuard";
 import { MissingMediaModal } from "./panels/MissingMediaModal";
 import { createMissingMediaHandlers } from "./library/missingMediaHandlers";
 import { DismissOnBack } from "./mobile/DismissOnBack";
 import { getEffectiveTempoMarkerAt } from "./tempo/tempoMarkers";
+import { publishSoundingKey } from "./keyChanges/soundingKeyStore";
+import { useSoundingKeySync } from "./keyChanges/useSoundingKeySync";
 import {
   parseBpmDraft,
   parseTimeSignatureDraft,
@@ -1905,7 +1924,8 @@ export function TransportPanelContent() {
           setSong((previous) => {
             if (!nextSong) return null;
             if (!previous) return nextSong;
-            return { ...nextSong, waveforms: previous.waveforms };
+            // Untouched tracks/clips keep their identity, as in the revision loader.
+            return mergeSongView(previous, { ...nextSong, waveforms: previous.waveforms });
           });
         }
       };
@@ -2004,9 +2024,9 @@ export function TransportPanelContent() {
 
       void runAction(async () => {
         try {
-          const liveSettings = normalizeAppSettings(
-            await updateAudioSettings(normalizedSettings),
-          );
+          const liveSettings = isGuestMirrorMode()
+            ? normalizedSettings
+            : normalizeAppSettings(await updateAudioSettings(normalizedSettings));
           const savedSettings = normalizeAppSettings(
             await saveSettings(liveSettings),
           );
@@ -2082,8 +2102,12 @@ export function TransportPanelContent() {
     handleTimelineNavigationSchemeChange,
     handleTimelinePlayheadFollowModeChange,
     handlePauseAtSongEndChange,
+    handleVampBetweenSongsChange,
+    handleTrackMeterModeChange,
+    handleFadeOutStopSecondsChange,
     handleMidiPlatformSettingsChange,
-    handleImportMergeMatchingTracksChange,
+    handleSongTrackLayoutChange,
+    handleDefaultSongTemplateChange,
     handleAutoColorNewTracksChange,
     handleReferenceImportedAudioChange,
     handleAutoSaveEnabledChange,
@@ -2166,6 +2190,7 @@ export function TransportPanelContent() {
       createLibraryHandlers({
         getPlaybackSongDir: () => playbackSongDirRef.current,
         getLibraryAssets: () => libraryAssetsRef.current,
+        getSong: () => songRef.current,
         runAction,
         waitForUiPaint,
         setStatus,
@@ -2180,6 +2205,9 @@ export function TransportPanelContent() {
         importLibraryAssetsFromDialog,
         getLibraryFolders,
         deleteLibraryAsset,
+        removeMissingFile,
+        // Declared further down; only called after the render that built it.
+        applyPlaybackSnapshot: (snapshot) => applyPlaybackSnapshot(snapshot),
         createLibraryFolder,
         moveLibraryAsset,
         renameLibraryFolder,
@@ -2204,6 +2232,7 @@ export function TransportPanelContent() {
     handleDeleteLibraryAssets,
     handleCreateLibraryFolder,
     handleMoveLibraryAssets,
+    handleOrganizeUnfiledBySong,
     handleRenameLibraryFolder,
     handleDeleteLibraryFolder,
   } = libraryHandlers;
@@ -2364,8 +2393,11 @@ export function TransportPanelContent() {
 
   // Los dos manejadores de "falta el audio" viven en su propia factory: el
   // paso 08 anadia el segundo y el fichero rebasaba su presupuesto de tamano.
-  const { locateMissingFile: handleLocateMissingFile, relinkMissingFile: handleRelinkMissingFile } =
-    useMemo(
+  const {
+    locateMissingFile: handleLocateMissingFile,
+    relinkMissingFile: handleRelinkMissingFile,
+    removeMissingFile: handleRemoveMissingFile,
+  } = useMemo(
       () =>
         createMissingMediaHandlers({
           runAction,
@@ -2374,6 +2406,7 @@ export function TransportPanelContent() {
           refreshLibraryState,
           setStatus,
           savedMessage: () => t("transport.status.projectSaved"),
+          removedMessage: () => t("transport.missingMedia.removed"),
         }),
       [
         applyPlaybackSnapshot,
@@ -2891,13 +2924,18 @@ export function TransportPanelContent() {
 
   // Track drag preview ("hueco + fantasma") for the DAW and the compact
   // mixer. See ./tracks/useTrackDragPreview.
-  const { applyTrackDragVisuals, clearTrackDragVisuals, resolveTrackDrop } =
-    useTrackDragPreview({
-      song,
-      songRef,
-      timelineShellRef,
-      getVisibleTrackIds: () => visibleTracksRef.current.map((track) => track.id),
-    });
+  const {
+    applyTrackDragVisuals,
+    attachMountedTrackRows,
+    clearTrackDragVisuals,
+    resolveTrackDrop,
+  } = useTrackDragPreview({
+    song,
+    songRef,
+    timelineShellRef,
+    getVisibleTrackIds: () => visibleTracksRef.current.map((track) => track.id),
+    getTrackLayout: () => trackRowLayoutRef.current,
+  });
 
   // Track create / reorder handlers. See ./tracks/trackHandlers. Reactive state
   // is read through getters (songRef, tracksByIdRef, the timeline UI store) so
@@ -2917,6 +2955,7 @@ export function TransportPanelContent() {
         setStatus,
         t,
         moveTrack,
+        setSong,
         createTrack,
         prompt: (message, defaultValue) => promptDialog(message, defaultValue),
         setAutomationTrackPosition,
@@ -2929,6 +2968,7 @@ export function TransportPanelContent() {
       applyPlaybackSnapshot,
       clearTrackDragVisuals,
       setStatus,
+      setSong,
       t,
     ],
   );
@@ -3108,6 +3148,7 @@ export function TransportPanelContent() {
             ? durationSeconds
             : Number.MAX_SAFE_INTEGER,
       anchorDurationSeconds: timelineDurationSecondsRef.current || durationSeconds,
+      snapshotAgeSeconds: snapshotAgeSeconds(nextSnapshot),
     });
 
     if (decision.kind === "reanchor") {
@@ -3200,7 +3241,10 @@ export function TransportPanelContent() {
         // If the voice guide was left enabled in a previous session, push the
         // config + load the clip bank now so it works without re-opening the
         // settings panel. set_voice_guide_config_realtime loads the bank.
-        if (active && settings?.voiceGuideEnabled) {
+        // Not as a network guest: these are the host's settings, and pushing
+        // them back made the host reload its bank and rewrite its settings
+        // file on every join (~700 ms, and racing its own changes).
+        if (active && settings?.voiceGuideEnabled && !isGuestMirrorMode()) {
           void setVoiceGuideConfigRealtime(settings).catch(() => {});
         }
       })
@@ -3269,6 +3313,7 @@ export function TransportPanelContent() {
   useAudioMeters();
   useClearSelectionOnOutsideClick();
   useRegionMeters();
+  useAutomationMixSync();
 
   // Backend waveform-ready events -> merge peaks into the waveform cache.
   useEffect(() => {
@@ -3932,6 +3977,20 @@ export function TransportPanelContent() {
     setStatus,
     t,
     handleSelectedRegionTransposeChange,
+    revealPlayheadAfterStoppedJump: (positionSeconds) => {
+      const nextCameraX = cameraXAfterStoppedJump({
+        followEnabled: followPlayheadEnabledRef.current,
+        viewMode: viewModeRef.current,
+        playheadSeconds: positionSeconds,
+        cameraX: cameraXRef.current,
+        pixelsPerSecond: livePixelsPerSecondRef.current,
+        viewportWidth: laneViewportWidthRef.current,
+        durationSeconds: songRef.current?.durationSeconds ?? 0,
+        contentEndSeconds: timelineContentEndSecondsRef.current,
+        followMode: appSettingsRef.current.timelinePlayheadFollowMode,
+      });
+      if (nextCameraX !== null) updateCameraX(nextCameraX);
+    },
   });
 
   // Per-song play button in the compact view: routes through the same
@@ -4199,38 +4258,22 @@ export function TransportPanelContent() {
     setTimeSignatureDraft(getSongBaseTimeSignature(song));
   }, [song, song?.projectRevision, activeTempoRegionKey]);
 
-  // "Pad follows song key": when enabled, drive the pad's key from the tonic of
-  // the song region under the playhead, re-evaluating when the playhead crosses
-  // into another song (activeSongRegionId) or when that region's key/transpose
-  // is edited (song?.projectRevision). A pad is a tonal drone, so only the
-  // tonic matters — regionPadKey ignores major/minor. We push the change only
-  // when the tonic actually differs from the current padKey to avoid redundant
-  // decodes, and leave the manual key untouched when the song has no set key.
-  useEffect(() => {
-    if (!appSettings.padFollowSongKey || !appSettings.padEnabled) {
-      return;
-    }
-    const region = getSongRegionAtPosition(
-      songRef.current,
-      displayPositionSecondsRef.current,
-    );
-    const tonic = regionPadKey(region);
-    if (tonic === null || tonic === appSettingsRef.current.padKey) {
-      return;
-    }
-    handlePadChange({ padKey: tonic });
-  }, [
-    appSettings.padFollowSongKey,
-    appSettings.padEnabled,
-    appSettings.padKey,
-    activeSongRegionId,
-    song?.projectRevision,
-    handlePadChange,
-  ]);
+  // La nota que suena (con sus cambios) y el pad que la sigue: keyChanges/.
+  const followPadKey = useCallback(
+    (padKey: number) => handlePadChange({ padKey }),
+    [handlePadChange],
+  );
+  useSoundingKeySync({
+    song,
+    positionRef: displayPositionSecondsRef,
+    padFollowsKey: appSettings.padFollowSongKey && appSettings.padEnabled,
+    padKey: appSettings.padKey,
+    onPadKeyChange: followPadKey,
+  });
 
   // Waveforms for the song's clips (batched + polling).
   // See ./hooks/useSongWaveforms.
-  useSongWaveforms({ song, setWaveformCache });
+  useSongWaveforms({ song, projectKey: playbackSongDir, setWaveformCache });
   useWaveformProgress({ playbackSongDir, setWaveformCache });
 
   // Clear the meters when playback stops so they don't freeze mid-level.
@@ -4707,7 +4750,12 @@ export function TransportPanelContent() {
     openClipMenu: (event, clip) => timelineMenus.openVideoClipMenu(event, clip),
   });
 
+  // Seleccion multiple de marcas de la regla: ver rulerMarkers/.
+  const rulerMarkers = useMemo(() => createRulerMarkerHandlers({
+    getSong: () => songRef.current, runAction, applyPlaybackSnapshot, refreshSongView, setStatus, t,
+  }), [applyPlaybackSnapshot, refreshSongView, runAction, setStatus, t]);
   const { runShortcutAction } = useTimelineKeyboardShortcuts({
+    rulerMarkers,
     videoEdits: video.keyboardEdits,
     runAction,
     applyPlaybackSnapshot,
@@ -4796,15 +4844,16 @@ export function TransportPanelContent() {
       setActiveTempoRegionKey(nextRegionKey);
     }
 
-    // Track the song region under the playhead so the "pad follows song key"
-    // effect can react when the playhead crosses into a song with a different
-    // tonic. Only re-renders on an actual boundary crossing.
+    // Track the song region under the playhead (compact mixer filter). Only
+    // re-renders on an actual boundary crossing; the sounding key store does
+    // the same for key changes.
     const nextSongRegionId =
       getSongRegionAtPosition(songRef.current, clampedPosition)?.id ?? "";
     if (nextSongRegionId !== activeSongRegionIdRef.current) {
       activeSongRegionIdRef.current = nextSongRegionId;
       setActiveSongRegionId(nextSongRegionId);
     }
+    publishSoundingKey(songRef.current, clampedPosition);
 
     if (transportReadoutTempoRef.current) {
       transportReadoutTempoRef.current.textContent = `${displayedTempo.toFixed(2)} BPM`;
@@ -5386,6 +5435,21 @@ export function TransportPanelContent() {
     [setStatus, runAction, refreshSongView, applyPlaybackSnapshot, t],
   );
 
+  // Song tempo stepper in the Warp popover. See ./tempo/regionTempoHandler.
+  const handleSelectedRegionTempoChange = useMemo(
+    () =>
+      createRegionTempoHandler({
+        runAction,
+        refreshSongView,
+        applyPlaybackSnapshot,
+        setSongRegionTempo,
+        onWarpEnabled: () => recordProductEvent("feature_warp"),
+        setStatus,
+        t,
+      }),
+    [setStatus, runAction, refreshSongView, applyPlaybackSnapshot, t],
+  );
+
   // Ruler/lane drag commits + cue editing. `song` and editAutomationCue (which
   // the menu factory rebuilds each render) are read through getters, so this
   // factory stays referentially stable across snapshots.
@@ -5515,6 +5579,9 @@ export function TransportPanelContent() {
     applyPlaybackSnapshot,
     optimisticallyAppliedRevisionsRef,
   });
+  // Which track rows the DAW mounts. See ./tracks/useTrackRowWindow.
+  useTrackRowWindowController({ viewportRef: timelineScrollViewportRef, layout: trackRowLayout,
+    tracks: visibleTracks, onRowsMounted: attachMountedTrackRows });
 
   // Native iOS keeps this last-known state after WebContent dies, so a black
   // UI can leave evidence in errors.log even though JavaScript is already gone.
@@ -6575,6 +6642,27 @@ export function TransportPanelContent() {
     handleDomExternalDropPreviewChange,
   } = libraryDragDrop;
 
+  const libraryDragDropDeps = () => {
+    const value = libraryDragDropDepsRef.current;
+    if (!value) throw new Error("library drag-drop deps are not ready");
+    return value;
+  };
+  // Drops from the folder library (disk folders). Getters, so the factory is
+  // built once and still reads the live session and drag-drop factory.
+  const browserDrop = useMemo(
+    () =>
+      createBrowserDrop({
+        dragDrop: () => libraryDragDrop,
+        hasSession: () => Boolean(playbackSongDirRef.current),
+        runAction: (action) => libraryDragDropDeps().runAction(action),
+        mergeLibraryAssets: (assets) => libraryDragDropDeps().mergeLibraryAssets(assets),
+        setStatus: (message) => libraryDragDropDeps().setStatus(message),
+        t: (key, options) => libraryDragDropDeps().t(key, options),
+        getPlayheadSeconds: () => displayPositionSecondsRef.current,
+      }),
+    [libraryDragDrop],
+  );
+
   // `dropLibraryFolder` nace de la factoria de arrastre, que se construye justo
   // arriba, asi que las dependencias de colocacion se rellenan aqui y no junto
   // al `useMemo` que las consume.
@@ -6597,6 +6685,7 @@ export function TransportPanelContent() {
       timelineMenus,
       getPlayheadSeconds: () => displayPositionSecondsRef.current,
       onAddAudios: handleImportLibraryFromDialog,
+      rulerMarkersMenu: rulerMarkers.groupMenu,
     });
 
   const handleRulerPointerDown = useTimelineRangeSelection({
@@ -6616,6 +6705,7 @@ export function TransportPanelContent() {
       updateCameraX(nextCameraX, { commitToStore: false }),
     prewarmPosition: prewarmTimelinePosition,
     clearTimelineSelection: () => clearSelections(),
+    areaMarkers: rulerMarkers.area,
     setRange: setSelectedTimelineRange,
     seek: (seconds) => {
       void runAction(async () => {
@@ -6939,7 +7029,7 @@ export function TransportPanelContent() {
               );
               const nextSnapshot = tempoMarker
                 ? await upsertSongTempoMarker(
-                    tempoMarker.sourceStartSeconds ?? tempoMarker.startSeconds,
+                    tempoMarker.startSeconds,
                     clampedBpm,
                   )
                 : await updateSongTempo(clampedBpm);
@@ -7096,6 +7186,10 @@ export function TransportPanelContent() {
                     defaultValue: "Guardar como plantilla…",
                   })}
                 </button>
+                <LevelSongsMenuItem
+                  disabled={!song}
+                  onSelected={() => setIsMobileFileActionsOpen(false)}
+                />
               </div>
             </div>
           ) : null}
@@ -7138,6 +7232,8 @@ export function TransportPanelContent() {
                   );
                 }}
                 onAddFolderToTimeline={handleAddLibraryFolderToTimeline}
+                onOrganizeBySong={() => void handleOrganizeUnfiledBySong()}
+                browserDrop={browserDrop}
               />
               <WorshipToolsSidebarPanel
                 isOpen={activeSidebarTab === "worshiptools"}
@@ -7384,6 +7480,8 @@ export function TransportPanelContent() {
                     onSongTransitionModeChange={handleSongTransitionModeChange}
                     onVampModeChange={handleVampModeChange}
                     onVampBarsChange={handleVampBarsChange}
+                    vampBetweenSongs={appSettings.vampBetweenSongs}
+                    onVampBetweenSongsChange={handleVampBetweenSongsChange}
                     onToggleVamp={() =>
                       void runAction(async () => {
                         await toggleTimelineVamp();
@@ -7401,6 +7499,7 @@ export function TransportPanelContent() {
                     }
                     selectedRegionEffectiveBpm={selectedRegionEffectiveBpm}
                     onSelectedRegionWarpToggle={handleSelectedRegionWarpToggle}
+                    onSelectedRegionTempoChange={handleSelectedRegionTempoChange}
                     onSelectedRegionMasterGainChange={
                       handleSelectedRegionMasterGainChange
                     }
@@ -7744,6 +7843,7 @@ export function TransportPanelContent() {
                             );
                           }}
                           onAutomationCueEdit={handleAutomationCueEdit}
+                          keyChangeCallbacks={timelineMenus.keyChangeCallbacks}
                           onAutomationLaneContextMenu={(event) => {
                             if (!song) {
                               return;
@@ -7827,6 +7927,9 @@ export function TransportPanelContent() {
                             });
                           }}
                           onMarkerMoveCommit={handleMarkerMoveCommit}
+                          onRulerMarkersMoveCommit={rulerMarkers.moveGroup}
+                          onRulerMarkersContextMenu={(event, markers) =>
+                            openMenu(event, t("transport.menu.markersTitle", { count: markers.length, defaultValue: "{{count}} markers" }), rulerMarkers.groupMenu(markers))}
                           onAutomationCueMoveCommit={
                             handleAutomationCueMoveCommit
                           }
@@ -7993,6 +8096,7 @@ export function TransportPanelContent() {
                       onMarkerAction={(marker) => void runAction(() => handleMarkerPrimaryAction(marker))}
                       onSongAction={(region) => handleCompactPlaySong(region.id, region.name)}
                       onReorderSong={(id, index) => runAction(async () => applyPlaybackSnapshot(await reorderSongRegion(id, index)))}
+                      onChartChange={(regionId, chart) => runAction(async () => applyPlaybackSnapshot(await setSongRegionChart(regionId, chart)))}
                       onToggleVamp={() => void runAction(async () => {
                         await toggleTimelineVamp();
                       })}
@@ -8007,6 +8111,8 @@ export function TransportPanelContent() {
                       onSongTransitionModeChange={handleSongTransitionModeChange}
                       onVampModeChange={handleVampModeChange}
                       onVampBarsChange={handleVampBarsChange}
+                      vampBetweenSongs={appSettings.vampBetweenSongs}
+                      onVampBetweenSongsChange={handleVampBetweenSongsChange}
                     />
                   ) : null}
                 </section>
@@ -8051,6 +8157,7 @@ export function TransportPanelContent() {
               onClearOutputChannels={handleClearOutputChannels}
               onLowLatencyOutputChange={handleLowLatencyOutputChange}
               onAudioSingleThreadRenderChange={handleAudioSingleThreadRenderChange}
+              onTrackMeterModeChange={handleTrackMeterModeChange}
               midiInputDevices={midiInputDevices}
               isMidiInputRefreshing={isMidiInputRefreshing}
               selectedMidiInputDevice={selectedMidiInputDevice}
@@ -8067,9 +8174,12 @@ export function TransportPanelContent() {
                 handleTimelinePlayheadFollowModeChange
               }
               onPauseAtSongEndChange={handlePauseAtSongEndChange}
-              onImportMergeMatchingTracksChange={
-                handleImportMergeMatchingTracksChange
+              onVampBetweenSongsChange={handleVampBetweenSongsChange}
+              onFadeOutStopSecondsChange={handleFadeOutStopSecondsChange}
+              onSongTrackLayoutChange={
+                handleSongTrackLayoutChange
               }
+              onDefaultSongTemplateChange={handleDefaultSongTemplateChange}
               onAutoColorNewTracksChange={handleAutoColorNewTracksChange}
               onReferenceImportedAudioChange={handleReferenceImportedAudioChange}
               onAutoSaveEnabledChange={handleAutoSaveEnabledChange}
@@ -8097,6 +8207,7 @@ export function TransportPanelContent() {
               onClose={() => setIsRemoteModalOpen(false)}
               remoteServerInfo={remoteServerInfo}
             />
+            <NetworkSessionRoot />
 
             {isMobileSessionsModalOpen ? (
               <div
@@ -8174,6 +8285,10 @@ export function TransportPanelContent() {
             />
 
             <RenderSongModal />
+            <LevelSongsModal onApplied={applyPlaybackSnapshot} />
+            {FEATURE_FLAGS.songAnalysis ? (
+              <SongAnalysisModal onApplied={applyPlaybackSnapshot} />
+            ) : null}
 
             <ExportSessionModal
               isOpen={isExportSessionModalOpen}
@@ -8183,6 +8298,9 @@ export function TransportPanelContent() {
             />
 
             <CloudSurfaces />
+            {FEATURE_FLAGS.songTemplates ? (
+              <TemplateDropToast onUndone={applyPlaybackSnapshot} />
+            ) : null}
 
             {automationCueDraft ? (
               <AutomationCueModal
@@ -8253,6 +8371,7 @@ export function TransportPanelContent() {
                 onClose={() => setMissingMediaOpen(false)}
                 onLocate={handleLocateMissingFile}
                 onRelink={handleRelinkMissingFile}
+                onRemove={handleRemoveMissingFile}
               />
             ) : null}
 

@@ -21,7 +21,7 @@ use std::thread;
 // Only the mobile pickers' return type derives it.
 #[cfg(any(target_os = "android", target_os = "ios"))]
 use serde::Serialize;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::commands::events::{
     emit_library_import_complete_event, emit_project_load_complete_event,
@@ -424,6 +424,12 @@ fn import_external_project_off_lock(
 ) -> Result<TransportSnapshot, String> {
     crate::state::emit_project_load_message(app, 5, "Leyendo proyecto externo...".into());
 
+    // Parse and validate BEFORE the bootstrap below: a project that cannot be
+    // imported must not leave an empty `import-session-…` open behind the
+    // error. Also keeps the parse off the session lock.
+    let parsed =
+        crate::state::parse_external_project(project_path).map_err(|error| error.to_string())?;
+
     let mut session = state
         .session
         .lock()
@@ -435,12 +441,11 @@ fn import_external_project_off_lock(
         .ensure_song_loaded_for_external_import(app, &state.audio)
         .map_err(|error| error.to_string())?;
 
-    // The drop X is the DESIRED position; import_external_project resolves it
-    // against existing songs (falling back to the setlist end if it would
-    // overlap), since a whole project becomes song region(s) that may not
-    // overlap.
+    // The drop X is the DESIRED position; the import resolves it against
+    // existing songs (falling back to the setlist end if it would overlap),
+    // since a whole project becomes song region(s) that may not overlap.
     let response = session
-        .import_external_project_at(project_path, insert_at_seconds, true, &state.audio)
+        .import_parsed_external_project_at(parsed, insert_at_seconds, true, &state.audio)
         .map_err(|error| error.to_string())?;
     // Return as soon as the model is ready; `spawn_project_work` emits
     // project:load-complete and THEN drains the decode in the background (see
@@ -505,6 +510,11 @@ pub fn pick_and_import_external_project_from_dialog(
         target_pick.to_string_lossy()
     );
 
+    // Parse and validate before the bootstrap session exists (see
+    // `import_external_project_off_lock`).
+    let parsed = crate::state::parse_external_project(project_file.to_string_lossy().as_ref())
+        .map_err(|error| error.to_string())?;
+
     let mut session = state
         .session
         .lock()
@@ -514,11 +524,7 @@ pub fn pick_and_import_external_project_from_dialog(
         .map_err(|error| error.to_string())?;
     let insert_at_seconds = session.transport_position_seconds();
     session
-        .import_external_project(
-            project_file.to_string_lossy().as_ref(),
-            insert_at_seconds,
-            &state.audio,
-        )
+        .import_parsed_external_project_at(parsed, insert_at_seconds, false, &state.audio)
         .map_err(|error| error.to_string())?;
     eprintln!("[libretracks-import] wizard waiting for post-import audio preparation");
     session
@@ -1263,6 +1269,23 @@ pub fn resolve_missing_file(
         .map_err(|error| crate::infra::error_log::log_command_err("resolve_missing_file", error))
 }
 
+/// Quitar de la sesión un fichero que falta (clips y biblioteca). Ver
+/// `DesktopSession::remove_missing_file`.
+#[tauri::command(async)]
+pub fn remove_missing_file(
+    file_path: String,
+    state: State<'_, DesktopState>,
+) -> Result<TransportSnapshot, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| DesktopError::StatePoisoned.to_string())?;
+
+    session
+        .remove_missing_file(&file_path, &state.audio)
+        .map_err(|error| crate::infra::error_log::log_command_err("remove_missing_file", error))
+}
+
 #[tauri::command]
 pub fn start_save_project_as(
     app: AppHandle,
@@ -1470,16 +1493,30 @@ fn spawn_open_project_worker(app: &AppHandle, song_file: std::path::PathBuf) {
         // ready — so it is always visible that the audio is NOT ready yet.
         //
         // Playback is progressive: decoded blocks sound, the rest is silent.
-        let result = (|| -> Result<TransportSnapshot, String> {
-            let mut session = state
-                .session
-                .lock()
-                .map_err(|_| DesktopError::StatePoisoned.to_string())?;
-            let snapshot = session
-                .begin_open_project_from_path(&worker_app, &state.audio, song_file)
-                .map_err(|error| error.to_string())?;
-            Ok(snapshot)
-        })();
+        //
+        // A panic inside the load must still end in a load-complete event:
+        // without it the frontend never leaves "Cargando sesion de audio..."
+        // and the only trace is a PANIC line in errors.log.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || -> Result<TransportSnapshot, String> {
+                let mut session = state
+                    .session
+                    .lock()
+                    .map_err(|_| DesktopError::StatePoisoned.to_string())?;
+                let snapshot = session
+                    .begin_open_project_from_path(&worker_app, &state.audio, song_file)
+                    .map_err(|error| error.to_string())?;
+                Ok(snapshot)
+            },
+        ))
+        .unwrap_or_else(|payload| {
+            let message = payload
+                .downcast_ref::<&str>()
+                .map(|message| (*message).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "error interno".to_string());
+            Err(format!("No se pudo abrir la sesion: {message}"))
+        });
 
         match result {
             Ok(snapshot) => {
@@ -1570,6 +1607,18 @@ pub fn create_clips_batch(
     Ok(snapshot)
 }
 
+/// Evento con lo que la plantilla organizó en el último drop de stems
+/// (`{ matched, unmatched }`), para el toast «12 stems organizados».
+pub const TEMPLATE_DROP_SUMMARY_EVENT: &str = "song-template:drop-summary";
+
+fn emit_template_drop_summary(app: &AppHandle, session: &mut crate::state::DesktopSession) {
+    if let Some(summary) = session.last_template_drop.take() {
+        if let Err(error) = app.emit(TEMPLATE_DROP_SUMMARY_EVENT, summary) {
+            eprintln!("[song-templates] failed to emit drop summary: {error}");
+        }
+    }
+}
+
 /// Drop one or more audio files into a compact-view song column. The
 /// state layer creates an auto track per file; the file stem becomes
 /// the track name. Used by the compact view's drop handler.
@@ -1587,6 +1636,7 @@ pub fn create_clips_with_auto_tracks(
     let snapshot = session
         .create_clips_with_auto_tracks(&requests, &state.audio)
         .map_err(|error| error.to_string())?;
+    emit_template_drop_summary(&app, &mut session);
 
     if let Some(song_dir) = snapshot.song_dir.as_deref() {
         let requested_paths = requests
@@ -1617,6 +1667,7 @@ pub fn create_audio_tracks_with_clips(
     let snapshot = session
         .create_audio_tracks_with_clips(&requests, &state.audio)
         .map_err(|error| error.to_string())?;
+    emit_template_drop_summary(&app, &mut session);
 
     if let Some(song_dir) = snapshot.song_dir.as_deref() {
         let requested_paths = requests
@@ -2300,11 +2351,7 @@ pub async fn import_audio_files_from_paths(
 
     let song_dir_for_prepare = song_dir.clone();
     let outcome = tauri::async_runtime::spawn_blocking(move || {
-        crate::state::import_audio_files_from_paths_to_library(
-            &song_dir,
-            current_song.as_ref(),
-            &files,
-        )
+        import_paths_or_tree_uris(&song_dir, current_song.as_ref(), &files)
     })
     .await
     .map_err(|error| crate::infra::error_log::log_command_err("import_audio_files_from_paths", error))?
@@ -2316,6 +2363,36 @@ pub async fn import_audio_files_from_paths(
     prepare_library_assets(&state, &song_dir_for_prepare, &outcome.assets);
 
     Ok(outcome)
+}
+
+/// Import by path. Android: the folder library hands over `content://` URIs of
+/// documents inside a picked SAF tree (there are no paths there); those go to
+/// the by-reference URI importer Android already uses, which reads them through
+/// the tree's persistable permission. Real paths take the usual road.
+fn import_paths_or_tree_uris(
+    song_dir: &std::path::Path,
+    song: Option<&libretracks_core::Song>,
+    files: &[AudioFilePathImportPayload],
+) -> Result<crate::models::LibraryImportResult, DesktopError> {
+    #[cfg(target_os = "android")]
+    {
+        let (uris, paths): (Vec<_>, Vec<_>) = files
+            .iter()
+            .cloned()
+            .partition(|file| file.source_path.starts_with("content://"));
+        if !uris.is_empty() {
+            let mut outcome =
+                crate::state::import_referenced_audio_uris_to_library(song_dir, song, &uris)?;
+            if !paths.is_empty() {
+                let more =
+                    crate::state::import_audio_files_from_paths_to_library(song_dir, song, &paths)?;
+                outcome.assets.extend(more.assets);
+                outcome.skipped.extend(more.skipped);
+            }
+            return Ok(outcome);
+        }
+    }
+    crate::state::import_audio_files_from_paths_to_library(song_dir, song, files)
 }
 
 /// Android: consume files staged by `stage_imported_audio_chunk` — they are

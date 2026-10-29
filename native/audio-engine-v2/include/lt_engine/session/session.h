@@ -152,7 +152,18 @@ enum class MarkerKind : int {
     EaseDown = 39,
     GetReady = 40,
     NextSong = 41,
-    Custom = 42,
+    // Instrument solos: sections, appended per the ABI rule.
+    DrumSolo = 42,
+    BassSolo = 43,
+    GuitarSolo = 44,
+    // Tempo cues (one-shot warnings; the tempo does not change).
+    TempoUp = 45,
+    TempoDown = 46,
+    // Spoken count ("one", "two", ...): a cue whose variant is the number. It
+    // plays the counts/<n> clip on its own frame, so a guide's bare count-in
+    // ("1 . 2 . | 1 2 3 4") is one marker per number, each on its beat.
+    Count = 47,
+    Custom = 48,
 };
 
 // Map a serialized snake_case kind token (as sent by Rust/TS) to the enum.
@@ -202,6 +213,8 @@ struct TempoMarker {
     Id     id;
     Frame  frame = 0;
     double bpm = 120.0;
+    // Glides to the next tempo marker's bpm, reached there (see tempo_ramp.h).
+    bool   ramp = false;
 };
 
 struct TimeSignatureMarker {
@@ -232,6 +245,17 @@ struct Region {
     // Per-song master fader. The mixer multiplies the post-mix bus by this
     // value while the playhead lies inside the region. Defaults to unity.
     float master_gain = 1.0f;
+
+    // Song fade in / fade out, in timeline frames from the region's start and
+    // up to its end. 0 = no fade. Applied with the master gain, so they touch
+    // the tracks only, never the click or the voice guide. See
+    // render/region_envelope.h.
+    Frame fade_in_frames  = 0;
+    Frame fade_out_frames = 0;
+
+    // Voice-guide count-in style for this song (VoiceGuideCountStyle value),
+    // or -1 to follow the global setting. Only the voice guide reads it.
+    int voice_guide_count_style = -1;
 };
 
 // ---------------------------------------------------------------------------

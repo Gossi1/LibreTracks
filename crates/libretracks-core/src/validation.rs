@@ -653,6 +653,7 @@ mod tests {
 
     fn region(id: &str, start: f64, end: f64) -> SongRegion {
         SongRegion {
+            key_changes: Vec::new(),
             id: id.into(),
             name: id.into(),
             start_seconds: start,
@@ -663,6 +664,8 @@ mod tests {
             key: None,
             master: SongMaster::default(),
             compact_column_width_rem: None,
+            chart: None,
+            voice_guide_count_style: None,
             structure: None,
         }
     }
@@ -691,6 +694,8 @@ mod tests {
             midi_enabled: true,
             collapsed: false,
             height_offset: None,
+            match_aliases: Vec::new(),
+            song_region_id: None,
         }
     }
 
@@ -767,7 +772,10 @@ mod tests {
     #[test]
     fn rejects_negative_region_master_gain() {
         let mut song = valid_song();
-        song.regions[0].master = SongMaster { gain: -0.5 };
+        song.regions[0].master = SongMaster {
+            gain: -0.5,
+            ..SongMaster::default()
+        };
         assert!(matches!(
             validate_song(&song),
             Err(DomainError::InvalidRegionMasterGain { region_id, .. }) if region_id == "r1"
@@ -779,6 +787,7 @@ mod tests {
         let mut song = valid_song();
         song.regions[0].master = SongMaster {
             gain: f64::INFINITY,
+            ..SongMaster::default()
         };
         assert!(matches!(
             validate_song(&song),

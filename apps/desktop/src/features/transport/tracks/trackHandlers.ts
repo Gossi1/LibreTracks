@@ -6,7 +6,12 @@ import type {
 } from "@libretracks/shared/models";
 
 import type { TrackDropState } from "../types";
-import { planTrackDrop, type MoveTrackArgs } from "./trackMovePlan";
+import {
+  applyTrackMoves,
+  planTrackDrop,
+  withTrackTreeFields,
+  type MoveTrackArgs,
+} from "./trackMovePlan";
 
 /**
  * Dependencies for the track create / reorder handlers extracted from
@@ -16,6 +21,9 @@ import { planTrackDrop, type MoveTrackArgs } from "./trackMovePlan";
  */
 export type TrackHandlerDeps = {
   getSong: () => SongView | null;
+  /** Write the song store (value or updater). The drop paints its result
+   * optimistically before the backend confirms it. */
+  setSong: (next: SongView | null | ((previous: SongView | null) => SongView | null)) => void;
   getTracksById: () => Record<string, TrackSummary>;
   getSelectedTrackIds: () => string[];
   runAction: (action: () => Promise<void>) => Promise<void>;
@@ -26,7 +34,7 @@ export type TrackHandlerDeps = {
   applyPlaybackSnapshot: (snapshot: TransportSnapshot | null) => void;
   /** `settle` after a drop that will change the order: the preview stays
    * until the new order renders. See ./useTrackDragPreview. */
-  clearTrackDragVisuals: (options?: { settle?: boolean }) => void;
+  clearTrackDragVisuals: (options?: { settle?: boolean; revert?: boolean }) => void;
   optimisticallyAppliedRevisionsRef: { current: Set<number> };
   setStatus: (message: string) => void;
   t: (key: string, options?: Record<string, unknown>) => string;
@@ -58,6 +66,7 @@ export function createTrackHandlers(deps: TrackHandlerDeps) {
     setStatus,
     t,
     moveTrack,
+    setSong,
     createTrack,
     prompt,
     setAutomationTrackPosition,
@@ -102,6 +111,21 @@ export function createTrackHandlers(deps: TrackHandlerDeps) {
         return;
       }
 
+      // The preview already shows the result: accept it now, so the release
+      // does not wait on the backend (every move rebuilds the audio structure
+      // and saves, which takes a while in a big session).
+      clearTrackDragVisuals({ settle: true });
+      // And paint it: headers moved with the preview, but the clips live on
+      // the canvas, which only follows `song.tracks`. Applying the moves here
+      // (the backend's own rules, ./trackMovePlan) moves the clips with their
+      // track at once; the refresh below confirms it, and keeps the objects
+      // since they come back equal.
+      const tracksBefore = song!.tracks;
+      setSong((current) =>
+        current && current.tracks === tracksBefore
+          ? { ...current, tracks: withTrackTreeFields(applyTrackMoves(tracksBefore, plan.moves)) }
+          : current,
+      );
       await runAction(async () => {
         try {
           let lastSnapshot: TransportSnapshot | null = null;
@@ -110,16 +134,26 @@ export function createTrackHandlers(deps: TrackHandlerDeps) {
           }
 
           if (lastSnapshot) {
+            // refreshSongView below already pulls the new order: without this
+            // the revision effect fetched the whole song a second time.
+            optimisticallyAppliedRevisionsRef.current.add(lastSnapshot.projectRevision);
             applyPlaybackSnapshot(lastSnapshot);
           }
-          await refreshSongView();
+          // Reordering moves tracks, never clips: the waveform cache is still
+          // valid. Fetching it again was a multi-MB payload, and replacing
+          // the song wholesale re-rendered every row — with 138 tracks the
+          // drop took seconds to land.
+          await refreshSongView({ includeWaveforms: false });
           setStatus(
             t("transport.status.tracksReordered", {
               count: plan.moves.length,
             }),
           );
-        } finally {
-          clearTrackDragVisuals({ settle: true });
+        } catch (error) {
+          clearTrackDragVisuals({ revert: true });
+          // Back to what the backend has: the optimistic order did not happen.
+          setSong((current) => (current ? { ...current, tracks: tracksBefore } : current));
+          throw error;
         }
       });
     },
@@ -134,7 +168,9 @@ export function createTrackHandlers(deps: TrackHandlerDeps) {
           ? t("transport.defaults.folderTrackName")
           : kind === "video"
             ? t("transport.video.trackDefaultName")
-            : t("transport.defaults.audioTrackName");
+            : kind === "midi"
+              ? t("transport.midi.trackDefaultName")
+              : t("transport.defaults.audioTrackName");
       const name = (await prompt(t("transport.prompt.trackName"), defaultName))?.trim();
       if (!name) {
         return;

@@ -7,7 +7,7 @@ import type {
 } from "../desktopApi";
 import { secondsToScreenX } from "../timeline/timelineMath";
 
-import { drawRulerMarker, drawRulerTempoMarker } from "./drawBackground";
+import { drawRulerMarker, drawRulerTempoMarker, drawRulerTempoRamp } from "./drawBackground";
 
 export type RulerForegroundLayerArgs = {
   width: number;
@@ -20,7 +20,8 @@ export type RulerForegroundLayerArgs = {
   timeSignatureMarkers: TimeSignatureMarkerSummary[];
   pendingMarkerJump: PendingJumpSummary | null;
   pendingAutomationCue: PendingAutomationCueSummary | null;
-  selectedMarkerId: string | null;
+  /** Seleccion (multiple) de marcas, de cualquier tipo. */
+  selectedMarkerIds: readonly string[];
   currentMarkerId: string | null;
   pulseAlpha: number;
 };
@@ -180,7 +181,7 @@ export function drawRulerForegroundLayer(
       args.cameraX,
       args.pixelsPerSecond,
       {
-        isSelected: args.selectedMarkerId === marker.id,
+        isSelected: args.selectedMarkerIds.includes(marker.id),
         isArmed: args.pendingMarkerJump?.targetMarkerId === marker.id,
         isCurrent: args.currentMarkerId === marker.id,
         pulseAlpha: args.pulseAlpha,
@@ -188,6 +189,13 @@ export function drawRulerForegroundLayer(
     );
   }
 
+  const sortedTempo = [...args.tempoMarkers].sort((a, b) => a.startSeconds - b.startSeconds);
+  sortedTempo.forEach((marker, index) => {
+    const next = sortedTempo[index + 1];
+    if (marker.ramp && next && next.bpm !== marker.bpm) {
+      drawRulerTempoRamp(context, marker, next, args.width, args.cameraX, args.pixelsPerSecond);
+    }
+  });
   for (const marker of args.tempoMarkers) {
     drawRulerTempoMarker(
       context,
@@ -196,6 +204,8 @@ export function drawRulerForegroundLayer(
       args.height,
       args.cameraX,
       args.pixelsPerSecond,
+      undefined,
+      args.selectedMarkerIds.includes(marker.id),
     );
   }
 
@@ -212,6 +222,7 @@ export function drawRulerForegroundLayer(
       args.cameraX,
       args.pixelsPerSecond,
       marker.signature,
+      args.selectedMarkerIds.includes(marker.id),
     );
   }
 

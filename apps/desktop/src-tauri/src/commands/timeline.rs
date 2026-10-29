@@ -21,7 +21,9 @@ use tauri::State;
 use crate::audio::automation::{AutomationCue, MixScene};
 use crate::infra::error::DesktopError;
 use crate::models::{SongStructureResult, TransportSnapshot};
-use crate::state::{ClipMoveRequest, DesktopState};
+use crate::state::{
+    ClipMoveRequest, DesktopState, KeyChangeInput, RulerMarkerPlacement, RulerMarkerRef,
+};
 use libretracks_core::{Arrangement, MarkerCategory, MarkerKind, MidiClip, TrackKind};
 use serde::Deserialize;
 
@@ -285,6 +287,7 @@ pub fn create_section_marker(
     kind: Option<MarkerKind>,
     variant: Option<u8>,
     name: Option<String>,
+    category_override: Option<libretracks_core::MarkerCategory>,
     state: State<'_, DesktopState>,
 ) -> Result<TransportSnapshot, String> {
     let mut session = state
@@ -293,7 +296,14 @@ pub fn create_section_marker(
         .map_err(|_| DesktopError::StatePoisoned.to_string())?;
 
     session
-        .create_section_marker(start_seconds, kind, variant, name, &state.audio)
+        .create_section_marker_in_lane(
+            start_seconds,
+            kind,
+            variant,
+            name,
+            category_override,
+            &state.audio,
+        )
         .map_err(|error| error.to_string())
 }
 
@@ -338,6 +348,55 @@ pub fn delete_section_marker(
         .map_err(|error| error.to_string())
 }
 
+/// Mueve una selección de marcas de la regla (secciones, tempo, compás) en un
+/// solo paso de deshacer. Posiciones en tiempo de vista.
+#[tauri::command(async)]
+pub fn move_ruler_markers(
+    moves: Vec<RulerMarkerPlacement>,
+    state: State<'_, DesktopState>,
+) -> Result<TransportSnapshot, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| DesktopError::StatePoisoned.to_string())?;
+
+    session
+        .move_ruler_markers(&moves, &state.audio)
+        .map_err(|error| error.to_string())
+}
+
+/// Copia cada marca a la posición indicada, en un solo paso de deshacer.
+#[tauri::command(async)]
+pub fn duplicate_ruler_markers(
+    copies: Vec<RulerMarkerPlacement>,
+    state: State<'_, DesktopState>,
+) -> Result<TransportSnapshot, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| DesktopError::StatePoisoned.to_string())?;
+
+    session
+        .duplicate_ruler_markers(&copies, &state.audio)
+        .map_err(|error| error.to_string())
+}
+
+/// Borra una selección de marcas de la regla en un solo paso de deshacer.
+#[tauri::command(async)]
+pub fn delete_ruler_markers(
+    markers: Vec<RulerMarkerRef>,
+    state: State<'_, DesktopState>,
+) -> Result<TransportSnapshot, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| DesktopError::StatePoisoned.to_string())?;
+
+    session
+        .delete_ruler_markers(&markers, &state.audio)
+        .map_err(|error| error.to_string())
+}
+
 #[tauri::command(async)]
 pub fn create_song_region(
     start_seconds: f64,
@@ -358,10 +417,12 @@ pub fn create_song_region(
 /// "+ Nueva canción" button. The new song is placed one bar after the
 /// previous one's end (or at t=0 for the first song) and is itself one
 /// bar wide so it's visible in the DAW view immediately; it resizes to
-/// fit the first clip dropped into it.
+/// fit the first clip dropped into it. `template` lays it out from a song
+/// template; without it the default template in Settings applies, if any.
 #[tauri::command(async)]
 pub fn create_empty_song(
     name: Option<String>,
+    template: Option<String>,
     state: State<'_, DesktopState>,
 ) -> Result<TransportSnapshot, String> {
     let mut session = state
@@ -370,7 +431,7 @@ pub fn create_empty_song(
         .map_err(|_| DesktopError::StatePoisoned.to_string())?;
 
     session
-        .create_empty_song(name.as_deref(), &state.audio)
+        .create_empty_song(name.as_deref(), template.as_deref(), &state.audio)
         .map_err(|error| error.to_string())
 }
 
@@ -543,6 +604,22 @@ pub fn update_song_region_warp(
         .map_err(|error| error.to_string())
 }
 
+#[tauri::command(async)]
+pub fn set_song_region_tempo(
+    region_id: String,
+    bpm: f64,
+    state: State<'_, DesktopState>,
+) -> Result<TransportSnapshot, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| DesktopError::StatePoisoned.to_string())?;
+
+    session
+        .set_song_region_tempo(&region_id, bpm, &state.audio)
+        .map_err(|error| error.to_string())
+}
+
 /// Realtime master-gain stream during drag. Bridge-only: pushes the value to
 /// the engine and returns immediately. No model write, no snapshot, no undo.
 /// Use `update_song_region_master_gain` on pointer-up to commit the value.
@@ -574,6 +651,67 @@ pub fn update_song_region_master_gain(
 
     session
         .update_song_region_master_gain(&region_id, master_gain, &state.audio)
+        .map_err(|error| error.to_string())
+}
+
+/// One song master per entry, committed as a single undo step ("Nivelar
+/// canciones").
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegionMasterGain {
+    pub region_id: String,
+    pub master_gain: f64,
+}
+
+#[tauri::command(async)]
+pub fn update_song_region_master_gains(
+    gains: Vec<RegionMasterGain>,
+    state: State<'_, DesktopState>,
+) -> Result<TransportSnapshot, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| DesktopError::StatePoisoned.to_string())?;
+
+    let gains: Vec<(String, f64)> = gains
+        .into_iter()
+        .map(|entry| (entry.region_id, entry.master_gain))
+        .collect();
+    session
+        .update_song_region_master_gains(&gains, &state.audio)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command(async)]
+pub fn update_song_region_fades(
+    region_id: String,
+    fade_in_seconds: f64,
+    fade_out_seconds: f64,
+    state: State<'_, DesktopState>,
+) -> Result<TransportSnapshot, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| DesktopError::StatePoisoned.to_string())?;
+
+    session
+        .update_song_region_fades(&region_id, fade_in_seconds, fade_out_seconds, &state.audio)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command(async)]
+pub fn update_song_region_voice_guide_count_style(
+    region_id: String,
+    count_style: Option<libretracks_core::VoiceGuideCountStyle>,
+    state: State<'_, DesktopState>,
+) -> Result<TransportSnapshot, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| DesktopError::StatePoisoned.to_string())?;
+
+    session
+        .update_song_region_voice_guide_count_style(&region_id, count_style, &state.audio)
         .map_err(|error| error.to_string())
 }
 
@@ -910,6 +1048,23 @@ pub fn update_song_region_key(
         .map_err(|error| error.to_string())
 }
 
+/// Replaces the song's key changes (modulations); the initial key stays.
+#[tauri::command(async)]
+pub fn set_song_region_key_changes(
+    region_id: String,
+    changes: Vec<KeyChangeInput>,
+    state: State<'_, DesktopState>,
+) -> Result<TransportSnapshot, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| DesktopError::StatePoisoned.to_string())?;
+
+    session
+        .set_song_region_key_changes(&region_id, changes, &state.audio)
+        .map_err(|error| error.to_string())
+}
+
 /// Persists the width of a song's column in the compact view. Pure view
 /// state — see `set_song_region_compact_width`. `width_rem: None` restores
 /// the default width.
@@ -942,6 +1097,22 @@ pub fn upsert_song_tempo_marker(
 
     session
         .upsert_song_tempo_marker(start_seconds, bpm, &state.audio)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command(async)]
+pub fn set_song_tempo_marker_ramp(
+    marker_id: String,
+    ramp: bool,
+    state: State<'_, DesktopState>,
+) -> Result<TransportSnapshot, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| DesktopError::StatePoisoned.to_string())?;
+
+    session
+        .set_song_tempo_marker_ramp(&marker_id, ramp, &state.audio)
         .map_err(|error| error.to_string())
 }
 
@@ -1134,6 +1305,23 @@ pub fn update_track_transpose_enabled(
 
     session
         .update_track_transpose_enabled(&track_id, transpose_enabled, &state.audio)
+        .map_err(|error| error.to_string())
+}
+
+/// Words a template matches dropped stems against to land on this track.
+#[tauri::command(async)]
+pub fn update_track_match_aliases(
+    track_id: String,
+    aliases: Vec<String>,
+    state: State<'_, DesktopState>,
+) -> Result<TransportSnapshot, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| DesktopError::StatePoisoned.to_string())?;
+
+    session
+        .update_track_match_aliases(&track_id, &aliases, &state.audio)
         .map_err(|error| error.to_string())
 }
 

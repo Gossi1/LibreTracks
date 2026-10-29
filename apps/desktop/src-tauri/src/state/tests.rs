@@ -3,7 +3,7 @@ use std::{fs, path::Path, thread, time::Duration};
 use libretracks_audio::{JumpTrigger, PendingMarkerJump, PlaybackState, TransitionType};
 use libretracks_core::{
     source_seconds_at_view, validate_song, warp_timeline_seconds_at, Clip, Marker, MarkerKind,
-    Song, SongRegion, TempoMarker, Track, TrackKind,
+    Song, SongRegion, TempoMarker, TimeSignatureMarker, Track, TrackKind,
 };
 use libretracks_project::{
     create_song_folder, export_region_as_package, generate_waveform_summary, load_song, save_song,
@@ -71,6 +71,7 @@ fn demo_song() -> Song {
         tempo_markers: vec![],
         time_signature_markers: vec![],
         regions: vec![SongRegion {
+            key_changes: Vec::new(),
             id: "region_1".into(),
             name: "Move Demo".into(),
             start_seconds: 0.0,
@@ -81,6 +82,8 @@ fn demo_song() -> Song {
             key: None,
             master: libretracks_core::SongMaster::default(),
             compact_column_width_rem: None,
+            chart: None,
+            voice_guide_count_style: None,
             structure: None,
         }],
         tracks: vec![Track {
@@ -102,6 +105,8 @@ fn demo_song() -> Song {
             midi_enabled: true,
             collapsed: false,
             height_offset: None,
+            match_aliases: Vec::new(),
+            song_region_id: None,
         }],
         clips: vec![Clip {
             id: "clip_1".into(),
@@ -140,6 +145,7 @@ fn demo_song_with_varispeed_region() -> Song {
     let mut song = demo_song();
     song.duration_seconds = 24.0;
     song.regions = vec![SongRegion {
+        key_changes: Vec::new(),
         id: "region_varispeed".into(),
         name: "Varispeed".into(),
         start_seconds: 5.0,
@@ -150,6 +156,8 @@ fn demo_song_with_varispeed_region() -> Song {
         key: None,
         master: libretracks_core::SongMaster::default(),
         compact_column_width_rem: None,
+        chart: None,
+        voice_guide_count_style: None,
         structure: None,
     }];
     // Keep the clip inside the varispeed region ([5, 20]) so the song
@@ -193,6 +201,7 @@ fn musical_position_summary_uses_tempo_markers_beyond_song_duration() {
         id: "tempo_far".into(),
         start_seconds: 12.0,
         bpm: 60.0,
+        ramp: false,
     }];
 
     let summary = musical_position_summary(&song, 13.0);
@@ -201,6 +210,31 @@ fn musical_position_summary_uses_tempo_markers_beyond_song_duration() {
     assert_eq!(summary.beat_in_bar, 2);
     assert_eq!(summary.sub_beat, 0);
     assert_eq!(summary.display, "7.2.00");
+}
+
+#[test]
+fn musical_position_summary_restarts_the_bar_at_a_time_signature_marker_off_the_grid() {
+    // 120 BPM 4/4: bars of 2 s. A time signature marker at 5 s (mid bar 3)
+    // starts bar 4 even with the same meter, as the engine's metronome does.
+    // A tempo marker alone keeps the beat phase, like the timeline grid.
+    let mut song = demo_song();
+    song.bpm = 120.0;
+    song.time_signature_markers = vec![TimeSignatureMarker {
+        id: "sig_mid_bar".into(),
+        start_seconds: 5.0,
+        signature: "4/4".into(),
+    }];
+    assert_eq!(musical_position_summary(&song, 5.0).display, "4.1.00");
+    assert_eq!(musical_position_summary(&song, 5.5).display, "4.2.00");
+
+    song.time_signature_markers.clear();
+    song.tempo_markers = vec![TempoMarker {
+        id: "tempo_mid_bar".into(),
+        start_seconds: 5.0,
+        bpm: 60.0,
+        ramp: false,
+    }];
+    assert_eq!(musical_position_summary(&song, 5.0).display, "3.3.00");
 }
 
 fn demo_song_with_two_sections() -> Song {
@@ -238,6 +272,7 @@ fn demo_song_with_region_changes_and_sections() -> Song {
     song.duration_seconds = 18.0;
     song.regions = vec![
         SongRegion {
+            key_changes: Vec::new(),
             id: "region_1".into(),
             name: "Intro".into(),
             start_seconds: 0.0,
@@ -248,9 +283,12 @@ fn demo_song_with_region_changes_and_sections() -> Song {
             key: None,
             master: libretracks_core::SongMaster::default(),
             compact_column_width_rem: None,
+            chart: None,
+            voice_guide_count_style: None,
             structure: None,
         },
         SongRegion {
+            key_changes: Vec::new(),
             id: "region_2".into(),
             name: "Bridge".into(),
             start_seconds: 8.0,
@@ -261,9 +299,12 @@ fn demo_song_with_region_changes_and_sections() -> Song {
             key: None,
             master: libretracks_core::SongMaster::default(),
             compact_column_width_rem: None,
+            chart: None,
+            voice_guide_count_style: None,
             structure: None,
         },
         SongRegion {
+            key_changes: Vec::new(),
             id: "region_3".into(),
             name: "Outro".into(),
             start_seconds: 14.0,
@@ -274,6 +315,8 @@ fn demo_song_with_region_changes_and_sections() -> Song {
             key: None,
             master: libretracks_core::SongMaster::default(),
             compact_column_width_rem: None,
+            chart: None,
+            voice_guide_count_style: None,
             structure: None,
         },
     ];
@@ -331,6 +374,8 @@ fn demo_song_with_folder_track() -> Song {
             midi_enabled: true,
             collapsed: false,
             height_offset: None,
+            match_aliases: Vec::new(),
+            song_region_id: None,
         },
     );
     // Make the audio track a child of the folder.
@@ -358,7 +403,7 @@ pub(super) fn write_silent_test_wav(path: &Path, duration_seconds: u32) {
     writer.finalize().expect("wav should finalize");
 }
 
-fn session_with_song_dir(song_name: &str, song: Song) -> DesktopSession {
+pub(super) fn session_with_song_dir(song_name: &str, song: Song) -> DesktopSession {
     let root = tempdir().expect("temp dir should exist");
     let root_path = root.keep();
     let song_dir = create_song_folder(&root_path, song_name).expect("song dir should exist");
@@ -388,6 +433,7 @@ fn hierarchy_song() -> Song {
         tempo_markers: vec![],
         time_signature_markers: vec![],
         regions: vec![SongRegion {
+            key_changes: Vec::new(),
             id: "region_1".into(),
             name: "Hierarchy Demo".into(),
             start_seconds: 0.0,
@@ -398,6 +444,8 @@ fn hierarchy_song() -> Song {
             key: None,
             master: libretracks_core::SongMaster::default(),
             compact_column_width_rem: None,
+            chart: None,
+            voice_guide_count_style: None,
             structure: None,
         }],
         tracks: vec![
@@ -420,6 +468,8 @@ fn hierarchy_song() -> Song {
                 midi_enabled: true,
                 collapsed: false,
                 height_offset: None,
+                match_aliases: Vec::new(),
+                song_region_id: None,
             },
             Track {
                 id: "track_child_a".into(),
@@ -440,6 +490,8 @@ fn hierarchy_song() -> Song {
                 midi_enabled: true,
                 collapsed: false,
                 height_offset: None,
+                match_aliases: Vec::new(),
+                song_region_id: None,
             },
             Track {
                 id: "track_folder_b".into(),
@@ -460,6 +512,8 @@ fn hierarchy_song() -> Song {
                 midi_enabled: true,
                 collapsed: false,
                 height_offset: None,
+                match_aliases: Vec::new(),
+                song_region_id: None,
             },
             Track {
                 id: "track_child_b".into(),
@@ -480,6 +534,8 @@ fn hierarchy_song() -> Song {
                 midi_enabled: true,
                 collapsed: false,
                 height_offset: None,
+                match_aliases: Vec::new(),
+                song_region_id: None,
             },
         ],
         clips: vec![],
@@ -981,6 +1037,7 @@ fn song_to_view_preserves_track_ids_and_parent_ids_verbatim() {
         tempo_markers: vec![],
         time_signature_markers: vec![],
         regions: vec![SongRegion {
+            key_changes: Vec::new(),
             id: "region_1".into(),
             name: "ID Audit".into(),
             start_seconds: 0.0,
@@ -991,6 +1048,8 @@ fn song_to_view_preserves_track_ids_and_parent_ids_verbatim() {
             key: None,
             master: libretracks_core::SongMaster::default(),
             compact_column_width_rem: None,
+            chart: None,
+            voice_guide_count_style: None,
             structure: None,
         }],
         tracks: vec![
@@ -1013,6 +1072,8 @@ fn song_to_view_preserves_track_ids_and_parent_ids_verbatim() {
                 midi_enabled: true,
                 collapsed: false,
                 height_offset: None,
+                match_aliases: Vec::new(),
+                song_region_id: None,
             },
             Track {
                 id: "track-drums_01".into(),
@@ -1033,6 +1094,8 @@ fn song_to_view_preserves_track_ids_and_parent_ids_verbatim() {
                 midi_enabled: true,
                 collapsed: false,
                 height_offset: None,
+                match_aliases: Vec::new(),
+                song_region_id: None,
             },
         ],
         clips: vec![],
@@ -1216,6 +1279,8 @@ fn batch_move_can_reassign_clip_to_another_track() {
         midi_enabled: true,
         collapsed: false,
         height_offset: None,
+        match_aliases: Vec::new(),
+        song_region_id: None,
     });
     let mut session = session_with_song_dir("batch-move-track", song);
     let audio = crate::audio::engine::AudioController::default();
@@ -1477,6 +1542,7 @@ fn varispeed_expansion_next_to_another_song_returns_descriptive_overlap_error() 
     song.duration_seconds = 24.0;
     song.regions[0].name = "Pueblos todos".into();
     song.regions.push(SongRegion {
+        key_changes: Vec::new(),
         id: "region_2".into(),
         name: "Santo por siempre".into(),
         start_seconds: 12.0,
@@ -1487,6 +1553,8 @@ fn varispeed_expansion_next_to_another_song_returns_descriptive_overlap_error() 
         key: None,
         master: libretracks_core::SongMaster::default(),
         compact_column_width_rem: None,
+        chart: None,
+        voice_guide_count_style: None,
         structure: None,
     });
     let mut session = session_with_song_dir("transpose-overlap-demo", song);
@@ -2374,6 +2442,8 @@ fn song_with_folder_hierarchy() -> Song {
             midi_enabled: true,
             collapsed: false,
             height_offset: None,
+            match_aliases: vec!["drums".into(), "kick".into()],
+            song_region_id: Some("region_1".into()),
         },
     );
     song.tracks.push(Track {
@@ -2395,6 +2465,8 @@ fn song_with_folder_hierarchy() -> Song {
         midi_enabled: true,
         collapsed: false,
         height_offset: None,
+        match_aliases: Vec::new(),
+        song_region_id: None,
     });
     song
 }
@@ -2416,6 +2488,10 @@ fn strip_song_to_template_keeps_structure_and_drops_content() {
     assert_eq!(folder.kind, TrackKind::Folder);
     assert_eq!(folder.audio_to, "bus_a");
     assert_eq!(folder.color.as_deref(), Some("#ff0000"));
+    // The aliases are layout and travel with the template; the song a track
+    // was made for does not, because a template has no songs.
+    assert_eq!(folder.match_aliases, vec!["drums", "kick"]);
+    assert_eq!(folder.song_region_id, None);
     let child = template
         .tracks
         .iter()
@@ -3799,6 +3875,52 @@ fn splitting_a_song_region_divides_it_in_two_at_the_cursor() {
 }
 
 #[test]
+fn splitting_a_song_after_a_stretched_song_cuts_its_clips_at_the_cursor() {
+    // Issue: varias canciones con distinto BPM, warp/transposición. Los clips
+    // se guardan en tiempo de fuente; el cursor llega en tiempo de vista. Con
+    // una canción estirada delante, los dos relojes se separan y el corte de
+    // los clips caía antes que el de la canción.
+    let mut song = demo_song_with_region_changes_and_sections();
+    // +12 semitonos sin warp → varispeed ×2: region_1 [0,8] dura 4s en vista,
+    // así que region_2 [8,14] se ve en [4,10].
+    song.regions[0].transpose_semitones = 12;
+    song.clips[0].timeline_start_seconds = 9.0;
+    song.clips[0].duration_seconds = 4.0;
+    let mut session = session_with_song_dir("region-split-after-stretch", song);
+    let audio = crate::audio::engine::AudioController::default();
+
+    // Vista 6 = fuente 10, dentro del clip [9,13].
+    session
+        .split_song_region("region_2", 6.0, &audio)
+        .expect("region should split");
+    let song_view = session
+        .song_view()
+        .expect("song view should build")
+        .expect("song summary should exist");
+
+    let right = song_view
+        .regions
+        .iter()
+        .find(|r| r.name == "Bridge (2)")
+        .expect("right half exists");
+    assert!((right.start_seconds - 6.0).abs() < 0.0001);
+
+    let mut clips: Vec<(f64, f64)> = song_view
+        .clips
+        .iter()
+        .map(|clip| (clip.timeline_start_seconds, clip.source_start_seconds))
+        .collect();
+    clips.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    assert_eq!(clips.len(), 2, "the clip crossing the cut is split");
+    assert!((clips[0].0 - 5.0).abs() < 0.0001);
+    assert!((clips[1].0 - 6.0).abs() < 0.0001, "cut lands on the cursor");
+    assert!(
+        (clips[1].1 - (clips[0].1 + 1.0)).abs() < 0.0001,
+        "right half resumes the audio 1 source second later"
+    );
+}
+
+#[test]
 fn splitting_a_song_region_outside_its_range_is_rejected() {
     let mut session = session_with_song_dir(
         "region-split-invalid",
@@ -3850,6 +3972,7 @@ fn reconcile_regions_and_clips_keeps_a_clip_from_crossing_into_the_next_song() {
     let mut song = demo_song();
     song.regions = vec![
         SongRegion {
+            key_changes: Vec::new(),
             id: "a".into(),
             name: "A".into(),
             start_seconds: 0.0,
@@ -3860,9 +3983,12 @@ fn reconcile_regions_and_clips_keeps_a_clip_from_crossing_into_the_next_song() {
             key: None,
             master: libretracks_core::SongMaster::default(),
             compact_column_width_rem: None,
+            chart: None,
+            voice_guide_count_style: None,
             structure: None,
         },
         SongRegion {
+            key_changes: Vec::new(),
             id: "b".into(),
             name: "B".into(),
             start_seconds: 100.0,
@@ -3873,6 +3999,8 @@ fn reconcile_regions_and_clips_keeps_a_clip_from_crossing_into_the_next_song() {
             key: None,
             master: libretracks_core::SongMaster::default(),
             compact_column_width_rem: None,
+            chart: None,
+            voice_guide_count_style: None,
             structure: None,
         },
     ];
@@ -4050,15 +4178,18 @@ fn changing_warped_region_tempo_keeps_following_song_on_downbeat() {
             id: "tempo_middle".into(),
             start_seconds: 10.0,
             bpm: 130.0,
+            ramp: false,
         },
         TempoMarker {
             id: "tempo_following".into(),
             start_seconds: 17.384615384615387,
             bpm: 140.0,
+            ramp: false,
         },
     ];
     song.regions = vec![
         SongRegion {
+            key_changes: Vec::new(),
             id: "region_intro".into(),
             name: "Intro".into(),
             start_seconds: 0.0,
@@ -4069,9 +4200,12 @@ fn changing_warped_region_tempo_keeps_following_song_on_downbeat() {
             key: None,
             master: libretracks_core::SongMaster::default(),
             compact_column_width_rem: None,
+            chart: None,
+            voice_guide_count_style: None,
             structure: None,
         },
         SongRegion {
+            key_changes: Vec::new(),
             id: "region_middle".into(),
             name: "Warped".into(),
             start_seconds: 10.0,
@@ -4082,9 +4216,12 @@ fn changing_warped_region_tempo_keeps_following_song_on_downbeat() {
             key: None,
             master: libretracks_core::SongMaster::default(),
             compact_column_width_rem: None,
+            chart: None,
+            voice_guide_count_style: None,
             structure: None,
         },
         SongRegion {
+            key_changes: Vec::new(),
             id: "region_following".into(),
             name: "Following".into(),
             start_seconds: 17.384615384615387,
@@ -4095,6 +4232,8 @@ fn changing_warped_region_tempo_keeps_following_song_on_downbeat() {
             key: None,
             master: libretracks_core::SongMaster::default(),
             compact_column_width_rem: None,
+            chart: None,
+            voice_guide_count_style: None,
             structure: None,
         },
     ];
@@ -4610,6 +4749,207 @@ fn automation_track_mix_is_reflected_in_the_model() {
         "automation pan must be visible in the model, got {}",
         track.pan
     );
+}
+
+/// Field report: muting a track by hand and then letting an automation cue
+/// un-mute it left the red M lit. The model was right (see the tests above) but
+/// nothing told the UI: automation must not bump `project_revision` (it is not
+/// an edit — no autosave, no undo), and that counter was the only thing the
+/// frontend refetched the song on. `mix_revision` is the signal it watches now.
+#[test]
+fn automation_mix_bumps_mix_revision_but_not_project_revision() {
+    let mut session = session_with_song_dir("automation-mix-revision-demo", demo_song());
+    let audio = crate::audio::engine::AudioController::default();
+    let before = session.snapshot();
+
+    session
+        .apply_automation_action(
+            &crate::audio::automation::AutomationAction::SetTrackMute {
+                track_id: "track_1".into(),
+                muted: false,
+            },
+            &audio,
+        )
+        .expect("automation un-mute should succeed");
+
+    let after = session.snapshot();
+    assert!(
+        after.mix_revision > before.mix_revision,
+        "automation mute must tell the UI the mix changed"
+    );
+    assert_eq!(
+        after.project_revision, before.project_revision,
+        "automation is playback state, not an edit: no autosave, no undo"
+    );
+
+    for action in [
+        crate::audio::automation::AutomationAction::SetTrackSolo {
+            track_id: "track_1".into(),
+            solo: true,
+        },
+        crate::audio::automation::AutomationAction::SetTrackMix {
+            track_id: "track_1".into(),
+            volume: Some(0.5),
+            pan: None,
+            ramp_seconds: None,
+        },
+    ] {
+        let revision = session.snapshot().mix_revision;
+        session
+            .apply_automation_action(&action, &audio)
+            .expect("automation action should succeed");
+        assert!(
+            session.snapshot().mix_revision > revision,
+            "{action:?} must bump mix_revision"
+        );
+    }
+}
+
+/// Song fades are an edit like any other (undo, autosave) and can never be
+/// longer than the song: a fade in longer than the song would never reach full
+/// level.
+#[test]
+fn song_region_fades_are_stored_capped_and_validated() {
+    let mut session = session_with_song_dir("song-fades-demo", demo_song());
+    let audio = crate::audio::engine::AudioController::default();
+    let revision = session.snapshot().project_revision;
+
+    session
+        .update_song_region_fades("region_1", 3.0, 40.0, &audio)
+        .expect("fades should be stored");
+
+    let song = session.engine.song().expect("song should be loaded");
+    assert_eq!(song.regions[0].master.fade_in_seconds, 3.0);
+    assert_eq!(
+        song.regions[0].master.fade_out_seconds, 12.0,
+        "a fade is capped at the song's 12 s"
+    );
+    assert!(session.snapshot().project_revision > revision, "fades are an edit");
+
+    assert!(session
+        .update_song_region_fades("region_1", -1.0, 0.0, &audio)
+        .is_err());
+    assert!(session
+        .update_song_region_fades("region_1", f64::NAN, 0.0, &audio)
+        .is_err());
+}
+
+/// A song's own voice-guide count style is an edit like any other (undo,
+/// `project_revision`) and `None` puts the song back on the global setting.
+#[test]
+fn song_region_voice_guide_count_style_is_stored_and_undoable() {
+    use libretracks_core::VoiceGuideCountStyle;
+    let mut session = session_with_song_dir("count-style-demo", demo_song());
+    let audio = crate::audio::engine::AudioController::default();
+    let revision = session.snapshot().project_revision;
+
+    session
+        .update_song_region_voice_guide_count_style(
+            "region_1",
+            Some(VoiceGuideCountStyle::HalfThenFull),
+            &audio,
+        )
+        .expect("count style should be stored");
+    let song = session.engine.song().unwrap();
+    assert_eq!(
+        song.regions[0].voice_guide_count_style,
+        Some(VoiceGuideCountStyle::HalfThenFull)
+    );
+    assert_eq!(
+        crate::models::view::region_to_summary(song, &song.regions[0]).voice_guide_count_style,
+        Some(VoiceGuideCountStyle::HalfThenFull),
+        "the view carries it so the menu can tick the current style"
+    );
+    assert!(session.snapshot().project_revision > revision, "it is an edit");
+
+    session.undo_action(&audio).expect("undo");
+    assert_eq!(session.engine.song().unwrap().regions[0].voice_guide_count_style, None);
+
+    assert!(session
+        .update_song_region_voice_guide_count_style("missing", None, &audio)
+        .is_err());
+}
+
+/// "Nivelar canciones" sets every song master in one edit: one undo puts them
+/// all back, and a bad value or unknown song changes nothing.
+#[test]
+fn song_master_gains_are_set_together_and_undone_together() {
+    let mut song = demo_song();
+    let mut second = song.regions[0].clone();
+    second.id = "region_2".into();
+    second.start_seconds = 6.0;
+    song.regions[0].end_seconds = 6.0;
+    song.regions.push(second);
+    let mut session = session_with_song_dir("level-songs-demo", song);
+    let audio = crate::audio::engine::AudioController::default();
+
+    session
+        .update_song_region_master_gains(
+            &[("region_1".into(), 0.5), ("region_2".into(), 1.5)],
+            &audio,
+        )
+        .expect("gains should be stored");
+    let gains = |session: &DesktopSession| -> Vec<f64> {
+        session
+            .engine
+            .song()
+            .expect("song")
+            .regions
+            .iter()
+            .map(|region| region.master.gain)
+            .collect()
+    };
+    assert_eq!(gains(&session), vec![0.5, 1.5]);
+
+    assert!(session
+        .update_song_region_master_gains(&[("region_1".into(), 2.0), ("nope".into(), 1.0)], &audio)
+        .is_err());
+    assert!(session
+        .update_song_region_master_gains(&[("region_1".into(), f64::NAN)], &audio)
+        .is_err());
+    assert_eq!(gains(&session), vec![0.5, 1.5], "a rejected batch changes nothing");
+
+    session.undo_action(&audio).expect("undo");
+    assert_eq!(gains(&session), vec![1.0, 1.0], "one undo restores every song");
+}
+
+/// «Fade out y parar»: fades while playing, stops when the fade runs out, and
+/// a second press stops at once. Pause cancels it. Every way out leaves the
+/// fade cleared, or the next Play would start under a silenced master.
+#[test]
+fn fade_out_and_stop_fades_then_stops() {
+    let mut session = session_with_song_dir("fade-stop-demo", demo_song());
+    let audio = crate::audio::engine::AudioController::default();
+
+    // Not playing: nothing to fade.
+    let idle = session.fade_out_and_stop(5.0, &audio).expect("idle press is fine");
+    assert!(!idle.fading_to_stop);
+
+    session.play(&audio).expect("play should succeed");
+    let fading = session.fade_out_and_stop(5.0, &audio).expect("fade should start");
+    assert!(fading.fading_to_stop);
+    assert_eq!(fading.playback_state, "playing", "it keeps playing while it fades");
+
+    // Before the end, the sync tick leaves it playing.
+    assert!(!session.finish_fade_stop_if_due(&audio).expect("tick"));
+    session.expire_fade_stop_for_test();
+    assert!(session.finish_fade_stop_if_due(&audio).expect("tick"));
+    let stopped = session.snapshot();
+    assert_eq!(stopped.playback_state, "stopped");
+    assert!(!stopped.fading_to_stop);
+
+    // Second press while fading = stop now.
+    session.play(&audio).expect("play should succeed");
+    session.fade_out_and_stop(5.0, &audio).expect("fade should start");
+    let now = session.fade_out_and_stop(5.0, &audio).expect("second press");
+    assert_eq!(now.playback_state, "stopped");
+    assert!(!now.fading_to_stop);
+
+    // Pause during the fade cancels it.
+    session.play(&audio).expect("play should succeed");
+    session.fade_out_and_stop(5.0, &audio).expect("fade should start");
+    let paused = session.pause(&audio).expect("pause should succeed");
+    assert!(!paused.fading_to_stop);
 }
 
 /// Commit path (pointer-up): must bump revision and send exactly one realtime command.
@@ -5473,6 +5813,45 @@ fn toggling_pause_at_song_end_reaches_the_engine_without_reopening_the_device() 
 }
 
 #[test]
+fn toggling_vamp_between_songs_reaches_the_engine_without_reopening_the_device() {
+    let previous = crate::infra::settings::AppSettings::default();
+    assert!(
+        !previous.vamp_between_songs,
+        "el vamp entre canciones viene desactivado por defecto"
+    );
+    let mut next = previous.clone();
+    next.vamp_between_songs = true;
+
+    let plan = plan_audio_settings_change(&previous, &next);
+
+    assert!(plan.apply, "el interruptor tiene que llegar al mezclador");
+    assert!(
+        !plan.rebuild_stream,
+        "es un flag del mezclador: reabrir el dispositivo cortaría el audio"
+    );
+}
+
+#[test]
+fn changing_the_track_meter_mode_reaches_the_engine_without_reopening_the_device() {
+    let previous = crate::infra::settings::AppSettings::default();
+    assert_eq!(
+        previous.track_meter_mode,
+        lt_audio_engine_v2::TrackMeterMode::PostFader,
+        "el vúmetro de pista es post-fader por defecto, como en Ableton"
+    );
+    let mut next = previous.clone();
+    next.track_meter_mode = lt_audio_engine_v2::TrackMeterMode::PreFader;
+
+    let plan = plan_audio_settings_change(&previous, &next);
+
+    assert!(plan.apply, "el punto de medida tiene que llegar al mezclador");
+    assert!(
+        !plan.rebuild_stream,
+        "es un atómico del mezclador: reabrir el dispositivo cortaría el audio"
+    );
+}
+
+#[test]
 fn unchanged_audio_settings_do_not_touch_the_engine() {
     let settings = crate::infra::settings::AppSettings::default();
 
@@ -5516,4 +5895,515 @@ fn changing_the_output_device_reopens_the_stream() {
 
     assert!(plan.apply);
     assert!(plan.rebuild_stream);
+}
+
+fn song_with_intro_chorus_bridge() -> Song {
+    let mut song = demo_song();
+    for (id, name, start_seconds, digit) in [
+        ("intro", "Intro", 0.0, 1),
+        ("chorus", "Coro", 4.0, 2),
+        ("bridge", "Puente", 8.0, 3),
+    ] {
+        song.section_markers.push(Marker {
+            id: id.into(),
+            name: name.into(),
+            start_seconds,
+            digit: Some(digit),
+            kind: MarkerKind::Custom,
+            variant: None,
+            color: None,
+            category_override: None,
+        });
+    }
+    song
+}
+
+fn mute_cue_at(at_seconds: f64) -> crate::audio::automation::AutomationCue {
+    crate::audio::automation::AutomationCue {
+        id: "mute_before_chorus".into(),
+        name: "Mute".into(),
+        at_seconds,
+        enabled: true,
+        max_runs: None,
+        actions: vec![crate::audio::automation::AutomationAction::SetTrackMute {
+            track_id: "track_1".into(),
+            muted: true,
+        }],
+    }
+}
+
+/// Field report: a mute cue right before the chorus, vamp on the chorus, then
+/// a jump back to the intro. The playhead crosses the cue again on its way to
+/// the vamp, so the cue has to be armed even though the vamp is still on.
+#[test]
+fn jumping_back_with_a_vamp_on_rearms_the_cues_before_the_vamp() {
+    let mut session = session_with_song_dir("vamp-automation", song_with_intro_chorus_bridge());
+    session.automation.cues = vec![mute_cue_at(3.0)];
+    let audio = crate::audio::engine::AudioController::default();
+
+    session.play(&audio).expect("play should succeed");
+    session.seek(5.0, &audio).expect("seek should succeed");
+    session
+        .toggle_vamp(libretracks_audio::VampMode::Section, &audio)
+        .expect("vamp should toggle on");
+    assert!(session.engine.active_vamp().is_some());
+
+    session
+        .schedule_marker_jump(
+            "intro",
+            JumpTrigger::Immediate,
+            TransitionType::Instant,
+            &audio,
+        )
+        .expect("jump should succeed");
+
+    assert!(session.engine.active_vamp().is_some());
+    assert!(session.engine.position_seconds() < 3.0);
+    let job = session
+        .active_automation_job
+        .as_ref()
+        .expect("the cue before the vamp should be armed");
+    assert_eq!(job.cue_id, "mute_before_chorus");
+    // The vamp owns the native scheduler: nothing is armed as a jump.
+    assert!(session.pending_automation_jump.is_none());
+}
+
+#[test]
+fn a_vamp_does_not_arm_cues_past_its_end() {
+    let mut session = session_with_song_dir("vamp-automation-end", song_with_intro_chorus_bridge());
+    session.automation.cues = vec![mute_cue_at(9.0)];
+    let audio = crate::audio::engine::AudioController::default();
+
+    session.play(&audio).expect("play should succeed");
+    session.seek(5.0, &audio).expect("seek should succeed");
+    session
+        .toggle_vamp(libretracks_audio::VampMode::Section, &audio)
+        .expect("vamp should toggle on");
+
+    assert!(session.active_automation_job.is_none());
+
+    session
+        .toggle_vamp(libretracks_audio::VampMode::Section, &audio)
+        .expect("vamp should toggle off");
+    assert!(session.engine.active_vamp().is_none());
+    assert_eq!(
+        session
+            .active_automation_job
+            .as_ref()
+            .map(|job| job.cue_id.as_str()),
+        Some("mute_before_chorus"),
+        "turning the vamp off re-arms the cue ahead"
+    );
+}
+
+/// Field report: a cue placed ON the chorus marker never fired when a jump
+/// landed on the chorus, because arming only looked strictly ahead of the
+/// playhead. With and without a vamp running.
+#[test]
+fn a_jump_landing_on_a_cue_fires_it() {
+    for with_vamp in [false, true] {
+        let mut session = session_with_song_dir("landing-cue", song_with_intro_chorus_bridge());
+        session.automation.cues = vec![mute_cue_at(4.0)];
+        let audio = crate::audio::engine::AudioController::default();
+
+        session.play(&audio).expect("play should succeed");
+        session.seek(6.0, &audio).expect("seek should succeed");
+        if with_vamp {
+            session
+                .toggle_vamp(libretracks_audio::VampMode::Section, &audio)
+                .expect("vamp should toggle on");
+        }
+        session
+            .schedule_marker_jump(
+                "chorus",
+                JumpTrigger::Immediate,
+                TransitionType::Instant,
+                &audio,
+            )
+            .expect("jump should succeed");
+
+        assert_eq!(
+            session
+                .active_automation_job
+                .as_ref()
+                .map(|job| job.cue_id.as_str()),
+            Some("mute_before_chorus"),
+            "with_vamp={with_vamp}"
+        );
+    }
+}
+
+/// Same report for MIDI: a lyrics change placed on the chorus marker has to go
+/// out when a jump lands there, so the cursor must sit just before the landing
+/// point (the tick window is `(cursor, now]`), not on it — and not stay where
+/// the jump started, which silenced MIDI until the playhead got back there.
+#[test]
+fn a_jump_puts_the_midi_cursor_just_before_the_landing_point() {
+    let mut session = session_with_song_dir("landing-midi", song_with_intro_chorus_bridge());
+    let audio = crate::audio::engine::AudioController::default();
+
+    session.play(&audio).expect("play should succeed");
+    session.seek(6.0, &audio).expect("seek should succeed");
+    session
+        .schedule_marker_jump(
+            "chorus",
+            JumpTrigger::Immediate,
+            TransitionType::Instant,
+            &audio,
+        )
+        .expect("jump should succeed");
+
+    assert!(session.midi_cursor_seconds < 4.0);
+    assert!(session.midi_cursor_seconds > 3.99);
+}
+
+fn jump_cue(id: &str, at_seconds: f64, marker_id: &str) -> crate::audio::automation::AutomationCue {
+    crate::audio::automation::AutomationCue {
+        id: id.into(),
+        name: id.into(),
+        at_seconds,
+        enabled: true,
+        max_runs: None,
+        actions: vec![crate::audio::automation::AutomationAction::Jump {
+            target: crate::audio::automation::AutomationJumpTarget::Marker {
+                marker_id: marker_id.into(),
+            },
+            transition: Default::default(),
+            mix_scene_id: None,
+        }],
+    }
+}
+
+/// Field report: a cue before the intro jumps back to the chorus. After that
+/// jump lands, the same cue has to be armed again for the next pass — it is
+/// only kept off the landing point, not out of the song.
+#[test]
+fn a_cue_that_jumps_back_is_armed_again_for_the_next_pass() {
+    let mut session = session_with_song_dir("loop-back", song_with_intro_chorus_bridge());
+    session.automation.cues = vec![jump_cue("back_to_chorus", 7.5, "chorus")];
+    let audio = crate::audio::engine::AudioController::default();
+
+    session.play(&audio).expect("play should succeed");
+    session.seek(4.0, &audio).expect("seek should succeed");
+    // What the native-jump completion does once the cue's jump has landed.
+    session.record_automation_cue_run("back_to_chorus");
+    session
+        .arm_automation_from_landing(&audio, 4.0, Some("back_to_chorus"))
+        .expect("arming should succeed");
+
+    assert_eq!(
+        session
+            .pending_automation_jump
+            .as_ref()
+            .map(|pending| pending.cue_id.as_str()),
+        Some("back_to_chorus")
+    );
+}
+
+/// A jump cue placed right on the marker a jump lands on fires right after
+/// the landing instead of being dropped.
+#[test]
+fn a_jump_cue_on_the_landing_point_fires_right_after_landing() {
+    let mut session = session_with_song_dir("landing-jump", song_with_intro_chorus_bridge());
+    session.automation.cues = vec![jump_cue("chorus_to_bridge", 4.0, "bridge")];
+    let audio = crate::audio::engine::AudioController::default();
+
+    session.play(&audio).expect("play should succeed");
+    session.seek(6.0, &audio).expect("seek should succeed");
+    session
+        .schedule_marker_jump(
+            "chorus",
+            JumpTrigger::Immediate,
+            TransitionType::Instant,
+            &audio,
+        )
+        .expect("jump should succeed");
+
+    let pending = session
+        .pending_automation_jump
+        .as_ref()
+        .expect("the cue on the landing point should be armed");
+    assert_eq!(pending.cue_id, "chorus_to_bridge");
+    assert!(pending.execute_at_seconds > session.engine.position_seconds());
+    assert!(pending.execute_at_seconds < 4.1);
+}
+
+/// Field report: with a jump programmed for the next marker, a mute cue
+/// halfway there never fired (MIDI did). While the programmed jump waits, the
+/// cues before it are armed as timeline jobs; their own jump is left out so
+/// the jump the user asked for wins.
+#[test]
+fn cues_before_a_programmed_jump_still_fire_while_it_waits() {
+    let mut session = session_with_song_dir("programmed-jump", song_with_intro_chorus_bridge());
+    session.automation.cues = vec![mute_cue_at(6.0)];
+    let audio = crate::audio::engine::AudioController::default();
+
+    session.play(&audio).expect("play should succeed");
+    session.seek(5.0, &audio).expect("seek should succeed");
+    session
+        .schedule_marker_jump(
+            "intro",
+            JumpTrigger::NextMarker,
+            TransitionType::Instant,
+            &audio,
+        )
+        .expect("jump should be programmed");
+
+    assert!(session.engine.pending_marker_jump().is_some());
+    assert_eq!(
+        session
+            .active_automation_job
+            .as_ref()
+            .map(|job| job.cue_id.as_str()),
+        Some("mute_before_chorus")
+    );
+    assert!(session.pending_automation_jump.is_none());
+
+    session
+        .cancel_marker_jump(&audio)
+        .expect("cancel should succeed");
+    assert!(
+        session.active_automation_job.is_some(),
+        "cancelling the programmed jump keeps the cue armed"
+    );
+}
+
+#[test]
+fn setting_song_tempo_turns_warp_on_and_scales_every_marker_inside() {
+    let mut song = demo_song();
+    song.tempo_markers = vec![TempoMarker {
+        id: "tempo_inside".into(),
+        start_seconds: 6.0,
+        bpm: 130.0,
+        ramp: false,
+    }];
+    let mut session = session_with_song_dir("region-tempo-scales-markers", song);
+    let audio = crate::audio::engine::AudioController::default();
+
+    session
+        .set_song_region_tempo("region_1", 132.0, &audio)
+        .expect("song tempo should change");
+
+    let song = session.engine.song().expect("song should be loaded");
+    let region = &song.regions[0];
+    assert!(region.warp_enabled, "changing the tempo turns warp on");
+    assert_eq!(region.warp_source_bpm, Some(120.0));
+    assert!((song.bpm - 132.0).abs() < 1e-9);
+    // Same factor (×1,1) for the marker inside: the whole song speeds up.
+    assert!((song.tempo_markers[0].bpm - 143.0).abs() < 1e-9);
+    validate_song(song).expect("song should validate");
+}
+
+#[test]
+fn changing_a_tempo_marker_of_a_slowed_song_at_its_view_position_edits_it() {
+    // Field report: changing the bpm added a second marker a few seconds
+    // before the real one. The UI sent the marker's source position, and this
+    // command takes view seconds and converts them again.
+    let mut song = demo_song();
+    song.tempo_markers = vec![TempoMarker {
+        id: "tempo_inside".into(),
+        start_seconds: 6.0,
+        bpm: 130.0,
+        ramp: false,
+    }];
+    let mut session = session_with_song_dir("tempo-marker-edit-slowed-song", song);
+    let audio = crate::audio::engine::AudioController::default();
+    session
+        .set_song_region_tempo("region_1", 108.0, &audio)
+        .expect("song tempo should change");
+    let view_start = session
+        .song_view()
+        .expect("song view should build")
+        .expect("song summary should exist")
+        .tempo_markers[0]
+        .start_seconds;
+    assert!(view_start > 6.1, "a slowed song moves the marker later in view");
+
+    session
+        .upsert_song_tempo_marker(view_start, 100.0, &audio)
+        .expect("tempo marker should update");
+
+    let song = session.engine.song().expect("song should be loaded");
+    assert_eq!(song.tempo_markers.len(), 1);
+    assert_eq!(song.tempo_markers[0].id, "tempo_inside");
+    assert!((song.tempo_markers[0].start_seconds - 6.0).abs() < 1e-6);
+    assert_eq!(song.tempo_markers[0].bpm, 100.0);
+}
+
+#[test]
+fn setting_one_song_tempo_leaves_the_neighbours_alone_and_original_undoes_it() {
+    let mut session = session_with_song_dir(
+        "region-tempo-neighbours",
+        demo_song_with_region_changes_and_sections(),
+    );
+    let audio = crate::audio::engine::AudioController::default();
+
+    session
+        .set_song_region_tempo("region_2", 150.0, &audio)
+        .expect("song tempo should change");
+    {
+        let song = session.engine.song().expect("song should be loaded");
+        let bpm_at = |region_id: &str| {
+            let region = song.regions.iter().find(|r| r.id == region_id).unwrap();
+            libretracks_core::effective_bpm_at(song, region.start_seconds)
+        };
+        assert!((bpm_at("region_1") - 120.0).abs() < 1e-9);
+        assert!((bpm_at("region_2") - 150.0).abs() < 1e-9);
+        // The following song used to inherit 120 BPM: it keeps it.
+        assert!((bpm_at("region_3") - 120.0).abs() < 1e-9);
+        let regions = &song.regions;
+        assert!(!regions[0].warp_enabled && !regions[2].warp_enabled);
+        assert_eq!(regions[1].warp_source_bpm, Some(120.0));
+        validate_song(song).expect("song should validate");
+    }
+
+    session
+        .set_song_region_tempo("region_2", 120.0, &audio)
+        .expect("original tempo should apply");
+    let song = session.engine.song().expect("song should be loaded");
+    let region = song.regions.iter().find(|r| r.id == "region_2").unwrap();
+    assert!(
+        (libretracks_core::warp::region_warp_ratio_in_song(region, song) - 1.0).abs() < 1e-9,
+        "back to the original tempo the ratio is exactly 1"
+    );
+}
+
+#[test]
+fn setting_song_tempo_out_of_range_changes_nothing() {
+    let mut song = demo_song();
+    song.tempo_markers = vec![TempoMarker {
+        id: "tempo_inside".into(),
+        start_seconds: 6.0,
+        bpm: 250.0,
+        ramp: false,
+    }];
+    let mut session = session_with_song_dir("region-tempo-out-of-range", song);
+    let audio = crate::audio::engine::AudioController::default();
+
+    // ×2 would push the inner 250 BPM marker to 500.
+    assert!(session.set_song_region_tempo("region_1", 240.0, &audio).is_err());
+    let song = session.engine.song().expect("song should be loaded");
+    assert!(!song.regions[0].warp_enabled);
+    assert_eq!(song.bpm, 120.0);
+}
+
+// ── Cambios de nota ────────────────────────────────────────────────────────
+
+fn key_change(start_seconds: f64, key: &str) -> super::KeyChangeInput {
+    super::KeyChangeInput {
+        id: None,
+        start_seconds,
+        key: key.into(),
+    }
+}
+
+fn region_keys(session: &mut DesktopSession, region_id: &str) -> (Option<String>, Vec<(f64, String)>) {
+    let view = session
+        .song_view()
+        .expect("song view should build")
+        .expect("song summary should exist");
+    let region = view
+        .regions
+        .iter()
+        .find(|region| region.id == region_id)
+        .expect("region");
+    (
+        region.key.clone(),
+        region
+            .key_changes
+            .iter()
+            .map(|change| (change.start_seconds, change.key.clone()))
+            .collect(),
+    )
+}
+
+#[test]
+fn key_changes_are_stored_relative_to_the_song_and_shown_on_the_timeline() {
+    let mut session = session_with_song_dir("key-changes", demo_song_with_region_changes_and_sections());
+    let audio = crate::audio::engine::AudioController::default();
+    session
+        .update_song_region_key("region_2", Some("D".into()), &audio)
+        .expect("key");
+    session
+        .set_song_region_key_changes(
+            "region_2",
+            vec![
+                key_change(12.0, "F#"),
+                key_change(10.0, "E"),
+                // Fuera de la canción y repitiendo la nota: se descartan.
+                key_change(15.0, "G"),
+                key_change(11.0, "E"),
+            ],
+            &audio,
+        )
+        .expect("key changes");
+
+    assert_eq!(
+        region_keys(&mut session, "region_2"),
+        (Some("D".into()), vec![(10.0, "E".into()), (12.0, "F#".into())])
+    );
+    let song = session.engine.song().expect("song");
+    let region = song.regions.iter().find(|r| r.id == "region_2").unwrap();
+    assert_eq!(region.key_changes[0].offset_seconds, 2.0);
+    assert_eq!(region.key_at(13.0), Some("F#"));
+
+    session.undo_action(&audio).expect("undo");
+    assert_eq!(region_keys(&mut session, "region_2"), (Some("D".into()), vec![]));
+}
+
+#[test]
+fn splitting_a_song_shares_out_its_key_changes() {
+    let mut session = session_with_song_dir("key-split", demo_song_with_region_changes_and_sections());
+    let audio = crate::audio::engine::AudioController::default();
+    session
+        .update_song_region_key("region_1", Some("D".into()), &audio)
+        .expect("key");
+    session
+        .set_song_region_key_changes(
+            "region_1",
+            vec![key_change(2.0, "E"), key_change(6.0, "F")],
+            &audio,
+        )
+        .expect("key changes");
+    session
+        .split_song_region("region_1", 4.0, &audio)
+        .expect("split");
+
+    assert_eq!(
+        region_keys(&mut session, "region_1"),
+        (Some("D".into()), vec![(2.0, "E".into())])
+    );
+    let view = session.song_view().unwrap().unwrap();
+    let right = view
+        .regions
+        .iter()
+        .find(|r| (r.start_seconds - 4.0).abs() < 1e-4)
+        .expect("right half");
+    assert_eq!(right.key.as_deref(), Some("E"));
+    assert_eq!(right.key_changes.len(), 1);
+    assert_eq!(right.key_changes[0].start_seconds, 6.0);
+    assert_eq!(right.key_changes[0].key, "F");
+}
+
+#[test]
+fn resizing_a_song_keeps_its_key_changes_where_they_sound() {
+    let mut session = session_with_song_dir("key-resize", demo_song_with_region_changes_and_sections());
+    let audio = crate::audio::engine::AudioController::default();
+    session
+        .update_song_region_key("region_3", Some("D".into()), &audio)
+        .expect("key");
+    session
+        .set_song_region_key_changes("region_3", vec![key_change(16.0, "E")], &audio)
+        .expect("key changes");
+    session
+        .update_song_region("region_3", "Outro", 15.0, 18.0, &audio)
+        .expect("resize");
+
+    assert_eq!(
+        region_keys(&mut session, "region_3"),
+        (Some("D".into()), vec![(16.0, "E".into())])
+    );
+    let song = session.engine.song().expect("song");
+    let region = song.regions.iter().find(|r| r.id == "region_3").unwrap();
+    assert_eq!(region.key_changes[0].offset_seconds, 1.0);
 }

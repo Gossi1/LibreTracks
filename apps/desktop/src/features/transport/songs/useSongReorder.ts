@@ -25,10 +25,12 @@ import {
  *
  * Dos formas de agarrar una canción:
  *
- * - **El asa** (`handleProps`): arrastra al instante con ratón, dedo o lápiz.
- *   Lleva `touch-action: none` en CSS, que es lo que permite arrastrar con el
- *   dedo sin que el navegador se quede el gesto para hacer scroll. Con el
- *   teclado, las flechas la mueven un puesto.
+ * - **El asa** (`handleProps`): arrastra al instante, con ratón, lápiz o
+ *   dedo. Lleva `touch-action: none` en CSS, que es lo que permite arrastrar
+ *   con el dedo sin que el navegador se quede el gesto para hacer scroll. Con
+ *   el teclado, las flechas la mueven un puesto. (Hubo una época en que con el
+ *   dedo había que mantenerla: la lista de la live iba abajo y en el iPhone
+ *   chocaba con el gesto de cambiar de app. Las listas están ya arriba.)
  * - **La superficie** (`surfaceProps`): la cabecera o el botón de la canción,
  *   sólo con ratón y a partir de unos píxeles, para que un clic siga siendo un
  *   clic. Con el dedo no: ahí el gesto ya es scroll y la pulsación larga ya es
@@ -275,7 +277,7 @@ export function useSongReorder({
     (
       event: ReactPointerEvent<HTMLElement>,
       id: string,
-      immediate: boolean,
+      start: "immediate" | "threshold",
     ) => {
       if (!enabled || sessionRef.current) return;
       const fromIndex = latestRef.current.itemIds.indexOf(id);
@@ -346,7 +348,7 @@ export function useSongReorder({
         window.removeEventListener("keydown", onKey);
       };
 
-      if (immediate) activate();
+      if (start === "immediate") activate();
     },
     [autoScrollStep, enabled, finish, renderPreview, startPreview],
   );
@@ -358,7 +360,7 @@ export function useSongReorder({
         // Que no lo vea la cabecera (selección) ni el scroll del contenedor.
         event.stopPropagation();
         event.preventDefault();
-        begin(event, id, true);
+        begin(event, id, "immediate");
       },
       // El asa no es un botón de acción: un clic suelto no hace nada, y que
       // no llegue a la cabecera evita que además la seleccione.
@@ -392,7 +394,7 @@ export function useSongReorder({
         if (target?.closest?.(`input, select, textarea, [${SONG_REORDER_IGNORE_ATTRIBUTE}]`)) {
           return;
         }
-        begin(event, id, false);
+        begin(event, id, "threshold");
       },
     }),
     [begin],

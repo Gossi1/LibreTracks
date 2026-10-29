@@ -28,6 +28,8 @@ const TRACK_FADER_TICKS = faderTicks(TRACK_FADER_SCALE);
 
 import type { TrackSummary } from "../desktopApi";
 import { TrackMeter } from "../tracks/TrackMeter";
+import { trackRowSegments } from "../tracks/trackRowWindowing";
+import { useMixerStripWindow } from "./useMixerStripWindow";
 import { useTransportStore, type OptimisticMixState } from "../store";
 import { useTimelineUIStore } from "../uiStore";
 
@@ -250,12 +252,17 @@ function CompactMixerComponent({
     [collapsedFolders, filterActiveSong, activeSongTrackIds, tracks],
   );
 
-  return (
-    <div
-      className={`lt-compact-mixer ${trackReorderMode ? "is-track-reorder-mode" : ""}`}
-    >
-      <div className="lt-compact-mixer-strips">
-        {visibleTracks.map((track) => (
+  // A big session mounts only the strips near the visible band. See
+  // ./useMixerStripWindow.
+  const stripsRef = useRef<HTMLDivElement | null>(null);
+  const stripIds = useMemo(() => visibleTracks.map((track) => track.id), [visibleTracks]);
+  const { rowWindow, layout, geometry } = useMixerStripWindow(stripsRef, stripIds);
+  const segments =
+    rowWindow.isWindowed && layout && geometry
+      ? trackRowSegments(layout, rowWindow)
+      : null;
+
+  const renderStrip = (track: TrackSummary) => (
           <CompactMixerStrip
             key={track.id}
             track={track}
@@ -270,13 +277,46 @@ function CompactMixerComponent({
             hiddenChildCount={hiddenCountByFolderId.get(track.id) ?? 0}
             onToggleFolder={onToggleFolder}
           />
-        ))}
+  );
+
+  return (
+    <div
+      className={`lt-compact-mixer ${trackReorderMode ? "is-track-reorder-mode" : ""}`}
+    >
+      <div className="lt-compact-mixer-strips" ref={stripsRef}>
+        {segments && geometry
+          ? segments.map((segment) =>
+              segment.kind === "row" ? (
+                renderStrip(visibleTracks[segment.index])
+              ) : (
+                <CompactMixerSpacer
+                  key={segment.key}
+                  strips={Math.round(segment.height / geometry.pitch)}
+                  pitch={geometry.pitch}
+                  gap={geometry.gap}
+                />
+              ),
+            )
+          : visibleTracks.map(renderStrip)}
       </div>
     </div>
   );
 }
 
 export const CompactMixer = memo(CompactMixerComponent);
+
+/** Stands in for `strips` unmounted strips. The flex gap also wraps the
+ * spacer, so k strips are k pitches minus one gap. */
+function CompactMixerSpacer({ strips, pitch, gap }: { strips: number; pitch: number; gap: number }) {
+  const width = Math.max(0, strips * pitch - gap);
+  return (
+    <div
+      className="lt-compact-mixer-spacer"
+      aria-hidden="true"
+      style={{ flexBasis: width, width }}
+    />
+  );
+}
 
 type CompactMixerProps_DragSelection = {
   /** Track ids the user has selected. Mirrors the project-wide
@@ -663,8 +703,8 @@ function CompactMixerStripComponent({
           90° (writing-mode + appearance:slider-vertical) all force
           trade-offs: either the thumb travels horizontally, or
           appearance:slider-vertical wins but discards our custom
-          thumb colour. The custom path lets us reuse the exact same
-          teal-on-black look the DAW track-volume slider uses, and
+          thumb styling. The custom path lets us draw the same console
+          fader cap the horizontal faders use (shared/faders.css), and
           travel bottom→top reliably. The meter is a div whose height
           tracks the same `meters[trackId]` dictionary the DAW track
           headers already populate. */}
@@ -714,18 +754,12 @@ function CompactMixerStripComponent({
         <div className="lt-compact-mixer-pan-track">
           <input
             type="range"
-            className="lt-compact-mixer-pan"
+            className="lt-compact-mixer-pan lt-fader is-pan"
             min={-1}
             max={1}
             step={0.01}
             value={pan}
             aria-label={`Pan ${track.name}`}
-            // Two-tone azul→negro gradient — identical to the DAW
-            // track-pan slider (TrackHeaderItem.tsx). `panFill` maps
-            // pan ∈ [-1,1] to a 0..100% position on the horizontal axis.
-            style={{
-              background: `linear-gradient(to right, #4d79d8 0%, #74b8ff ${(((pan + 1) * 0.5) * 100).toFixed(2)}%, #0e0e0e ${(((pan + 1) * 0.5) * 100).toFixed(2)}%, #0e0e0e 100%)`,
-            }}
             onChange={handlePanInput}
             onDoubleClick={handlePanDoubleClick}
             onPointerDown={() => setIsPanDragging(true)}
@@ -768,12 +802,31 @@ function CompactMixerStripComponent({
   );
 }
 
-const CompactMixerStrip = memo(CompactMixerStripComponent);
+// `parentInfo` se construye de nuevo en cada render del mezclador; se compara
+// por contenido para que una tira dentro de una carpeta no repinte cada vez que
+// cambia otra pista. El resto de props, por referencia como `memo` a secas.
+function areCompactMixerStripPropsEqual(
+  previous: CompactMixerStripProps,
+  next: CompactMixerStripProps,
+): boolean {
+  for (const key of Object.keys(next) as Array<keyof CompactMixerStripProps>) {
+    if (key === "parentInfo") continue;
+    if (previous[key] !== next[key]) return false;
+  }
+  const a = previous.parentInfo;
+  const b = next.parentInfo;
+  return a === b || (a !== null && b !== null && a.color === b.color && a.name === b.name);
+}
+
+const CompactMixerStrip = memo(
+  CompactMixerStripComponent,
+  areCompactMixerStripPropsEqual,
+);
 
 /**
  * Vertical fader rendered as a custom <div> + pointer events so we can
- * keep the DAW-style colours (teal fill below the thumb on a #0e0e0e
- * track + saturated teal thumb) while travelling bottom→top reliably.
+ * draw the console-style cap and groove (shared/faders.css) while
+ * travelling bottom→top reliably.
  * The native <input type=range> route requires either appearance:
  * slider-vertical (which discards custom thumb colouring) or a CSS
  * writing-mode rotation (which in this build mis-rotated the slider
@@ -933,11 +986,6 @@ function CompactVerticalFaderComponent({
       aria-valuemax={1}
       aria-valuenow={value}
       aria-orientation="vertical"
-      // Teal fill below the thumb, black above — same gradient pattern
-      // the DAW track-volume slider uses.
-      style={{
-        background: `linear-gradient(to top, #3cddc7 ${fillPct}%, #0e0e0e ${fillPct}%)`,
-      }}
       onPointerDown={handlePointerDown}
       onPointerMove={handlePointerMove}
       onPointerUp={finishDrag}

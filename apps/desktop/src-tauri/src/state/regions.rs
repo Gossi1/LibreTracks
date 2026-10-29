@@ -4,24 +4,74 @@
 //! loaded `Song` and persists it; the pure geometry lives in `timeline_math`.
 
 use libretracks_core::{
-    source_seconds_at_view, Marker, MarkerCategory, MarkerKind, SongRegion, TempoMarker,
-    TimeSignatureMarker, MAX_COMPACT_COLUMN_WIDTH_REM, MAX_TRANSPOSE_SEMITONES,
+    effective_bpm_at, source_seconds_at_view, KeyChange, KeyMap, Marker, MarkerCategory,
+    MarkerKind, Song, SongRegion,
+    TempoMarker, TimeSignatureMarker, MAX_COMPACT_COLUMN_WIDTH_REM, MAX_TRANSPOSE_SEMITONES,
     MIN_COMPACT_COLUMN_WIDTH_REM, MIN_TRANSPOSE_SEMITONES,
 };
+
+use serde::Deserialize;
 
 use crate::audio::engine::{jump_debug_logging_enabled, AudioController};
 use crate::infra::error::DesktopError;
 use crate::models::TransportSnapshot;
 
+use super::song_templates::apply_song_template;
 use super::{
     bar_seconds_at, default_region_name, next_downbeat_after_in_song,
     prune_auto_created_empty_tracks, realign_regions_after_warp_tempo_change,
-    refresh_song_duration, replace_song_region_range, sanitize_region_bounds,
+    refresh_song_duration, replace_song_region_range, sanitize_region_bounds, scale_region_tempo,
     set_song_tempo_at_source_position, shift_song_suffix, snap_regions_after_to_downbeats,
     song_has_active_warp, sort_song_regions, split_clips_crossing_point, timestamp_suffix,
     ui_locale, validate_time_signature, AudioChangeImpact, DesktopSession, TransposeHistoryTarget,
     UpdatePhase,
 };
+
+/// Sustituye los cambios de nota de la región por `changes` (segundos de vista
+/// del timeline de `song`), normalizados a la nota inicial que ya tiene.
+pub(super) fn set_region_key_changes(
+    song: &mut Song,
+    region_id: &str,
+    changes: Vec<KeyChangeInput>,
+) -> Result<(), DesktopError> {
+    let start = song
+        .regions
+        .iter()
+        .find(|region| region.id == region_id)
+        .map(|region| region.start_seconds)
+        .ok_or_else(|| DesktopError::RegionNotFound(region_id.to_string()))?;
+    let changes: Vec<KeyChange> = changes
+        .into_iter()
+        .enumerate()
+        .map(|(index, change)| KeyChange {
+            id: change
+                .id
+                .filter(|id| !id.trim().is_empty())
+                .unwrap_or_else(|| format!("key_change_{}_{index}", timestamp_suffix())),
+            // View-time → source-time conversion, see create_section_marker.
+            offset_seconds: source_seconds_at_view(song, change.start_seconds) - start,
+            key: change.key.trim().to_string(),
+        })
+        .collect();
+    if let Some(region) = song.regions.iter_mut().find(|region| region.id == region_id) {
+        region.set_key_map(KeyMap {
+            key: region.key.clone(),
+            changes,
+        });
+    }
+    Ok(())
+}
+
+/// Un cambio de nota tal como lo manda la UI: posición en segundos de vista
+/// del timeline; sin `id` es uno nuevo.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyChangeInput {
+    #[serde(default)]
+    pub id: Option<String>,
+    pub start_seconds: f64,
+    pub key: String,
+}
 
 impl DesktopSession {
     pub fn create_section_marker(
@@ -30,6 +80,21 @@ impl DesktopSession {
         kind: Option<MarkerKind>,
         variant: Option<u8>,
         name: Option<String>,
+        audio: &AudioController,
+    ) -> Result<TransportSnapshot, DesktopError> {
+        self.create_section_marker_in_lane(start_seconds, kind, variant, name, None, audio)
+    }
+
+    /// `create_section_marker` with the lane chosen: `Some(Cue)` puts a
+    /// section kind in the cue lane, for when the spot already has a section
+    /// (two sections cannot share it; the UI offers the cue lane instead).
+    pub fn create_section_marker_in_lane(
+        &mut self,
+        start_seconds: f64,
+        kind: Option<MarkerKind>,
+        variant: Option<u8>,
+        name: Option<String>,
+        category_override: Option<MarkerCategory>,
         audio: &AudioController,
     ) -> Result<TransportSnapshot, DesktopError> {
         let mut song = self
@@ -59,9 +124,9 @@ impl DesktopSession {
             kind,
             variant,
             color: None,
-            // New markers start in the lane their kind implies; the user can
-            // drag them to the other row afterwards.
-            category_override: None,
+            // New markers start in the lane their kind implies (unless the
+            // caller chose one); the user can drag them to the other row.
+            category_override: category_override.filter(|lane| *lane != kind.category()),
         });
         song.section_markers.sort_by(|left, right| {
             left.start_seconds
@@ -177,6 +242,7 @@ impl DesktopSession {
         let region_index = song.regions.len();
         let region_name = default_region_name(ui_locale(audio).as_deref(), region_index);
         let region = SongRegion {
+            key_changes: Vec::new(),
             id: format!("region_{}_{}", timestamp_suffix(), region_index),
             name: region_name,
             start_seconds,
@@ -187,10 +253,18 @@ impl DesktopSession {
             warp_source_bpm: None,
             master: libretracks_core::SongMaster::default(),
             compact_column_width_rem: None,
+            chart: None,
+            voice_guide_count_style: None,
             structure: None,
         };
 
+        let region_id = region.id.clone();
+        let previous_regions = song.regions.clone();
         replace_song_region_range(&mut song, region);
+        // Before the template: the songs this one swallowed may have brought
+        // their own tracks, and those are now this song's.
+        super::song_templates::reassign_tracks_of_replaced_songs(&mut song, &previous_regions);
+        let laid_out = apply_song_template(&mut song, &region_id, None, audio)?;
         // The song must envelop every region or the engine's validator refuses
         // to load the session with "Region X is outside its song". Drawing a
         // region past the last clip left `duration_seconds` behind, so the
@@ -199,7 +273,12 @@ impl DesktopSession {
         // region path already does this; this one was the exception.
         refresh_song_duration(&mut song);
         audio.update_live_song_regions(&song)?;
-        self.persist_song_update(song, audio, AudioChangeImpact::TransportOnly, true)?;
+        let impact = if laid_out {
+            AudioChangeImpact::StructureRebuild
+        } else {
+            AudioChangeImpact::TransportOnly
+        };
+        self.persist_song_update(song, audio, impact, true)?;
 
         Ok(self.snapshot())
     }
@@ -213,9 +292,14 @@ impl DesktopSession {
     /// Only used by the compact view's "+ Nueva canción" button. In the
     /// DAW view, regions are still created implicitly when clips drop onto
     /// empty timeline.
+    ///
+    /// The song is laid out from `template` (a template reference, see
+    /// `song_templates`) or, without one, from the default template in
+    /// Settings; with neither it comes out empty as it always did.
     pub fn create_empty_song(
         &mut self,
         name: Option<&str>,
+        template: Option<&str>,
         audio: &AudioController,
     ) -> Result<TransportSnapshot, DesktopError> {
         let mut song = self
@@ -257,6 +341,7 @@ impl DesktopSession {
             .unwrap_or_else(|| default_region_name(ui_locale(audio).as_deref(), region_index));
 
         let region = SongRegion {
+            key_changes: Vec::new(),
             id: format!("region_{}_{}", timestamp_suffix(), region_index),
             name: region_name,
             start_seconds,
@@ -267,11 +352,15 @@ impl DesktopSession {
             warp_source_bpm: None,
             master: libretracks_core::SongMaster::default(),
             compact_column_width_rem: None,
+            chart: None,
+            voice_guide_count_style: None,
             structure: None,
         };
 
+        let region_id = region.id.clone();
         song.regions.push(region);
         sort_song_regions(&mut song.regions);
+        let laid_out = apply_song_template(&mut song, &region_id, template, audio)?;
 
         // Anchor the new song to the project's global bpm so it doesn't
         // inherit the previous song's tempo marker. Without this any tempo
@@ -290,6 +379,7 @@ impl DesktopSession {
                 id: format!("tempo_marker_{}", timestamp_suffix()),
                 start_seconds,
                 bpm: song.bpm,
+                ramp: false,
             });
             song.tempo_markers.sort_by(|left, right| {
                 left.start_seconds
@@ -299,7 +389,12 @@ impl DesktopSession {
         }
 
         audio.update_live_song_regions(&song)?;
-        self.persist_song_update(song, audio, AudioChangeImpact::TransportOnly, true)?;
+        let impact = if laid_out {
+            AudioChangeImpact::StructureRebuild
+        } else {
+            AudioChangeImpact::TransportOnly
+        };
+        self.persist_song_update(song, audio, impact, true)?;
 
         Ok(self.snapshot())
     }
@@ -335,7 +430,7 @@ impl DesktopSession {
         let end_seconds = source_seconds_at_view(&song, end_seconds);
         let (start_seconds, end_seconds) =
             sanitize_region_bounds(&song, start_seconds, end_seconds)?;
-        let updated_region = SongRegion {
+        let mut updated_region = SongRegion {
             id: existing_region.id.clone(),
             name: trimmed_name.to_string(),
             start_seconds,
@@ -347,7 +442,13 @@ impl DesktopSession {
             master: existing_region.master.clone(),
             compact_column_width_rem: existing_region.compact_column_width_rem,
             structure: existing_region.structure.clone(),
+            chart: existing_region.chart.clone(),
+            voice_guide_count_style: existing_region.voice_guide_count_style,
+            key_changes: existing_region.key_changes.clone(),
         };
+        // Los cambios de nota son relativos al inicio: al redimensionar se
+        // quedan donde suenan, como el resto del contenido.
+        updated_region.rebase_key_changes(existing_region.start_seconds);
 
         // Resizing a region NEVER moves its contents — the region is
         // just the named span that contains the clips and markers, not
@@ -398,6 +499,12 @@ impl DesktopSession {
         // tail (reproduced as: "drag the end handle inward → a phantom
         // duplicate region appears with the trimmed name and the cut-off
         // span").
+        super::song_templates::rename_song_folder(
+            &mut song,
+            &existing_region.id,
+            &existing_region.name,
+            &updated_region.name,
+        );
         song.regions
             .retain(|region| region.id != existing_region.id);
         replace_song_region_range(&mut song, updated_region);
@@ -592,6 +699,10 @@ impl DesktopSession {
             master: existing_region.master.clone(),
             compact_column_width_rem: existing_region.compact_column_width_rem,
             structure: existing_region.structure.clone(),
+            chart: existing_region.chart.clone(),
+            voice_guide_count_style: existing_region.voice_guide_count_style,
+            // Relativos al inicio: viajan con la canción sin tocarlos.
+            key_changes: existing_region.key_changes.clone(),
         };
 
         // Same rebuild flow as update_song_region: drop the old copy
@@ -727,6 +838,77 @@ impl DesktopSession {
             audio,
             AudioChangeImpact::TimelineWindow,
             false,
+            true,
+            UpdatePhase::Commit,
+        )?;
+
+        Ok(self.snapshot())
+    }
+
+    /// Acelera o frena una canción entera: la pone a `bpm` en su arranque sin
+    /// cambiar el tono. Si el warp estaba apagado lo enciende en el mismo paso,
+    /// con el tempo actual como BPM original (el audio suena hoy a ese tempo),
+    /// así un solo cambio = un solo deshacer. Las marcas de tempo de dentro se
+    /// escalan juntas (`scale_region_tempo`).
+    pub fn set_song_region_tempo(
+        &mut self,
+        region_id: &str,
+        bpm: f64,
+        audio: &AudioController,
+    ) -> Result<TransportSnapshot, DesktopError> {
+        if !bpm.is_finite() || bpm < 20.0 || bpm > 300.0 {
+            return Err(DesktopError::AudioCommand(
+                "song bpm must be between 20.0 and 300.0".into(),
+            ));
+        }
+
+        let mut song = self
+            .engine
+            .song()
+            .cloned()
+            .ok_or(DesktopError::NoSongLoaded)?;
+        let previous_song = song.clone();
+        let region = song
+            .regions
+            .iter()
+            .find(|region| region.id == region_id)
+            .ok_or_else(|| DesktopError::RegionNotFound(region_id.to_string()))?;
+        let current_bpm = effective_bpm_at(&song, region.start_seconds);
+        if !region.warp_enabled && (bpm - current_bpm).abs() < 1e-6 {
+            return Ok(self.snapshot());
+        }
+        let source_bpm = if region.warp_enabled {
+            region.warp_source_bpm.unwrap_or(current_bpm)
+        } else {
+            current_bpm
+        };
+        if !(libretracks_core::MIN_WARP_SOURCE_BPM..=libretracks_core::MAX_WARP_SOURCE_BPM)
+            .contains(&source_bpm)
+        {
+            return Err(DesktopError::AudioCommand(format!(
+                "warp source bpm must be between {} and {}",
+                libretracks_core::MIN_WARP_SOURCE_BPM,
+                libretracks_core::MAX_WARP_SOURCE_BPM
+            )));
+        }
+
+        scale_region_tempo(&mut song, region_id, bpm)?;
+        if let Some(region) = song
+            .regions
+            .iter_mut()
+            .find(|region| region.id == region_id)
+        {
+            region.warp_enabled = true;
+            region.warp_source_bpm = Some(source_bpm);
+        }
+        realign_regions_after_warp_tempo_change(&previous_song, &mut song);
+
+        audio.update_live_region_warp(region_id, true, Some(source_bpm))?;
+        // Realinear traslada las canciones siguientes: sus cues van con ellas.
+        self.persist_song_update_carrying_cues(
+            song,
+            audio,
+            AudioChangeImpact::TimelineWindow,
             true,
             UpdatePhase::Commit,
         )?;
@@ -966,6 +1148,112 @@ impl DesktopSession {
         Ok(self.snapshot())
     }
 
+    /// Set several song masters at once ("Nivelar canciones"): one edit, so a
+    /// single undo puts every song back. Validated up front, all or nothing.
+    pub fn update_song_region_master_gains(
+        &mut self,
+        gains: &[(String, f64)],
+        audio: &AudioController,
+    ) -> Result<TransportSnapshot, DesktopError> {
+        if gains
+            .iter()
+            .any(|(_, gain)| !gain.is_finite() || *gain < 0.0)
+        {
+            return Err(DesktopError::AudioCommand(
+                "master gain must be a finite, non-negative number".into(),
+            ));
+        }
+
+        let mut song = self
+            .engine
+            .song()
+            .cloned()
+            .ok_or(DesktopError::NoSongLoaded)?;
+        for (region_id, gain) in gains {
+            let region = song
+                .regions
+                .iter_mut()
+                .find(|region| &region.id == region_id)
+                .ok_or_else(|| DesktopError::RegionNotFound(region_id.clone()))?;
+            region.master.gain = *gain;
+        }
+
+        for (region_id, gain) in gains {
+            audio.update_live_region_master_gain(region_id, *gain as f32)?;
+        }
+        self.persist_song_update(song, audio, AudioChangeImpact::MixerOnly, true)?;
+
+        Ok(self.snapshot())
+    }
+
+    /// Song fade in / fade out (they live in the song master, next to its
+    /// gain). Each is capped at the song's length. An edit like any other:
+    /// undo, autosave, `project_revision`.
+    pub fn update_song_region_fades(
+        &mut self,
+        region_id: &str,
+        fade_in_seconds: f64,
+        fade_out_seconds: f64,
+        audio: &AudioController,
+    ) -> Result<TransportSnapshot, DesktopError> {
+        for value in [fade_in_seconds, fade_out_seconds] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(DesktopError::AudioCommand(
+                    "song fades must be finite, non-negative numbers".into(),
+                ));
+            }
+        }
+
+        let mut song = self
+            .engine
+            .song()
+            .cloned()
+            .ok_or(DesktopError::NoSongLoaded)?;
+        let region = song
+            .regions
+            .iter_mut()
+            .find(|region| region.id == region_id)
+            .ok_or_else(|| DesktopError::RegionNotFound(region_id.to_string()))?;
+        let length = (region.end_seconds - region.start_seconds).max(0.0);
+        region.master.fade_in_seconds = fade_in_seconds.min(length);
+        region.master.fade_out_seconds = fade_out_seconds.min(length);
+
+        audio.update_live_song_regions(&song)?;
+        self.persist_song_update(song, audio, AudioChangeImpact::MixerOnly, true)?;
+
+        Ok(self.snapshot())
+    }
+
+    /// How the voice guide counts into this song's sections; `None` = follow
+    /// the global setting. An edit like any other: undo, autosave,
+    /// `project_revision`. Pushed to the engine with the rest of the regions.
+    pub fn update_song_region_voice_guide_count_style(
+        &mut self,
+        region_id: &str,
+        count_style: Option<libretracks_core::VoiceGuideCountStyle>,
+        audio: &AudioController,
+    ) -> Result<TransportSnapshot, DesktopError> {
+        let mut song = self
+            .engine
+            .song()
+            .cloned()
+            .ok_or(DesktopError::NoSongLoaded)?;
+        let region = song
+            .regions
+            .iter_mut()
+            .find(|region| region.id == region_id)
+            .ok_or_else(|| DesktopError::RegionNotFound(region_id.to_string()))?;
+        if region.voice_guide_count_style == count_style {
+            return Ok(self.snapshot());
+        }
+        region.voice_guide_count_style = count_style;
+
+        audio.update_live_song_regions(&song)?;
+        self.persist_song_update(song, audio, AudioChangeImpact::MixerOnly, true)?;
+
+        Ok(self.snapshot())
+    }
+
     pub fn update_track_transpose_enabled(
         &mut self,
         track_id: &str,
@@ -1061,6 +1349,9 @@ impl DesktopSession {
         // deleted region keeps the mixer view tidy without an extra round
         // trip — same prune we already apply on clip move / delete paths.
         prune_auto_created_empty_tracks(&mut song);
+        // In the per-song layouts the song's own tracks (and its folder) go
+        // with it once they hold nothing; shared tracks are never touched.
+        super::song_templates::remove_empty_song_tracks(&mut song, region_id);
         refresh_song_duration(&mut song);
 
         audio.update_live_song_regions(&song)?;
@@ -1110,15 +1401,17 @@ impl DesktopSession {
         // A clip may not cross a region boundary (the engine rejects it). Any
         // clip straddling the cut is split there too, so each half stays inside
         // its song — exactly what split_clips does at the cursor.
-        split_clips_crossing_point(&mut song, split_seconds_view);
+        split_clips_crossing_point(&mut song, split_seconds);
 
+        let right_keys = region.key_map_between(split_seconds, region.end_seconds);
         let right = SongRegion {
             id: format!("region_{}_{}", timestamp_suffix(), song.regions.len()),
             name: format!("{} (2)", region.name),
             start_seconds: split_seconds,
             end_seconds: region.end_seconds,
             transpose_semitones: region.transpose_semitones,
-            key: region.key.clone(),
+            key: right_keys.key,
+            key_changes: right_keys.changes,
             warp_enabled: region.warp_enabled,
             warp_source_bpm: region.warp_source_bpm,
             master: region.master.clone(),
@@ -1126,6 +1419,8 @@ impl DesktopSession {
             // the song they cut — the new column showing up at a different
             // width than the one it came from would read as a glitch.
             compact_column_width_rem: region.compact_column_width_rem,
+            chart: region.chart.clone(),
+            voice_guide_count_style: region.voice_guide_count_style,
             // El original capturado describe la canción entera: ninguna de
             // las dos mitades lo hereda.
             structure: None,
@@ -1133,6 +1428,7 @@ impl DesktopSession {
         // Left half: shrink the original region's end to the cut.
         song.regions[region_index].end_seconds = split_seconds;
         song.regions[region_index].structure = None;
+        song.regions[region_index].rebase_key_changes(region.start_seconds);
         song.regions.push(right);
         sort_song_regions(&mut song.regions);
 
@@ -1293,9 +1589,36 @@ impl DesktopSession {
             .iter_mut()
             .find(|region| region.id == region_id)
             .ok_or_else(|| DesktopError::RegionNotFound(region_id.to_string()))?;
-        region.key = key
+        let key = key
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
+        // Normalizar: un primer cambio a la nota nueva ya no cambia nada.
+        region.set_key_map(KeyMap {
+            key,
+            changes: region.key_changes.clone(),
+        });
+
+        self.persist_song_update(song, audio, AudioChangeImpact::TransportOnly, true)?;
+
+        Ok(self.snapshot())
+    }
+
+    /// Sustituye los cambios de nota de la canción (la nota inicial no se
+    /// toca). Posiciones en segundos de vista del timeline; un cambio sin id
+    /// es nuevo. Los que caen fuera de la canción o repiten la nota que ya
+    /// regía se descartan. Un solo paso de deshacer.
+    pub fn set_song_region_key_changes(
+        &mut self,
+        region_id: &str,
+        changes: Vec<KeyChangeInput>,
+        audio: &AudioController,
+    ) -> Result<TransportSnapshot, DesktopError> {
+        let mut song = self
+            .engine
+            .song()
+            .cloned()
+            .ok_or(DesktopError::NoSongLoaded)?;
+        set_region_key_changes(&mut song, region_id, changes)?;
 
         self.persist_song_update(song, audio, AudioChangeImpact::TransportOnly, true)?;
 
@@ -1369,6 +1692,7 @@ impl DesktopSession {
                 id: format!("tempo_marker_{}", timestamp_suffix()),
                 start_seconds: clamped_start_seconds,
                 bpm,
+                ramp: false,
             });
             song.tempo_markers.sort_by(|left, right| {
                 left.start_seconds
@@ -1414,6 +1738,41 @@ impl DesktopSession {
             AudioChangeImpact::TransportOnly
         };
         // Realinear traslada las canciones siguientes: sus cues van con ellas.
+        self.persist_song_update_carrying_cues(song, audio, impact, true, UpdatePhase::Commit)?;
+
+        Ok(self.snapshot())
+    }
+
+    /// Turn a tempo marker's ramp on or off: with it the tempo glides from
+    /// this marker's bpm to the next tempo marker's (`TempoMarker::ramp`).
+    pub fn set_song_tempo_marker_ramp(
+        &mut self,
+        marker_id: &str,
+        ramp: bool,
+        audio: &AudioController,
+    ) -> Result<TransportSnapshot, DesktopError> {
+        let mut song = self
+            .engine
+            .song()
+            .cloned()
+            .ok_or(DesktopError::NoSongLoaded)?;
+        let previous_song = song.clone();
+        let marker = song
+            .tempo_markers
+            .iter_mut()
+            .find(|marker| marker.id == marker_id)
+            .ok_or_else(|| DesktopError::AudioCommand("tempo marker not found".into()))?;
+        if marker.ramp == ramp {
+            return Ok(self.snapshot());
+        }
+        marker.ramp = ramp;
+        realign_regions_after_warp_tempo_change(&previous_song, &mut song);
+
+        let impact = if song_has_active_warp(&song) {
+            AudioChangeImpact::TimelineWindow
+        } else {
+            AudioChangeImpact::TransportOnly
+        };
         self.persist_song_update_carrying_cues(song, audio, impact, true, UpdatePhase::Commit)?;
 
         Ok(self.snapshot())

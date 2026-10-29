@@ -74,9 +74,12 @@ async function viewport() {
   }));
 }
 
+/** Where shot() writes; the phone-layout step points it at the mobile set. */
+let shotDir = outDir;
+
 async function shot(name: string, crop?: Crop, drawn: Box[] = []) {
   await browser.pause(600);
-  const file = path.join(outDir, `${name}.png`);
+  const file = path.join(shotDir, `${name}.png`);
   const png = Buffer.from(await browser.takeScreenshot(), "base64");
   if (!crop) {
     await sharp(png).toFile(file);
@@ -167,6 +170,16 @@ async function ensureSession() {
   await AppPage.reopenSessionUntil(session, (s) => s.tracks.length >= 5, 180_000);
   await AppPage.resetShell();
   await browser.pause(5000);
+  await dismissVideoNotice();
+}
+
+/** «Ahora no» on the "this session has video" notice, if it is up. */
+async function dismissVideoNotice() {
+  await runInPage(() => {
+    const notice = document.querySelector(".lt-video-setup-notice");
+    const buttons = notice ? Array.from(notice.querySelectorAll("button")) : [];
+    (buttons[buttons.length - 1] as HTMLButtonElement | undefined)?.click();
+  });
 }
 
 /** Like tagByText, but the trimmed text must equal `text` ("Coro", not "Pre Coro"). */
@@ -228,12 +241,13 @@ async function rightClick(selector: string, at: { fx?: number; fy?: number } = {
 
 /**
  * Menu entries for features that exist in the build but are not announced
- * yet (song arrangements, 2026-10). Hidden from the guide captures until the
- * feature is public; remove an entry here when it ships.
+ * yet. Hidden from the guide captures until the feature is public; remove an
+ * entry here when it ships (song arrangements shipped in 1.14.0).
  */
-const UNANNOUNCED_MENU_ITEMS = [L("Arreglo")];
+const UNANNOUNCED_MENU_ITEMS: string[] = [];
 
 async function hideUnannouncedMenuItems() {
+  if (!UNANNOUNCED_MENU_ITEMS.length) return;
   await runInPage((labels: string[]) => {
     document.querySelectorAll<HTMLElement>(".lt-context-menu button").forEach((el) => {
       if (labels.includes((el.textContent ?? "").trim())) el.style.display = "none";
@@ -281,6 +295,49 @@ async function toolbarPanelShot(id: string, name: string) {
   await closeToolbarGroup(id);
 }
 
+/** Opens a topbar popover by its arrow and captures it, a screenful at a time. */
+async function popoverShots(splitId: string, name: string) {
+  // Voice guide and pads hide their settings while off: switch them on
+  // for the capture and back off afterwards.
+  const toggle = await $(`${tour(splitId)} > button:nth-of-type(1)`);
+  const wasOn = ((await toggle.getAttribute("class")) ?? "").includes("is-active");
+  if (!wasOn && splitId !== "topbar-metronome") {
+    await toggle.click();
+    await browser.pause(1200);
+  }
+  await (await $(`${tour(splitId)} > button:nth-of-type(2)`)).click();
+  await browser.pause(800);
+  const pages = await runInPage(() => {
+    const panel = document.querySelector(".lt-pads-popover") as HTMLElement | null;
+    if (!panel) return 0;
+    const scroller =
+      (Array.from(panel.querySelectorAll<HTMLElement>("*")).find((el) => el.scrollHeight > el.clientHeight + 8 &&
+        getComputedStyle(el).overflowY !== "visible") ?? panel);
+    scroller.setAttribute("data-guide", "pop-scroller");
+    scroller.scrollTop = 0;
+    const overflow = scroller.scrollHeight - scroller.clientHeight;
+    return overflow <= 8 ? 1 : Math.min(4, 1 + Math.ceil(overflow / (scroller.clientHeight - 60)));
+  });
+  if (!pages) throw new Error(`${name}: popover did not open`);
+  for (let page = 0; page < pages; page++) {
+    await runInPage((p: number) => {
+      const sc = document.querySelector('[data-guide="pop-scroller"]') as HTMLElement | null;
+      if (sc) sc.scrollTop = p * (sc.clientHeight - 60);
+    }, page);
+    await browser.pause(300);
+    await annotatedShot(`${name}${pages > 1 ? `-${page + 1}` : ""}`, [{ selector: ".lt-pads-popover", pad: 2 }], {
+      style: "spotlight",
+      crop: { marks: 24 },
+    });
+  }
+  await browser.keys(["Escape"]);
+  await browser.pause(400);
+  if (!wasOn && splitId !== "topbar-metronome") {
+    await toggle.click();
+    await browser.pause(600);
+  }
+}
+
 describe("user guide screenshots", function () {
   before(async function () {
     if (process.env.LT_GUIDESHOTS !== "1") {
@@ -295,7 +352,12 @@ describe("user guide screenshots", function () {
       restoreLocale = await useAppLocale("en");
       await AppPage.waitUntilBooted();
     }
-    await browser.setWindowSize(1940, 1140);
+    // As big as the screen allows, and never past it: with one 1080p monitor
+    // Windows did NOT clamp a 1940x1140 window, and every pointer action
+    // beyond the screen edge was lost (menus that never opened, drags that
+    // never landed).
+    const avail = await runInPage(() => ({ w: window.screen.availWidth, h: window.screen.availHeight }));
+    await browser.setWindowRect(0, 0, Math.min(1940, avail.w), Math.min(1140, avail.h));
     // Windows clamps the window to the screen, so the real viewport is a bit
     // shorter than 1080. The emulated one must match it exactly: if it is
     // larger the page is scaled to fit and every pointer action lands a few
@@ -313,7 +375,17 @@ describe("user guide screenshots", function () {
   });
 
   // The real mouse over the window breaks the synthetic drags (osCursor.ts).
-  beforeEach(() => parkOsCursor());
+  // A step that died mid-drag leaves the synthetic button held down, and
+  // every right-click after it opened nothing: release it before each step.
+  beforeEach(async function () {
+    await browser.releaseActions().catch(() => undefined);
+    await browser.keys(["Escape"]).catch(() => undefined);
+    await parkOsCursor();
+    // The shots session carries a video track, so with no projector set up
+    // the app offers to configure one: keep that notice out of every shot
+    // except the video step's own («Ahora no» only hides it in memory).
+    if (!/video/i.test(this.currentTest?.title ?? "")) await dismissVideoNotice();
+  });
 
   after(async () => {
     await restoreLocale?.();
@@ -374,15 +446,17 @@ describe("user guide screenshots", function () {
       [
         { selector: transportButton(1), n: 1, badge: "below", pad: 1 },
         { selector: transportButton(2), n: 2, badge: "below", pad: 1 },
+        // 3 is «Fade out y parar», between Stop and Play since 2026-10.
         { selector: transportButton(3), n: 3, badge: "below", pad: 1 },
         { selector: transportButton(4), n: 4, badge: "below", pad: 1 },
-        { selector: split("topbar-metronome", 1), n: 5, badge: "below", pad: 1 },
-        { selector: split("topbar-metronome", 2), n: 6, badge: "below", pad: 1 },
-        { selector: split("topbar-voice-guide", 1), n: 7, badge: "below", pad: 1 },
-        { selector: split("topbar-voice-guide", 2), n: 8, badge: "below", pad: 1 },
-        { selector: split("topbar-pads", 1), n: 9, badge: "below", pad: 1 },
-        { selector: split("topbar-pads", 2), n: 10, badge: "below", pad: 1 },
-        { selector: ".lt-transport-buttons > button:last-of-type", n: 11, badge: "below" },
+        { selector: transportButton(5), n: 5, badge: "below", pad: 1 },
+        { selector: split("topbar-metronome", 1), n: 6, badge: "below", pad: 1 },
+        { selector: split("topbar-metronome", 2), n: 7, badge: "below", pad: 1 },
+        { selector: split("topbar-voice-guide", 1), n: 8, badge: "below", pad: 1 },
+        { selector: split("topbar-voice-guide", 2), n: 9, badge: "below", pad: 1 },
+        { selector: split("topbar-pads", 1), n: 10, badge: "below", pad: 1 },
+        { selector: split("topbar-pads", 2), n: 11, badge: "below", pad: 1 },
+        { selector: ".lt-transport-buttons > button:last-of-type", n: 12, badge: "below" },
       ],
       { crop: { marks: 14 } },
     );
@@ -704,7 +778,9 @@ describe("user guide screenshots", function () {
     // empty timeline after the last song.
     const lanes = await rectOf(".lt-track-layers");
     if (!lanes) throw new Error("no lanes");
-    await setTimelineView({ zoomLevel: 0.0625 });
+    // Ask for less than the minimum: the app clamps to its own floor, which
+    // depends on the session length and the window width.
+    await setTimelineView({ zoomLevel: 0.01, cameraX: 0 });
     await browser.pause(800);
     // Drop right after the last song as it is drawn NOW: the app clamps the
     // scroll when everything fits, so a computed position can be wrong.
@@ -713,6 +789,9 @@ describe("user guide screenshots", function () {
         ...Array.from(document.querySelectorAll(".lt-region-hotspot")).map((el) => el.getBoundingClientRect().right),
       ),
     );
+    if (lastRight > lanes.x + lanes.w - 60) {
+      throw new Error(`library-folder-to-song: no empty timeline after the last song (ends at ${lastRight}, lanes end ${lanes.x + lanes.w})`);
+    }
     const dropX = Math.min(lanes.x + lanes.w - 30, lastRight + 14);
     console.log(`[guideshots] folder drop at x=${dropX} (last song ends at ${lastRight}, lanes end ${lanes.x + lanes.w})`);
     const vp = await viewport();
@@ -1088,49 +1167,6 @@ describe("user guide screenshots", function () {
     await ensureSession();
     await AppPage.resetShell();
 
-    /** Opens a topbar popover by its arrow and captures it, a screenful at a time. */
-    const popoverShots = async (splitId: string, name: string) => {
-      // Voice guide and pads hide their settings while off: switch them on
-      // for the capture and back off afterwards.
-      const toggle = await $(`${tour(splitId)} > button:nth-of-type(1)`);
-      const wasOn = ((await toggle.getAttribute("class")) ?? "").includes("is-active");
-      if (!wasOn && splitId !== "topbar-metronome") {
-        await toggle.click();
-        await browser.pause(1200);
-      }
-      await (await $(`${tour(splitId)} > button:nth-of-type(2)`)).click();
-      await browser.pause(800);
-      const pages = await runInPage(() => {
-        const panel = document.querySelector(".lt-pads-popover") as HTMLElement | null;
-        if (!panel) return 0;
-        const scroller =
-          (Array.from(panel.querySelectorAll<HTMLElement>("*")).find((el) => el.scrollHeight > el.clientHeight + 8 &&
-            getComputedStyle(el).overflowY !== "visible") ?? panel);
-        scroller.setAttribute("data-guide", "pop-scroller");
-        scroller.scrollTop = 0;
-        const overflow = scroller.scrollHeight - scroller.clientHeight;
-        return overflow <= 8 ? 1 : Math.min(4, 1 + Math.ceil(overflow / (scroller.clientHeight - 60)));
-      });
-      if (!pages) throw new Error(`${name}: popover did not open`);
-      for (let page = 0; page < pages; page++) {
-        await runInPage((p: number) => {
-          const sc = document.querySelector('[data-guide="pop-scroller"]') as HTMLElement | null;
-          if (sc) sc.scrollTop = p * (sc.clientHeight - 60);
-        }, page);
-        await browser.pause(300);
-        await annotatedShot(`${name}${pages > 1 ? `-${page + 1}` : ""}`, [{ selector: ".lt-pads-popover", pad: 2 }], {
-          style: "spotlight",
-          crop: { marks: 24 },
-        });
-      }
-      await browser.keys(["Escape"]);
-      await browser.pause(400);
-      if (!wasOn && splitId !== "topbar-metronome") {
-        await toggle.click();
-        await browser.pause(600);
-      }
-    };
-
     await popoverShots("topbar-metronome", "metronome-popover");
     await popoverShots("topbar-voice-guide", "voice-guide-popover");
     await popoverShots("topbar-pads", "pads-popover");
@@ -1276,13 +1312,174 @@ describe("user guide screenshots", function () {
     await (await $(viewBtn(3))).click();
     await browser.pause(2500);
     await annotatedShot("live-view", [
-      { selector: ".lt-live-header", n: 1, pad: 2 },
+      // Since 1.14 the setlist is a strip in the header, not a column.
+      { selector: ".lt-live-heading", n: 1, pad: 2 },
       { selector: ".lt-live-settings", n: 2, pad: 2 },
       { selector: ".lt-live-cue-panel", n: 3, pad: 2 },
-      { selector: ".lt-live-setlist", n: 4, pad: 2 },
+      { selector: ".lt-live-region-buttons", n: 4, pad: 2 },
     ]);
     await (await $(viewBtn(1))).click();
     await browser.pause(1200);
+  });
+
+  // Novedades de 2026-10: biblioteca de carpetas, organizar por canción,
+  // fades de canción, «Fade out y parar», vúmetros estéreo y las marcas
+  // nuevas. Lanzar solo esto con --mochaOpts.grep "novedades".
+  it("novedades: library, song fades, fade-out, meters and markers", async () => {
+    await ensureSession();
+    await AppPage.resetShell();
+
+    // The folder library shows the places saved in the app settings — the
+    // REAL ones of whoever runs this. Show only a folder of the session copy
+    // and put the user's settings back at the end.
+    const invoke = (cmd: string, args: Record<string, unknown> = {}) =>
+      browser.executeAsync(
+        (c: string, a: Record<string, unknown>, done: (v: unknown) => void) => {
+          const w = window as unknown as {
+            __TAURI_INTERNALS__: { invoke: (c: string, a: unknown) => Promise<unknown> };
+          };
+          w.__TAURI_INTERNALS__.invoke(c, a).then(done, (e) => done({ __error: String(e) }));
+        },
+        cmd,
+        args,
+      );
+    // The stored locale may not be the one this run shows (the frontend
+    // reads it once, at load), and saving settings applies it: pin it.
+    const original = (await invoke("get_settings")) as Record<string, unknown>;
+    const locale = UI_LANG === "en" ? "en" : original.locale;
+    try {
+      await invoke("save_settings", {
+        settings: { ...original, locale, libraryMode: "folders", libraryPlaces: [path.join(workDir, "audio")] },
+      });
+      await browser.pause(800);
+      await AppPage.openLibrary();
+      // «En esta sesión» is an accordion: open, it hides the disk folders.
+      await (await $(".lt-folder-library-session-toggle")).click();
+      await browser.pause(1200);
+      const place = await tag(".lt-folder-library-place-toggle", "place0");
+      await (await $(place)).click();
+      await browser.pause(1200);
+      await annotatedShot(
+        "library-folders",
+        [
+          { selector: ".lt-folder-library-add", n: 1 },
+          { selector: ".lt-folder-library-search", n: 2 },
+          { selector: ".lt-folder-library-place > .lt-folder-library-row", n: 3, nth: 0 },
+          { selector: ".lt-folder-library-session-toggle", n: 4 },
+        ],
+        { crop: { marks: 24 } },
+      );
+      await (await $(".lt-folder-library-session-toggle")).click();
+      await browser.pause(600);
+      // «Organizar por canción» only shows with unfiled audio, and the shots
+      // session has every asset in a folder: take one out the way a user does
+      // (this is the work copy).
+      if (!(await rectOf(".lt-library-organize-button"))) {
+        // Low in the panel the click would land past the window's edge.
+        const asset = await tag(".lt-library-asset-list [aria-label]", "asset-to-root");
+        await runInPage(() => document.querySelector("[data-guide=asset-to-root]")?.scrollIntoView({ block: "center" }));
+        await browser.pause(400);
+        await rightClick(asset);
+        const toRoot = await tagByText(".lt-context-menu button", L("Mover a la ra"), "menu-root").catch(() => null);
+        if (toRoot && (await (await $(toRoot)).isClickable().catch(() => false))) {
+          await (await $(toRoot)).click();
+          await browser.pause(1200);
+        } else {
+          await browser.keys(["Escape"]);
+        }
+      }
+      if (await rectOf(".lt-library-organize-button")) {
+        await runInPage(() =>
+          document.querySelector(".lt-library-root-group > summary")?.scrollIntoView({ block: "center" }),
+        );
+        await browser.pause(500);
+        await annotatedShot(
+          "library-organize",
+          [
+            { selector: ".lt-library-root-group > summary", pad: 2 },
+            { selector: ".lt-library-organize-button", n: 1, pad: 2 },
+          ],
+          { style: "spotlight", crop: { marks: 40 } },
+        );
+      } else {
+        console.log("[guideshots] SKIPPED library-organize: no unfiled audio in the session");
+      }
+      await AppPage.resetShell();
+    } finally {
+      await invoke("save_settings", { settings: { ...original, locale } });
+    }
+
+    // Song fades: give the first song a fade in and out, then show its band
+    // with the corner handles (they show on the selected song).
+    const first = [...((await AppPage.songView())?.regions ?? [])].sort((a, b) => a.startSeconds - b.startSeconds)[0];
+    if (!first) throw new Error("no song");
+    const length = first.endSeconds - first.startSeconds;
+    await invoke("update_song_region_fades", {
+      regionId: first.id,
+      // Long enough to read at the width of the docs column.
+      fadeInSeconds: length / 5,
+      fadeOutSeconds: length / 4,
+    });
+    await browser.pause(1500);
+    await setTimelineView({ zoomLevel: Math.max(0.05, 1000 / (length * 18)), cameraX: first.startSeconds * (1000 / (length * 18)) * 18 });
+    await browser.pause(800);
+    const band = await tag(".lt-region-hotspot", "song0");
+    await (await $(band)).click();
+    await browser.pause(800);
+    await annotatedShot(
+      "song-fade-handles",
+      [
+        { selector: `${band} .lt-song-fade-handle.is-in`, n: 1, badge: "below", pad: 4 },
+        { selector: `${band} .lt-song-fade-handle.is-out`, n: 2, badge: "below", pad: 4 },
+      ],
+      { crop: { selector: band, margin: 14 } },
+    );
+    await rightClick(band, { fx: 0.5 });
+    await (await $(await tagByText(".lt-context-menu button", L("Fades de la canción"), "menu-fades"))).click();
+    await browser.pause(500);
+    await menuShot("menu-song-fades", band);
+
+    // The stereo meters need playback: a minute into the first song, where
+    // the band plays, and a track whose meter is really moving.
+    await invoke("seek_transport", { positionSeconds: first.startSeconds + Math.min(60, length / 3) });
+    await (await $(`.lt-transport-buttons button[aria-label="${L("Reproducir")}"]`)).click();
+    await browser.pause(5000);
+    await runInPage(() => {
+      document.querySelectorAll("[data-guide=header0]").forEach((el) => el.removeAttribute("data-guide"));
+      const live = Array.from(document.querySelectorAll<HTMLElement>(".lt-track-header")).find((header) => {
+        const bars = Array.from(header.querySelectorAll<HTMLElement>(".lt-track-meter-bar"));
+        return bars.length === 2 && bars.every((bar) => Number(bar.style.opacity || "0") > 0.5);
+      });
+      live?.setAttribute("data-guide", "header0");
+    });
+    const header = '[data-guide="header0"]';
+    if (!(await rectOf(header))) throw new Error("no track meter moving");
+    await annotatedShot(
+      "track-meter-stereo",
+      [{ selector: `${header} .lt-track-meter`, n: 1, pad: 3 }],
+      { crop: { selector: header, margin: 12 } },
+    );
+    await (await $(`.lt-transport-buttons button[aria-label="${L("Detener")}"]`)).click();
+    await browser.pause(800);
+
+    // Marker kinds: the new sections (instrument solos) and cues (tempo).
+    await setTimelineView({ zoomLevel: 1, cameraX: 0 });
+    const ruler = await rectOf(tour("timeline-ruler"));
+    if (!ruler) throw new Error("no ruler");
+    for (const [group, name] of [
+      [L("Secciones"), "marker-kinds-sections"],
+      [L("Avisos"), "marker-kinds-cues"],
+    ] as const) {
+      await rightClickAt(ruler.x + 330, ruler.y + 40);
+      await (await $(await tagByText(".lt-context-menu button", L("Crear Marca"), "menu-item"))).click();
+      await browser.pause(600);
+      await (await $(await tagByText(".lt-context-menu button", group, "menu-group"))).click();
+      await browser.pause(600);
+      await menuShot(name, null);
+      await browser.keys(["Escape"]);
+      await browser.pause(300);
+    }
+    await AppPage.resetShell();
   });
 
   it("export, render and cloud", async () => {
@@ -1542,5 +1739,515 @@ describe("user guide screenshots", function () {
     } else {
       console.log("[guideshots] SKIPPED video-audio-prompt: not asked (choice remembered in settings?)");
     }
+  });
+
+  // Novedades de 1.14.0: arreglos de canción, «Nivelar volumen de
+  // canciones…» y «Vamp entre canciones». Last on purpose: applying an
+  // arrangement lengthens the song and shifts the rest of the set. Lanzar
+  // solo esto con --mochaOpts.grep "1.14".
+  it("novedades 1.14: arrangements, level songs, vamp between songs", async () => {
+    await ensureSession();
+    await AppPage.resetShell();
+    await setTimelineView({ zoomLevel: 1, cameraX: 0 });
+
+    // Arrangement editor, from the song menu. The first song of the shots
+    // session has its sections marked (Intro, Verso, Coro…).
+    const band = await tag(".lt-region-hotspot", "arr-song");
+    // Near the start of the band: at zoom 1 the song is wider than the page.
+    const bandBox = await rectOf(band);
+    if (!bandBox) throw new Error("no song band");
+    await rightClickAt(Math.max(bandBox.x, 0) + 160, bandBox.y + bandBox.h / 2);
+    await (await $(await tagByExactText(".lt-context-menu button", L("Arreglo"), "menu-arr"))).click();
+    await browser.pause(1200);
+    if (!(await rectOf(".lt-structure-panel"))) throw new Error("arrangement panel did not open");
+    if (await rectOf(".lt-structure-capture-button")) {
+      await annotatedShot(
+        "arrangement-capture",
+        [
+          { selector: ".lt-structure-detected", n: 1, pad: 4 },
+          { selector: ".lt-structure-capture-button", n: 2, pad: 3 },
+        ],
+        { crop: { selector: ".lt-structure-panel", margin: 10 } },
+      );
+      await (await $(".lt-structure-capture-button")).click();
+      await browser.pause(1500);
+    }
+    await (await $(await tagByExactText(".lt-structure-toolbar button", L("Nuevo"), "arr-new"))).click();
+    await browser.pause(800);
+
+    // Two more choruses at the end: click the chorus in the palette twice.
+    // A clip shows it, then the still with every zone numbered.
+    const chorus = await tagByText(".lt-structure-palette .lt-structure-chip", "Coro", "arr-chorus").catch(() =>
+      tag(".lt-structure-palette .lt-structure-chip", "arr-chorus", 2),
+    );
+    const panel = await rectOf(".lt-structure-panel");
+    if (!panel) throw new Error("no arrangement panel");
+    const rec = new Recorder(
+      cdp,
+      "arrangement-build",
+      { x: Math.max(0, panel.x - 10), y: Math.max(0, panel.y - 260), w: Math.min(1900, panel.w + 20), h: panel.h + 270 },
+      outDir,
+    );
+    await rec.hold(0.8);
+    await rec.click(chorus);
+    await rec.hold(0.8);
+    await rec.click(chorus);
+    await rec.hold(1.2);
+    await rec.click(".lt-structure-footer .is-primary");
+    await rec.hold(2.5);
+    await rec.encode();
+
+    await annotatedShot(
+      "arrangement-editor",
+      [
+        { selector: ".lt-structure-select", n: 1, pad: 3, badge: "above" },
+        { selector: ".lt-structure-toolbar > button", nth: 0, n: 2, pad: 3, badge: "above" },
+        { selector: ".lt-structure-toolbar > button", nth: 1, pad: 3 },
+        { selector: ".lt-structure-toolbar > button", nth: 2, pad: 3 },
+        { selector: ".lt-structure-toolbar > button", nth: 3, pad: 3 },
+        { selector: ".lt-structure-palette", n: 3, pad: 4 },
+        { selector: ".lt-structure-strip-wrap", n: 4, pad: 4 },
+        { selector: ".lt-structure-footer .is-primary", n: 5, pad: 3 },
+      ],
+      { crop: { selector: ".lt-structure-panel", margin: 10 } },
+    );
+    await (await $(".lt-structure-close")).click();
+    await browser.pause(1000);
+
+    // The song in the ruler carries the arrangement's name. Zoom so the whole
+    // (now longer) song fits in ~1100 px, then crop to its band and markers.
+    const arranged = [...((await AppPage.songView())?.regions ?? [])].sort((a, b) => a.startSeconds - b.startSeconds)[0];
+    if (arranged) {
+      const zoom = 1100 / ((arranged.endSeconds - arranged.startSeconds) * 18);
+      await setTimelineView({ zoomLevel: zoom, cameraX: arranged.startSeconds * zoom * 18 });
+    }
+    const songBand = await tag(".lt-region-hotspot", "arr-song-fit");
+    const songBox = await rectOf(songBand);
+    if (!songBox) throw new Error("no arranged song band");
+    await annotatedShot("arrangement-ruler", [{ selector: songBand, n: 1, pad: 3 }], {
+      crop: { x: Math.max(0, songBox.x - 30), y: Math.max(0, songBox.y - 30), w: Math.min(songBox.w + 60, 1900), h: 170 },
+    });
+
+    // Level song volumes: a set-wide action, so it lives in the File menu.
+    await (await $(`${tour("topbar-file-menu")} .lt-top-menu-trigger`)).click();
+    await browser.pause(500);
+    await (await $(await tagByText(".lt-top-menu-dropdown button", L("Nivelar volumen de canciones"), "menu-level"))).click();
+    await browser.pause(1500);
+    await annotatedShot(
+      "level-songs-setup",
+      [
+        { selector: ".lt-level-songs-groups", n: 1, pad: 4 },
+        { selector: ".lt-level-songs-modal .lt-export-modal-actions .is-primary", n: 2, pad: 3 },
+      ],
+      { crop: { selector: ".lt-level-songs-modal", margin: 12 } },
+    );
+    await (await $(".lt-level-songs-modal .lt-export-modal-actions .is-primary")).click();
+    let measured = false;
+    for (let i = 0; i < 300 && !measured; i++) {
+      await browser.pause(1000);
+      measured = Boolean(await rectOf(".lt-level-songs-table"));
+    }
+    if (measured) {
+      await browser.pause(800);
+      await annotatedShot(
+        "level-songs-result",
+        [
+          { selector: ".lt-level-songs-modal .lt-settings-field", n: 1, pad: 4 },
+          { selector: ".lt-level-songs-table-wrap", n: 2, pad: 4 },
+          { selector: ".lt-level-songs-modal .lt-export-modal-actions .is-primary", n: 3, pad: 3 },
+        ],
+        { crop: { selector: ".lt-level-songs-modal", margin: 12 } },
+      );
+    } else {
+      console.log("[guideshots] SKIPPED level-songs-result: measuring did not finish in 5 minutes");
+    }
+    // On the result screen the secondary button is «Volver» (back to the
+    // setup), not close, and Escape does not close it: a click on the
+    // backdrop, outside the dialog, does.
+    for (let i = 0; i < 3 && (await rectOf(".lt-level-songs-modal")); i++) {
+      await browser
+        .action("pointer", { id: "guide-mouse", parameters: { pointerType: "mouse" } })
+        .move({ x: 24, y: 300 })
+        .down({ button: 0 })
+        .up({ button: 0 })
+        .perform();
+      await browser.pause(700);
+    }
+    if (await rectOf(".lt-level-songs-modal")) throw new Error("level songs modal did not close");
+
+    // «Entre canciones» next to VAMP in the Live View.
+    const viewBtn = (n: number) => `${tour("view-mode-switcher")} button:nth-of-type(${n})`;
+    await (await $(viewBtn(3))).click();
+    await browser.pause(2500);
+    await annotatedShot(
+      "live-vamp-between-songs",
+      [
+        { selector: ".lt-song-gap-vamp", n: 1, pad: 3 },
+        { selector: ".lt-live-vamp", n: 2, pad: 3 },
+      ],
+      { crop: { selector: ".lt-live-settings", margin: 12 } },
+    );
+    await (await $(viewBtn(1))).click();
+    await browser.pause(1200);
+  });
+
+  it("novedades 1.15: lyrics, song analysis, key changes, tempo and markers", async () => {
+    await ensureSession();
+    // Opening the session can put the stored language back: pin it again.
+    if (UI_LANG === "en") {
+      const lang = await runInPage(() => document.documentElement.lang || navigator.language);
+      const shown = await runInPage(() => document.body.innerText.includes("SALTO DE MARCA"));
+      console.log(`[guideshots] language check: html=${lang} spanishShown=${shown}`);
+      if (shown) {
+        await useAppLocale("en");
+        await AppPage.waitUntilBooted();
+        await ensureSession();
+      }
+    }
+    await AppPage.resetShell();
+    const invoke = (cmd: string, args: Record<string, unknown> = {}) =>
+      browser.executeAsync(
+        (c: string, a: Record<string, unknown>, done: (v: unknown) => void) => {
+          const w = window as unknown as {
+            __TAURI_INTERNALS__: { invoke: (c: string, a: unknown) => Promise<unknown> };
+          };
+          w.__TAURI_INTERNALS__.invoke(c, a).then(done, (e) => done({ __error: String(e) }));
+        },
+        cmd,
+        args,
+      );
+    const viewBtn = (n: number) => `${tour("view-mode-switcher")} button:nth-of-type(${n})`;
+    const regions = [...((await AppPage.songView())?.regions ?? [])].sort((a, b) => a.startSeconds - b.startSeconds);
+    // The 1.15 shots session (TestMultiplesAnalisis) has lyrics, a key change
+    // and analysed markers on «Eres Todopoderoso».
+    const song = regions.find((r) => /todopoderoso/i.test(r.name)) ?? regions[1];
+    if (!song) throw new Error("no song to show");
+    const length = song.endSeconds - song.startSeconds;
+    const zoom = 1400 / (length * 18);
+    await setTimelineView({ zoomLevel: zoom, cameraX: Math.max(0, song.startSeconds * zoom * 18 - 160) });
+    await invoke("seek_transport", { positionSeconds: song.startSeconds + Math.min(60, length / 3) });
+    await browser.pause(800);
+    // The song band: the hotspot with most of its width on the page.
+    const tagged = await runInPage(() => {
+      document.querySelectorAll('[data-guide="song115"]').forEach((el) => el.removeAttribute("data-guide"));
+      const el = Array.from(document.querySelectorAll(".lt-region-hotspot"))
+        .map((e) => {
+          const r = e.getBoundingClientRect();
+          return { e, seen: r.height > 0 ? Math.min(r.right, window.innerWidth) - Math.max(r.left, 0) : 0 };
+        })
+        .filter(({ seen }) => seen > 0)
+        .sort((a, b) => b.seen - a.seen)[0];
+      el?.e.setAttribute("data-guide", "song115");
+      return Boolean(el);
+    });
+    if (!tagged) throw new Error("no song band");
+    const band = '[data-guide="song115"]';
+    const bandBox = await rectOf(band);
+    if (!bandBox) throw new Error("no song band box");
+    const vp115 = await viewport();
+    const cropLeft = Math.max(0, bandBox.x - 20);
+    const cropTop = Math.max(0, bandBox.y - 14);
+    const rulerCrop = {
+      x: cropLeft,
+      y: cropTop,
+      w: Math.min(bandBox.x + bandBox.w + 20, vp115.w) - cropLeft,
+      h: Math.min(170, vp115.h - cropTop),
+    };
+    /** data-guide=<name> on the nth match that is on the page and clickable. */
+    const tagOnScreen = async (selector: string, name: string, nth = 0) => {
+      const ok = await runInPage(
+        (sel: string, tagName: string, index: number) => {
+          document.querySelectorAll(`[data-guide="${tagName}"]`).forEach((el) => el.removeAttribute("data-guide"));
+          const el = Array.from(document.querySelectorAll(sel)).filter((e) => {
+            const r = e.getBoundingClientRect();
+            if (!(r.width > 0 && r.height > 0 && r.left >= 40 && r.right <= window.innerWidth - 40)) return false;
+            // Not under something else (the track header column covers the ruler's start).
+            const top = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+            return top === e || e.contains(top);
+          })[index];
+          el?.setAttribute("data-guide", tagName);
+          return Boolean(el);
+        },
+        selector,
+        name,
+        nth,
+      );
+      return ok ? `[data-guide="${name}"]` : null;
+    };
+    const centre = async (selector: string) => {
+      const r = await rectOf(selector);
+      if (!r) throw new Error(`${selector} not visible`);
+      return { x: Math.round(r.x + r.w / 2), y: Math.round(r.y + r.h / 2) };
+    };
+
+    // Key change: the notch on the song band.
+    if (await rectOf(".lt-key-change-hotspot")) {
+      await annotatedShot(
+        "key-change-notch",
+        [{ selector: ".lt-key-change-hotspot", n: 1, pad: 4, badge: "below" }],
+        { crop: rulerCrop },
+      );
+    } else {
+      console.log("[guideshots] SKIPPED key-change-notch: the song has no key change");
+    }
+
+    // Song menu (analysis, key change at the cursor, count-in per song).
+    await rightClick(band, { fx: 0.25 });
+    await menuShot("menu-song", band);
+
+    // BPM marker menu, with the ramp.
+    const tempo = await tagOnScreen(".lt-tempo-hotspot:not(.lt-time-signature-hotspot)", "tempo115");
+    if (tempo) {
+      await rightClick(tempo);
+      await menuShot("menu-tempo-marker", tempo);
+    }
+
+    // Several ruler markers selected with Ctrl+click.
+    // Three section markers well apart, in ruler order (the DOM order is not).
+    const spread = await runInPage(() => {
+      const els = Array.from(document.querySelectorAll(".lt-marker-hotspot"))
+        .map((e) => ({ e, r: e.getBoundingClientRect() }))
+        .filter(({ r }) => r.width > 0 && r.height > 0 && r.left >= 40 && r.right <= window.innerWidth - 40)
+        .sort((a, b) => a.r.left - b.r.left);
+      const picked: Element[] = [];
+      let lastX = -Infinity;
+      for (const { e, r } of els) {
+        if (r.left - lastX < 150) continue;
+        picked.push(e);
+        lastX = r.left;
+      }
+      ["m115a", "m115b", "m115c"].forEach((name, i) => {
+        document.querySelectorAll(`[data-guide="${name}"]`).forEach((el) => el.removeAttribute("data-guide"));
+        picked[i + 1]?.setAttribute("data-guide", name);
+      });
+      return picked.length;
+    });
+    const m1 = spread > 3 ? '[data-guide="m115a"]' : null;
+    const m2 = spread > 3 ? '[data-guide="m115b"]' : null;
+    const m3 = spread > 3 ? '[data-guide="m115c"]' : null;
+    if (!m1 || !m2 || !m3) throw new Error("not enough ruler markers on the page");
+    const [p1, p2, p3] = [await centre(m1), await centre(m2), await centre(m3)];
+    const press = (p: { x: number; y: number }) => [
+      { type: "pointerMove", duration: 0, x: p.x, y: p.y, origin: "viewport" },
+      { type: "pointerDown", button: 0 },
+      { type: "pointerUp", button: 0 },
+      { type: "pause", duration: 300 },
+    ];
+    const idle = (n: number) => Array.from({ length: n }, () => ({ type: "pause", duration: 0 }));
+    // One plain click, then two with Ctrl held: the key source holds Ctrl
+    // across the pointer ticks of the same action.
+    await browser.performActions([
+      { type: "key", id: "kb115", actions: [...idle(4), { type: "keyDown", value: "\uE009" }, ...idle(8), { type: "keyUp", value: "\uE009" }] },
+      {
+        type: "pointer",
+        id: "mouse115",
+        parameters: { pointerType: "mouse" },
+        actions: [...press(p1), { type: "pause", duration: 0 }, ...press(p2), ...press(p3), { type: "pause", duration: 0 }],
+      },
+    ]);
+    await browser.releaseActions();
+    await browser.pause(500);
+    const selectedCount = await runInPage(() => document.querySelectorAll(".lt-marker-hotspot.is-selected").length);
+    console.log(`[guideshots] ruler markers selected: ${selectedCount} (clicked at ${JSON.stringify([p1, p2, p3])})`);
+    await annotatedShot(
+      "ruler-marker-selection",
+      [
+        { selector: m1, n: 1, pad: 3, badge: "above" },
+        { selector: m2, n: 2, pad: 3, badge: "above" },
+        { selector: m3, n: 3, pad: 3, badge: "above" },
+      ],
+      { crop: rulerCrop },
+    );
+    await browser.keys(["Escape"]);
+    await browser.pause(300);
+
+    // Song tempo in the Warp popover.
+    await (await $(band)).click();
+    await browser.pause(600);
+    await toolbarPanelShot("toolbar-warp", "toolbar-warp-panel");
+
+    // Count style in the voice guide window.
+    await popoverShots("topbar-voice-guide", "voice-guide-popover");
+
+    // Analyze song: setup, then the review.
+    await rightClick(band, { fx: 0.25 });
+    await (await $(await tagByText(".lt-context-menu button", L("Analizar canción"), "menu-analyze"))).click();
+    await browser.pause(1200);
+    const modal = ".lt-song-analysis-modal";
+    if (!(await rectOf(modal))) throw new Error("song analysis did not open");
+    // The speech model (guide recognition) downloads once; fetch it first.
+    if (await rectOf(".lt-song-analysis-callout .lt-song-analysis-button")) {
+      await (await $(".lt-song-analysis-callout .lt-song-analysis-button")).click();
+      for (let i = 0; i < 300 && (await rectOf(".lt-song-analysis-callout")); i++) await browser.pause(1000);
+    }
+    await annotatedShot(
+      "song-analysis-setup",
+      [
+        { selector: `${modal} .lt-settings-field select`, nth: 0, n: 1, pad: 3 },
+        { selector: `${modal} .lt-render-section`, n: 2, pad: 3 },
+        { selector: `${modal} .lt-settings-field select`, nth: 1, n: 3, pad: 3 },
+        { selector: `${modal} .lt-export-modal-actions .is-primary`, n: 4, pad: 3 },
+      ],
+      { crop: { selector: modal, margin: 12 } },
+    );
+    await (await $(`${modal} .lt-export-modal-actions .is-primary`)).click();
+    let reviewed = false;
+    for (let i = 0; i < 400 && !reviewed; i++) {
+      await browser.pause(1000);
+      reviewed = Boolean(await rectOf(`${modal} .lt-song-analysis-part`));
+    }
+    if (reviewed) {
+      await browser.pause(800);
+      const pages = await runInPage(() => {
+        const body = document.querySelector(".lt-song-analysis-modal .lt-settings-modal-body") as HTMLElement | null;
+        if (!body) return 1;
+        body.setAttribute("data-guide", "analysis-body");
+        body.scrollTop = 0;
+        const overflow = body.scrollHeight - body.clientHeight;
+        return overflow <= 8 ? 1 : Math.min(3, 1 + Math.ceil(overflow / (body.clientHeight - 60)));
+      });
+      for (let page = 0; page < pages; page++) {
+        await runInPage((p: number) => {
+          const body = document.querySelector('[data-guide="analysis-body"]') as HTMLElement | null;
+          if (body) body.scrollTop = p * (body.clientHeight - 60);
+        }, page);
+        await browser.pause(400);
+        await shot(`song-analysis-review${pages > 1 ? `-${page + 1}` : ""}`, { selector: modal, margin: 12 });
+      }
+    } else {
+      console.log("[guideshots] SKIPPED song-analysis-review: the analysis did not finish");
+    }
+    // Close without applying: the backdrop, outside the dialog.
+    for (let i = 0; i < 3 && (await rectOf(modal)); i++) {
+      await browser
+        .action("pointer", { id: "guide-mouse", parameters: { pointerType: "mouse" } })
+        .move({ x: 24, y: 300 })
+        .down({ button: 0 })
+        .up({ button: 0 })
+        .perform();
+      await browser.pause(700);
+    }
+
+    // Lyrics in the Live View, a verse into the song.
+    await invoke("seek_transport", { positionSeconds: song.startSeconds + Math.min(75, length / 3) });
+    await (await $(viewBtn(3))).click();
+    await browser.pause(2500);
+    if (!(await rectOf(".lt-live-chart"))) {
+      await (await $(".lt-live-chart-toggle")).click();
+      await browser.pause(1200);
+    }
+    await annotatedShot(
+      "live-lyrics",
+      [
+        { selector: ".lt-live-chart-toggle", n: 1, pad: 3 },
+        { selector: ".lt-live-chart-tools", n: 2, pad: 3 },
+        { selector: ".lt-live-chart-scroller", n: 3, pad: 4 },
+      ],
+      { crop: { marks: 40 } },
+    );
+    await (await $(`.lt-live-chart button[aria-label="${L("Editar letra y sincronía")}"]`)).click();
+    await browser.pause(1200);
+    if (await rectOf(".lt-chart-editor")) {
+      await shot("lyrics-editor", { selector: ".lt-chart-editor", margin: 12 });
+      await browser.keys(["Escape"]);
+      await browser.pause(500);
+      if (await rectOf(".lt-chart-editor")) {
+        await (await $(await tagByExactText(".lt-chart-editor button", L("Cancelar"), "chart-cancel"))).click();
+        await browser.pause(500);
+      }
+    }
+    // A song without lyrics shows how to add them.
+    const bare = regions.find((r) => r.id !== song.id);
+    if (bare) {
+      await invoke("seek_transport", { positionSeconds: bare.startSeconds + 20 });
+      // Long enough for the «selections cleared» toast to go away.
+      await browser.pause(5000);
+      if (await rectOf(".lt-live-chart-empty")) {
+        await annotatedShot("live-lyrics-empty", [{ selector: ".lt-live-chart-empty-actions", n: 1, pad: 4 }], {
+          crop: { selector: ".lt-live-chart", margin: 12 },
+        });
+      }
+    }
+    await (await $(viewBtn(1))).click();
+    await browser.pause(1200);
+  });
+
+  // The PHONE layout from this desktop build: the frontend switches to it from
+  // an Android user agent. For the mobile images that only need the phone UI
+  // (the selection bar) when no debug APK can be built — whisper-rs-sys does
+  // not cross-compile for Android on Windows. Same marks as
+  // tests/android/guide-shots/shots.ts (trackSelect, clipSelect), same demo
+  // song, and a 915x412 @2 viewport, the emulator's 1828x822 frames. It
+  // changes the page for good, so it is the LAST step.
+  it("mobile 1.15: selection bar (phone layout)", async () => {
+    const phoneDir = path.join(repoRoot, "apps", "website", "public", "guide", UI_LANG === "en" ? "mobile-en" : "mobile");
+    mkdirSync(phoneDir, { recursive: true });
+    shotDir = phoneDir;
+    await cdp("Emulation.setUserAgentOverride", {
+      userAgent:
+        "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Mobile Safari/537.36",
+      platform: "Linux armv8l",
+    });
+    await cdp("Emulation.setTouchEmulationEnabled", { enabled: true, maxTouchPoints: 5 });
+    await cdp("Emulation.setDeviceMetricsOverride", { width: 915, height: 412, deviceScaleFactor: 2, mobile: true });
+    await runInPage(() => window.location.reload());
+    await browser.pause(5000);
+    await AppPage.waitUntilBooted();
+    // The reload puts the stored language back: pin English again.
+    if (UI_LANG === "en") {
+      await useAppLocale("en");
+      await AppPage.waitUntilBooted();
+    }
+    // The phone landing, then its demo song (the one the mobile set shows).
+    if (await rectOf(".lt-timeline-shell")) {
+      await (await $(`${tour("side-nav-sessions")}`)).click().catch(() => undefined);
+    }
+    for (let i = 0; i < 20 && !(await rectOf(tour("landing-demo-song"))); i++) await browser.pause(500);
+    await (await $(tour("landing-demo-song"))).click();
+    for (let i = 0; i < 60 && !(await rectOf(".lt-timeline-shell")); i++) await browser.pause(500);
+    await browser.pause(6000);
+    await dismissVideoNotice();
+    const tap = async (x: number, y: number) => {
+      await cdp("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ x, y }] });
+      await cdp("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+      await browser.pause(900);
+    };
+    const centre = async (selector: string) => {
+      const r = await rectOf(selector);
+      if (!r) throw new Error(`${selector} not visible`);
+      return { x: r.x + r.w / 2, y: r.y + r.h / 2 };
+    };
+
+    // A selected track and its action bar.
+    const name = await tag(".lt-track-header .lt-track-title-row strong", "phone-track");
+    const n = await centre(name);
+    await tap(n.x, n.y);
+    const bar = ".lt-mobile-selection-actions";
+    await annotatedShot("track-selected", [
+      { selector: ".lt-track-header.is-selected", n: 1 },
+      { selector: `${bar} .lt-mobile-selection-actions-title`, n: 2, badge: "above" },
+      { selector: `${bar} .lt-mobile-selection-action`, nth: 0, n: 3, badge: "above" },
+      { selector: `${bar} button[aria-label="${L("Más acciones")}"]`, n: 4, badge: "above" },
+      { selector: `${bar} button[aria-label="${L("Mezcla")}"]`, n: 5, badge: "above" },
+      { selector: `${bar} button[aria-label="${L("Seleccionar por área")}"]`, n: 6, badge: "above" },
+      { selector: `${bar} button[aria-label="${L("Quitar selección")}"]`, n: 7, badge: "above" },
+      { selector: `${bar} button[aria-label="${L("Ocultar acciones")}"]`, n: 8, badge: "above" },
+    ]);
+    await (await $(`${bar} button[aria-label="${L("Mezcla")}"]`)).click();
+    await browser.pause(800);
+    await annotatedShot("track-mix", [{ selector: ".lt-mobile-selection-mix", pad: 2 }], { style: "spotlight" });
+    await (await $(`${bar} button[aria-label="${L("Mezcla")}"]`)).click();
+    await browser.pause(500);
+    await (await $(`${bar} button[aria-label="${L("Quitar selección")}"]`)).click();
+    await browser.pause(800);
+
+    // A selected clip.
+    const row = await rectOf(".lt-track-header");
+    const song = await rectOf(".lt-region-hotspot");
+    if (!row || !song) throw new Error("no row/song on the phone screen");
+    await tap(song.x + song.w * 0.4, row.y + row.h / 2);
+    await annotatedShot("clip-selected", [{ selector: ".lt-mobile-selection-actions", pad: 2 }], { style: "spotlight" });
+    await (await $(`${bar} button[aria-label="${L("Quitar selección")}"]`)).click().catch(() => undefined);
+    shotDir = outDir;
   });
 });

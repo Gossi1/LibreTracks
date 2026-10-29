@@ -1,4 +1,5 @@
 #include <lt_engine/render/voice_guide_renderer.h>
+#include <lt_engine/session/tempo_ramp.h>
 #include <lt_engine/devices/device_channel_layout.h>
 
 #include <lt_engine/sources/audio_decoder.h>
@@ -62,12 +63,7 @@ std::pair<int, int> signature_at(const Song* song, Frame frame) noexcept {
 
 double bpm_at(const Song* song, Frame frame) noexcept {
     if (!song) return 120.0;
-    double bpm = song->bpm;
-    for (const auto& marker : song->tempo_markers) {
-        if (marker.frame > frame) break;
-        bpm = marker.bpm;
-    }
-    return std::clamp(bpm, 20.0, 300.0);
+    return tempo_span_at(song, frame).bpm_at(static_cast<double>(frame));
 }
 
 Frame timing_segment_start(const Song* song, Frame frame) noexcept {
@@ -148,6 +144,7 @@ std::string kind_token(MarkerKind kind) noexcept {
         case MarkerKind::Softly: return "softly";
         case MarkerKind::Swell: return "swell";
         case MarkerKind::WorshipFreely: return "worship_freely";
+        case MarkerKind::Count: return "count";
         case MarkerKind::Custom: default: return "custom";
     }
 }
@@ -159,6 +156,8 @@ std::string kind_token(MarkerKind kind) noexcept {
 const VoiceGuideClip* VoiceGuideClipBank::section_for(MarkerKind kind, int variant) const noexcept {
     const int idx = static_cast<int>(kind);
     if (idx < 0 || idx >= kKindCount) return nullptr;
+    // A count dragged into the section row says its number, then counts in.
+    if (kind == MarkerKind::Count) return count_for(variant);
     const VoiceGuideSection& section = sections[static_cast<std::size_t>(idx)];
     if (variant >= 1 && variant < VoiceGuideSection::kMaxVariant) {
         const VoiceGuideClip& v = section.variants[static_cast<std::size_t>(variant)];
@@ -183,9 +182,11 @@ const VoiceGuideClip* VoiceGuideClipBank::count_for(int beat_number) const noexc
     return clip.samples.empty() ? nullptr : &clip;
 }
 
-const VoiceGuideClip* VoiceGuideClipBank::cue_for(MarkerKind kind) const noexcept {
+const VoiceGuideClip* VoiceGuideClipBank::cue_for(MarkerKind kind, int variant) const noexcept {
     const int idx = static_cast<int>(kind);
     if (idx < 0 || idx >= kKindCount) return nullptr;
+    // A count has no recording of its own: it speaks its number.
+    if (kind == MarkerKind::Count) return count_for(variant);
     const VoiceGuideClip& clip = cues[static_cast<std::size_t>(idx)];
     if (!clip.samples.empty()) return &clip;
     // A *section* kind reaching this lookup can only be one dragged into the
@@ -276,6 +277,9 @@ const char* section_filename(int kind_index) noexcept {
         case MarkerKind::Rap: return "rap";
         case MarkerKind::Turnaround: return "turnaround";
         case MarkerKind::NextSong: return "next_song";
+        case MarkerKind::DrumSolo: return "drum_solo";
+        case MarkerKind::BassSolo: return "bass_solo";
+        case MarkerKind::GuitarSolo: return "guitar_solo";
         // Cue kinds and Custom have no entry in the sections tree.
         default: return nullptr;
     }
@@ -306,6 +310,8 @@ const char* cue_filename(int kind_index) noexcept {
         case MarkerKind::WorshipFreely: return "worship_freely";
         case MarkerKind::EaseDown: return "ease_down";
         case MarkerKind::GetReady: return "get_ready";
+        case MarkerKind::TempoUp: return "tempo_up";
+        case MarkerKind::TempoDown: return "tempo_down";
         default: return nullptr;
     }
 }
@@ -347,6 +353,58 @@ std::shared_ptr<VoiceGuideClipBank> load_voice_guide_bank(
     return bank;
 }
 
+// ── Count style ──────────────────────────────────────────────────────────────
+
+VoiceGuideCountStyle voice_guide_count_style_from_int(int value) noexcept {
+    switch (value) {
+    case static_cast<int>(VoiceGuideCountStyle::HalfThenFull):
+        return VoiceGuideCountStyle::HalfThenFull;
+    case static_cast<int>(VoiceGuideCountStyle::HalfTime):
+        return VoiceGuideCountStyle::HalfTime;
+    default:
+        return VoiceGuideCountStyle::Full;
+    }
+}
+
+VoiceGuideCountStyle effective_count_style(VoiceGuideCountStyle style,
+                                           int beats_per_bar, int beat_unit) noexcept {
+    if (style == VoiceGuideCountStyle::Full) return style;
+    // Halving needs an even number of simple beats: 2/4, 4/4, 2/2. 3/4 would
+    // land the "2" on beat 3 and 6/8 is felt in dotted quarters, not pairs of
+    // eighths — counting those in half notes misleads more than it helps.
+    if (beats_per_bar < 2 || beats_per_bar % 2 != 0 || beat_unit > 4)
+        return VoiceGuideCountStyle::Full;
+    return style;
+}
+
+int voice_guide_count_span_bars(VoiceGuideCountStyle style, int lead_bars) noexcept {
+    const int bars = std::max(1, lead_bars);
+    switch (style) {
+    case VoiceGuideCountStyle::HalfThenFull: return bars + 1;
+    case VoiceGuideCountStyle::HalfTime:     return bars * 2;
+    case VoiceGuideCountStyle::Full:
+    default:                                 return bars;
+    }
+}
+
+int voice_guide_count_number(VoiceGuideCountStyle style, int beats_per_bar,
+                             int beat_index) noexcept {
+    if (beats_per_bar <= 0 || beat_index < 0) return 0;
+    switch (style) {
+    case VoiceGuideCountStyle::HalfThenFull:
+        // First bar in half notes ("1 . 2 ."), the rest one number per beat.
+        if (beat_index < beats_per_bar)
+            return (beat_index % 2 == 0) ? beat_index / 2 + 1 : 0;
+        return ((beat_index - beats_per_bar) % beats_per_bar) + 1;
+    case VoiceGuideCountStyle::HalfTime:
+        // Every other beat, numbered 1..N: the full count at half speed.
+        return (beat_index % 2 == 0) ? ((beat_index / 2) % beats_per_bar) + 1 : 0;
+    case VoiceGuideCountStyle::Full:
+    default:
+        return (beat_index % beats_per_bar) + 1;
+    }
+}
+
 // ── Config ───────────────────────────────────────────────────────────────────
 
 void VoiceGuideRenderer::set_config(const VoiceGuideConfig& config) {
@@ -354,6 +412,7 @@ void VoiceGuideRenderer::set_config(const VoiceGuideConfig& config) {
     set_volume(config.volume);
     lead_bars_.store(std::clamp(config.lead_bars, 1, 4), std::memory_order_release);
     count_in_enabled_.store(config.count_in_enabled, std::memory_order_release);
+    count_style_.store(static_cast<int>(config.count_style), std::memory_order_release);
 
     std::string route = normalize_route(config.output_route.empty() ? "monitor"
                                                                      : config.output_route);
@@ -403,6 +462,8 @@ VoiceGuideConfig VoiceGuideRenderer::config() const {
     config.output_route = array_text(output_route_);
     config.lead_bars = lead_bars_.load(std::memory_order_acquire);
     config.count_in_enabled = count_in_enabled_.load(std::memory_order_acquire);
+    config.count_style =
+        voice_guide_count_style_from_int(count_style_.load(std::memory_order_acquire));
     return config;
 }
 
@@ -575,6 +636,8 @@ void VoiceGuideRenderer::render(float** output_channels,
 
     const int lead_bars = lead_bars_.load(std::memory_order_acquire);
     const bool count_in = count_in_enabled_.load(std::memory_order_acquire);
+    const VoiceGuideCountStyle global_style =
+        voice_guide_count_style_from_int(count_style_.load(std::memory_order_acquire));
 
     for (int f = 0; f < num_frames; ++f) {
         const float ramp_frames = static_cast<float>(std::max(1.0, sample_rate * 0.010));
@@ -591,6 +654,41 @@ void VoiceGuideRenderer::render(float** output_channels,
             const double beat_frames = quarter_note_frames * (4.0 / static_cast<double>(beat_unit));
 
             if (std::isfinite(beat_frames) && beat_frames >= 1.0) {
+                // Count style of the song a downbeat belongs to: that song's
+                // own override (its region), else the global setting, then
+                // degraded to Full if this meter can't be counted in halves.
+                auto style_for = [&](Frame anchor) {
+                    VoiceGuideCountStyle style = global_style;
+                    for (const auto& region : song->regions) {
+                        if (anchor < region.start_frame || anchor >= region.end_frame)
+                            continue;
+                        if (region.voice_guide_count_style >= 0)
+                            style = voice_guide_count_style_from_int(
+                                region.voice_guide_count_style);
+                        break;
+                    }
+                    return effective_count_style(style, beats_per_bar, beat_unit);
+                };
+                // The frame `beats` beats before a target downbeat. Inside a
+                // tempo ramp the beats before it are not evenly spaced: they
+                // are laid back along the ramp from the target itself, so the
+                // count lands on the same frames whatever frame we are on.
+                auto frame_before = [&](Frame target, double beats) {
+                    const TempoSpan ramp = tempo_span_at(song, target - 1);
+                    if (!ramp.is_ramp())
+                        return target - static_cast<Frame>(std::llround(beats * beat_frames));
+                    const double quarters = beats * 4.0 / static_cast<double>(beat_unit);
+                    return static_cast<Frame>(std::llround(
+                        ramp.frame_after(static_cast<double>(target), -quarters, sample_rate)));
+                };
+                // Frames between the start of the count and the downbeat. With
+                // the count off only the name plays, at the plain lead distance.
+                auto lead_span_for = [&](VoiceGuideCountStyle style, Frame target) {
+                    const int bars = count_in
+                        ? voice_guide_count_span_bars(style, lead_bars)
+                        : lead_bars;
+                    return target - frame_before(target, beats_per_bar * bars);
+                };
                 // Two independent announce targets, evaluated separately so one
                 // never silences the other (a pending automation jump further
                 // down the timeline must not stop the markers in between from
@@ -618,8 +716,20 @@ void VoiceGuideRenderer::render(float** output_channels,
                 // bug: vamping on "Bridge" spoke the "Verse" that follows it.
                 const Frame reachable_horizon =
                     jump_target.active ? jump_target.at_frame : -1;
+                // A marker just before the jump (an automation cue dropped a
+                // beat after the section it means to replace, or a wait before
+                // its jump) is the same moment for the listener: announcing it
+                // too spoke two sections over each other. Inside the jump's
+                // lead span the jump wins; a section that plays for longer
+                // than that is still announced on its own.
+                const bool marker_superseded_by_jump =
+                    jump_frame > abs_frame && marker_frame >= 0
+                    && marker_frame < jump_frame
+                    && marker_frame > jump_frame
+                        - lead_span_for(style_for(jump_frame), jump_frame);
                 const bool marker_unreachable =
-                    reachable_horizon >= 0 && marker_frame > reachable_horizon;
+                    (reachable_horizon >= 0 && marker_frame > reachable_horizon)
+                    || marker_superseded_by_jump;
 
                 // Fire (section + count) for one target downbeat. Each beat-frame
                 // guard keys off the absolute frame, so distinct targets that
@@ -644,8 +754,10 @@ void VoiceGuideRenderer::render(float** output_channels,
                         // a jump, target_frame is the TRIGGER (where the count lands)
                         // while cue_anchor_frame is the DESTINATION marker, so cues
                         // attached to the jump's destination still get announced.
-                        const Frame lead_span = static_cast<Frame>(
-                            std::llround(beats_per_bar * lead_bars * beat_frames));
+                        // The count style follows the DESTINATION's song (for a
+                        // jump, where you land, not where the trigger sits).
+                        const VoiceGuideCountStyle style = style_for(cue_anchor_frame);
+                        const Frame lead_span = lead_span_for(style, target_frame);
                         const Frame count_bar_start = target_frame - lead_span;
                         const Frame cue_window_start = cue_anchor_frame - lead_span;
 
@@ -661,9 +773,12 @@ void VoiceGuideRenderer::render(float** output_channels,
                         int chained_count = 0;
                         for (const auto& cue : song->markers) {
                             if (!cue.is_cue()) continue;
+                            // A count sits on its own beat: it is never moved
+                            // into a lead-in (see the loose-cue pass).
+                            if (cue.kind == MarkerKind::Count) continue;
                             if (cue.frame < cue_window_start || cue.frame > cue_anchor_frame)
                                 continue;
-                            const VoiceGuideClip* clip = bank->cue_for(cue.kind);
+                            const VoiceGuideClip* clip = bank->cue_for(cue.kind, cue.variant);
                             if (!clip) continue;            // no recording in this lang
                             if (chained_count >= kMaxChainedCues) break;
                             // Insertion sort by marker frame (small N).
@@ -724,16 +839,23 @@ void VoiceGuideRenderer::render(float** output_channels,
                             }
                         }
 
-                        // Count: every beat of the lead bar(s), spoken "1..N".
-                        // Always plays (rhythmic entry), even when the name didn't
-                        // fit.
+                        // Count over the lead span, laid out by the style: every
+                        // beat "1..N" (Full), a half-note bar first ("1 . 2 . |
+                        // 1 2 3 4") or the whole count at half speed. Always
+                        // plays (rhythmic entry), even when the name didn't fit.
                         if (count_in) {
-                            const int lead_beats = beats_per_bar * lead_bars;
+                            const int lead_beats =
+                                beats_per_bar * voice_guide_count_span_bars(style, lead_bars);
+                            const bool in_ramp = tempo_span_at(song, target_frame - 1).is_ramp();
                             for (int b = 0; b < lead_beats; ++b) {
-                                const Frame beat_frame = count_bar_start
-                                    + static_cast<Frame>(std::llround(b * beat_frames));
+                                const Frame beat_frame = in_ramp
+                                    ? frame_before(target_frame, lead_beats - b)
+                                    : count_bar_start
+                                        + static_cast<Frame>(std::llround(b * beat_frames));
                                 if (beat_frame != abs_frame) continue;
-                                const int beat_number = (b % beats_per_bar) + 1;
+                                const int beat_number =
+                                    voice_guide_count_number(style, beats_per_bar, b);
+                                if (beat_number <= 0) continue;   // silent half beat
                                 if (beat_frame != last_count_frame_) {
                                     trigger_clip(bank->count_for(beat_number), 0.9f,
                                                  sample_rate, bank);
@@ -805,21 +927,28 @@ void VoiceGuideRenderer::render(float** output_channels,
                     // it has already been (or will be) spoken earlier; don't also
                     // one-shot it. A cue is "chained" when it sits within the lead
                     // window before a section or jump downbeat.
-                    auto in_lead_window = [&](Frame downbeat) {
+                    auto in_lead_window = [&](Frame downbeat, Frame anchor) {
                         if (downbeat <= abs_frame) return false;
-                        const Frame win_start = downbeat
-                            - static_cast<Frame>(
-                                  std::llround(beats_per_bar * lead_bars * beat_frames));
+                        const Frame win_start = downbeat - lead_span_for(style_for(anchor), downbeat);
                         return cue->frame >= win_start && cue->frame <= downbeat;
                     };
-                    const bool chained =
-                        (marker_frame > abs_frame && in_lead_window(marker_frame))
-                        || (jump_frame > abs_frame && in_lead_window(jump_frame));
+                    const Frame jump_anchor = jump_target.destination_frame > 0
+                        ? jump_target.destination_frame
+                        : jump_frame;
+                    const bool in_lead =
+                        (marker_frame > abs_frame && in_lead_window(marker_frame, marker_frame))
+                        || (jump_frame > abs_frame && in_lead_window(jump_frame, jump_anchor));
+                    // A count is never chained, it plays on its own beat; but
+                    // inside a lead-in that already counts it would be said
+                    // twice, so the section's count-in wins there.
+                    const bool chained = cue->kind == MarkerKind::Count
+                        ? (in_lead && count_in)
+                        : in_lead;
                     if (!chained) {
                         // Only count an announcement when there is actually a clip
                         // for this cue in the loaded language (an absent recording
                         // is a silent slot, not a fired announcement).
-                        if (const VoiceGuideClip* clip = bank->cue_for(cue->kind)) {
+                        if (const VoiceGuideClip* clip = bank->cue_for(cue->kind, cue->variant)) {
                             trigger_clip(clip, 0.9f, sample_rate, bank);
                             announcements_fired_.fetch_add(1, std::memory_order_relaxed);
                         }

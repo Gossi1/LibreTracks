@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { useRef } from "react";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import {
   moveId,
@@ -102,6 +102,13 @@ describe("useSongReorder", () => {
       value: TestPointerEvent,
     });
   });
+  // A fake-timer test must not leave the clock frozen for the rest, nor drop
+  // its pending timers: the drop's setTimeout(0) is what removes the listener
+  // that swallows the click after a drag, and lost it would eat later clicks.
+  afterEach(() => {
+    if (vi.isFakeTimers()) vi.runOnlyPendingTimers();
+    vi.useRealTimers();
+  });
   afterAll(() => {
     Object.defineProperty(window, "PointerEvent", {
       configurable: true,
@@ -140,6 +147,25 @@ describe("useSongReorder", () => {
     expect(lift()).toBeNull();
   });
 
+  // The song lists are at the top now: a finger on the grip drags at once,
+  // with no hold first.
+  it("a finger drags from the grip right away", () => {
+    const onReorder = vi.fn();
+    const { container } = render(<Harness ids={["a", "b", "c"]} onReorder={onReorder} />);
+    layOut(container);
+    const touch = { pointerId: 3, pointerType: "touch", button: 0 };
+
+    act(() => {
+      fireEvent.pointerDown(screen.getByTestId("grip-a"), { ...touch, clientX: 50 });
+    });
+    expect(lift()).not.toBeNull();
+    act(() => {
+      fireEvent.pointerMove(window, { ...touch, clientX: 300 });
+      fireEvent.pointerUp(window, { ...touch, clientX: 300 });
+    });
+    expect(onReorder).toHaveBeenCalledWith("a", 2);
+  });
+
   it("keeps the preview until the new order renders, then lets go at once", () => {
     const { container, rerender } = render(
       <Harness ids={["a", "b", "c"]} onReorder={vi.fn()} />,
@@ -147,11 +173,16 @@ describe("useSongReorder", () => {
     layOut(container);
     const touch = { pointerId: 3, pointerType: "touch", button: 0 };
 
+    vi.useFakeTimers();
     act(() => {
       fireEvent.pointerDown(screen.getByTestId("grip-a"), { ...touch, clientX: 50 });
       fireEvent.pointerMove(window, { ...touch, clientX: 300 });
       fireEvent.pointerUp(window, { ...touch, clientX: 300 });
     });
+    // Only the drop's setTimeout(0): the 250 ms fallback that would drop the
+    // preview is exactly what this test checks has not happened yet.
+    vi.advanceTimersByTime(1);
+    vi.useRealTimers();
     // Guardando: la lista sigue enseñando el resultado.
     expect(screen.getByTestId("row-b").style.transform).not.toBe("");
 

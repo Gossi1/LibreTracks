@@ -1,4 +1,5 @@
 import { VideoLibrarySection } from "../video/VideoLibrarySection";
+import { useVideoStore } from "../video/videoStore";
 import {
   useCallback,
   useEffect,
@@ -12,8 +13,13 @@ import {
 import { useTranslation } from "react-i18next";
 import { TOUR_TARGETS } from "../../tutorial/tourTargets";
 
-import { isMobileApp, type LibraryImportProgressEvent } from "../desktopApi";
+import {
+  isMobileApp,
+  type LibraryImportProgressEvent,
+  type VideoAssetSummary,
+} from "../desktopApi";
 import { useDismissOnBack } from "../mobile/backNavigation";
+import { useViewportClampedMenu } from "../hooks/useViewportClampedMenu";
 import { DRAG_THRESHOLD_PX } from "../constants";
 import { getPendingClipLabel, type PendingLibraryAssetSummary } from "./pendingAudioImports";
 import { clientToZoomedCoords } from "../../../shared/uiZoom";
@@ -70,6 +76,8 @@ type LibrarySidebarPanelProps = {
     folderPath: string | null,
     assets: PendingLibraryAssetSummary[],
   ) => void;
+  /** "Organise by song": the unfiled audio goes into one folder per song. */
+  onOrganizeBySong?: () => void;
 };
 
 function formatAssetDuration(durationSeconds: number) {
@@ -98,6 +106,7 @@ export function LibrarySidebarPanel({
   onDeleteRequested,
   onAddSelectionToTimeline,
   onAddFolderToTimeline,
+  onOrganizeBySong,
 }: LibrarySidebarPanelProps) {
   const { t } = useTranslation();
   const [selectedAssetPaths, setSelectedAssetPaths] = useState<string[]>([]);
@@ -192,6 +201,14 @@ export function LibrarySidebarPanel({
   // En Android, atras cierra el menu contextual en vez de salir.
   const closeContextMenu = useCallback(() => setContextMenu(null), []);
   useDismissOnBack(closeContextMenu, contextMenu !== null);
+  // Anclado al cursor, un clic derecho en los últimos audios abría el menú por
+  // debajo del borde de la ventana y no se podía llegar a sus opciones.
+  const contextMenuPosition = useViewportClampedMenu(
+    contextMenuRef,
+    contextMenu,
+    contextMenu?.x ?? 0,
+    contextMenu?.y ?? 0,
+  );
 
   const selectedAssetPathSet = useMemo(() => new Set(selectedAssetPaths), [selectedAssetPaths]);
   const selectedAssets = useMemo(
@@ -392,6 +409,24 @@ export function LibrarySidebarPanel({
     }
 
     return actions;
+  };
+
+  const openVideoContextMenu = (event: MouseEvent<HTMLElement>, asset: VideoAssetSummary) => {
+    const { placeAtPlayhead, deleteAssets } = useVideoStore.getState();
+    const actions: ContextMenuAction[] = [];
+    if (placeAtPlayhead && !asset.isMissing) {
+      actions.push({
+        label: t("transport.video.placeAtPlayhead"),
+        onSelect: () => placeAtPlayhead(asset),
+      });
+    }
+    if (deleteAssets) {
+      actions.push({
+        label: t("transport.video.deleteFromLibrary"),
+        onSelect: () => deleteAssets([asset]),
+      });
+    }
+    if (actions.length) openContextMenu(event, asset.fileName, actions);
   };
 
   const folderContextMenu = (
@@ -778,6 +813,24 @@ export function LibrarySidebarPanel({
                   <strong title={t("library.rootFolder")}>{t("library.rootFolder")}</strong>
                   <small>{t("library.assetsInFolder", { count: rootAssets.length })}</small>
                 </span>
+                {onOrganizeBySong && rootAssets.length > 0 ? (
+                  <button
+                    type="button"
+                    className="lt-library-organize-button"
+                    aria-label={t("library.organize.button")}
+                    title={t("library.organize.hint")}
+                    // Inside the <summary>: without these the press would
+                    // start dragging the group and the click would fold it.
+                    onPointerDown={(event) => event.stopPropagation()}
+                    onClick={(event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      onOrganizeBySong();
+                    }}
+                  >
+                    <span className="material-symbols-outlined">auto_fix_high</span>
+                  </button>
+                ) : null}
               </summary>
               <div className="lt-library-group-list">{renderAssetRows(rootAssets)}</div>
             </details>
@@ -830,7 +883,9 @@ export function LibrarySidebarPanel({
           </div>
         ) : null}
 
-        {isMobileApp ? null : <VideoLibrarySection />}
+        {isMobileApp ? null : (
+          <VideoLibrarySection onAssetContextMenu={openVideoContextMenu} />
+        )}
 
         {contextMenu ? (
           <div
@@ -843,7 +898,11 @@ export function LibrarySidebarPanel({
             style={
               isMobileApp
                 ? undefined
-                : { left: contextMenu.x, top: contextMenu.y }
+                : {
+                    left: contextMenuPosition.left,
+                    top: contextMenuPosition.top,
+                    maxHeight: contextMenuPosition.maxHeight,
+                  }
             }
             onClick={(event) => event.stopPropagation()}
           >

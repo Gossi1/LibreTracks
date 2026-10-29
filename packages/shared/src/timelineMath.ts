@@ -18,7 +18,18 @@ export type TimelineRegion = {
   startSeconds: number;
   endSeconds: number;
   bpm: number;
+  /**
+   * The bpm at `endSeconds` when the region is (part of) a tempo ramp: the
+   * tempo goes linearly in time from `bpm` to it. Absent: a steady tempo.
+   */
+  endBpm?: number;
   timeSignature: string;
+  /**
+   * A time signature marker sits at this region's start, so it begins a new
+   * bar even when the meter does not change (the engine's metronome restarts
+   * the count there too). A tempo marker alone keeps the beat phase going.
+   */
+  startsBar?: boolean;
 };
 
 export type TimelineGrid = {
@@ -49,15 +60,109 @@ export type MusicalPosition = {
   display: string;
 };
 
+/**
+ * A tempo ramp: `startBpm` at `startSeconds` to `endBpm` at `endSeconds`,
+ * linear in time. The same formulas live in `libretracks_core::tempo_ramp`
+ * (Rust) and `tempo_ramp.h` (the engine's metronome): keep the three in step
+ * or the click drifts off the grid inside a ramp.
+ */
+export type TempoRamp = {
+  startSeconds: number;
+  endSeconds: number;
+  startBpm: number;
+  endBpm: number;
+};
+
+function rampSlope(ramp: TempoRamp): number {
+  const span = ramp.endSeconds - ramp.startSeconds;
+  return span > 0 ? (ramp.endBpm - ramp.startBpm) / span : 0;
+}
+
+/** Quarter notes from the ramp's start to `seconds`; past its end the tempo
+ * holds `endBpm`, before its start `startBpm`. */
+function rampQuartersFromStart(ramp: TempoRamp, seconds: number): number {
+  const dt = seconds - ramp.startSeconds;
+  if (dt <= 0) return (dt * ramp.startBpm) / 60;
+  const inside = Math.min(seconds, ramp.endSeconds) - ramp.startSeconds;
+  const quarters = (ramp.startBpm * inside + 0.5 * rampSlope(ramp) * inside * inside) / 60;
+  return quarters + (Math.max(0, seconds - ramp.endSeconds) * ramp.endBpm) / 60;
+}
+
+export function rampBpmAt(ramp: TempoRamp, seconds: number): number {
+  if (seconds <= ramp.startSeconds) return ramp.startBpm;
+  if (seconds >= ramp.endSeconds) return ramp.endBpm;
+  return ramp.startBpm + rampSlope(ramp) * (seconds - ramp.startSeconds);
+}
+
+export function rampQuartersBetween(ramp: TempoRamp, from: number, to: number): number {
+  return rampQuartersFromStart(ramp, to) - rampQuartersFromStart(ramp, from);
+}
+
+/** The instant `quarters` quarter notes after `from` (before it if negative). */
+export function rampSecondsAfter(ramp: TempoRamp, from: number, quarters: number): number {
+  const target = rampQuartersFromStart(ramp, from) + quarters;
+  if (target <= 0) return ramp.startSeconds + (target * 60) / ramp.startBpm;
+  const rampQuarters = rampQuartersFromStart(ramp, ramp.endSeconds);
+  if (target >= rampQuarters) {
+    return ramp.endSeconds + ((target - rampQuarters) * 60) / ramp.endBpm;
+  }
+  // a·dt + k/2·dt² = 60·q, the root that stays finite as k → 0.
+  const a = ramp.startBpm;
+  const q60 = 60 * target;
+  return (
+    ramp.startSeconds + (2 * q60) / (a + Math.sqrt(Math.max(0, a * a + 2 * rampSlope(ramp) * q60)))
+  );
+}
+
 type ResolvedTimelineRegion = TimelineRegion & {
   beatsPerBar: number;
   beatFrames: number;
   barFrames: number;
   beatDurationSeconds: number;
   cumulativeBarsStart: number;
+  /** Set when the region ramps (`endBpm`). */
+  ramp: TempoRamp | null;
+  /** Quarter notes in one beat (4 / beat unit). */
+  quartersPerBeat: number;
 };
 
+/** Beats from the region's start to `seconds`. A steady region counts on the
+ * timebase frames, as it always has; a ramp along its line. */
+function regionBeatsAt(region: ResolvedTimelineRegion, seconds: number): number {
+  if (region.ramp) {
+    return rampQuartersBetween(region.ramp, region.startSeconds, seconds) / region.quartersPerBeat;
+  }
+  return secondsToSignedTimebaseFrames(seconds - region.startSeconds) / region.beatFrames;
+}
+
+/** The instant `beats` beats after the region's start. */
+function regionSecondsAtBeats(region: ResolvedTimelineRegion, beats: number): number {
+  if (region.ramp) {
+    return rampSecondsAfter(region.ramp, region.startSeconds, beats * region.quartersPerBeat);
+  }
+  return region.startSeconds + timebaseFrameDeltaToSeconds(beats * region.beatFrames);
+}
+
 const MUSICAL_POSITION_EPSILON = 1e-9;
+/**
+ * How far (in bars) a time signature marker may sit from a bar line and still
+ * count as on it. Markers placed from audio ("Analizar canción") land on the
+ * click's real downbeat, a few milliseconds off the rounded tempo's grid.
+ */
+const BAR_BOUNDARY_TOLERANCE = 0.02;
+
+/**
+ * Bar count where a time signature marker starts a new bar. Within the
+ * tolerance of a bar line it IS that bar line, instead of adding a sliver of
+ * a bar before it.
+ */
+export function barCountAtTimingBoundary(cumulativeBars: number): number {
+  const nearest = Math.round(cumulativeBars);
+  if (Math.abs(cumulativeBars - nearest) <= BAR_BOUNDARY_TOLERANCE) {
+    return nearest;
+  }
+  return Math.ceil(cumulativeBars - MUSICAL_POSITION_EPSILON);
+}
 
 export function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
@@ -176,9 +281,11 @@ export function getCumulativeMusicalPosition(
   }
 
   const localSeconds = clamp(seconds - region.startSeconds, 0, region.endSeconds - region.startSeconds);
-  const totalFrames = secondsToTimebaseFrames(localSeconds, timebaseHz);
+  const localBeats = region.ramp
+    ? regionBeatsAt(region, region.startSeconds + localSeconds)
+    : secondsToTimebaseFrames(localSeconds, timebaseHz) / region.beatFrames;
   const { barNumber, beatInBar, subBeat } = getPositionFromTotalBeats(
-    region.cumulativeBarsStart * region.beatsPerBar + totalFrames / region.beatFrames,
+    region.cumulativeBarsStart * region.beatsPerBar + localBeats,
     region.beatsPerBar,
   );
 
@@ -494,29 +601,31 @@ export function buildVisibleTimelineGrid(params: TimelineGridParams): TimelineGr
       continue;
     }
 
-    const localVisibleStartFrames = secondsToTimebaseFrames(regionVisibleStart - region.startSeconds);
-    const localVisibleEndFrames = secondsToTimebaseFrames(regionVisibleEnd - region.startSeconds);
     const totalBeatsStart = region.cumulativeBarsStart * region.beatsPerBar;
     const startBeatOrdinal = Math.max(
       0,
-      Math.floor(totalBeatsStart + localVisibleStartFrames / region.beatFrames) - 1,
+      Math.floor(totalBeatsStart + Math.max(0, regionBeatsAt(region, regionVisibleStart))) - 1,
     );
     const endBeatOrdinal = Math.max(
       startBeatOrdinal,
-      Math.ceil(totalBeatsStart + localVisibleEndFrames / region.beatFrames) + 1,
+      Math.ceil(totalBeatsStart + Math.max(0, regionBeatsAt(region, regionVisibleEnd))) + 1,
     );
 
     for (let beatOrdinal = startBeatOrdinal; beatOrdinal <= endBeatOrdinal; beatOrdinal += 1) {
-      const seconds =
-        region.startSeconds +
-        timebaseFrameDeltaToSeconds((beatOrdinal - totalBeatsStart) * region.beatFrames);
+      const seconds = regionSecondsAtBeats(region, beatOrdinal - totalBeatsStart);
       if (seconds < visibleStartSeconds - region.beatDurationSeconds || seconds > safeDuration + region.beatDurationSeconds) {
         continue;
       }
       if (seconds < region.startSeconds - timebaseFramesToSeconds(1)) {
         continue;
       }
-      if (seconds >= region.endSeconds - timebaseFramesToSeconds(1)) {
+      // A beat a hair before the next region's start is that region's first
+      // bar line (see barCountAtTimingBoundary): drawing both doubles it.
+      const endGuardSeconds = Math.max(
+        timebaseFramesToSeconds(1),
+        BAR_BOUNDARY_TOLERANCE * region.beatDurationSeconds * region.beatsPerBar,
+      );
+      if (seconds >= region.endSeconds - endGuardSeconds) {
         continue;
       }
 
@@ -635,13 +744,11 @@ export function snapToTimelineGrid(
 
     const region = resolveTimelineRegionAtSeconds(seconds, resolvedRegions) ?? resolvedRegions[0];
     if (region) {
-      const localFrames = secondsToTimebaseFrames(seconds - region.startSeconds);
-      const totalBeats = region.cumulativeBarsStart * region.beatsPerBar + localFrames / region.beatFrames;
-      const snappedTotalBeats = Math.round(totalBeats);
-      const snappedFrames =
-        (snappedTotalBeats - region.cumulativeBarsStart * region.beatsPerBar) * region.beatFrames;
+      const totalBeatsStart = region.cumulativeBarsStart * region.beatsPerBar;
+      const localBeats = Math.max(0, regionBeatsAt(region, seconds));
+      const snappedTotalBeats = Math.round(totalBeatsStart + localBeats);
       return clamp(
-        region.startSeconds + timebaseFramesToSeconds(snappedFrames),
+        Math.max(region.startSeconds, regionSecondsAtBeats(region, snappedTotalBeats - totalBeatsStart)),
         region.startSeconds,
         region.endSeconds,
       );
@@ -682,16 +789,11 @@ export function snapToTimelineBar(
 
     const region = resolveTimelineRegionAtSeconds(seconds, resolvedRegions) ?? resolvedRegions[0];
     if (region) {
-      const localFrames = secondsToTimebaseFrames(seconds - region.startSeconds);
-      const totalBars =
-        region.cumulativeBarsStart + localFrames / (region.beatFrames * region.beatsPerBar);
-      const snappedTotalBars = Math.round(totalBars);
-      const localTargetFrames =
-        (snappedTotalBars - region.cumulativeBarsStart) *
-        region.beatFrames *
-        region.beatsPerBar;
+      const localBars = Math.max(0, regionBeatsAt(region, seconds)) / region.beatsPerBar;
+      const snappedTotalBars = Math.round(region.cumulativeBarsStart + localBars);
+      const targetBeats = (snappedTotalBars - region.cumulativeBarsStart) * region.beatsPerBar;
       return clamp(
-        region.startSeconds + timebaseFramesToSeconds(localTargetFrames),
+        Math.max(region.startSeconds, regionSecondsAtBeats(region, targetBeats)),
         region.startSeconds,
         region.endSeconds,
       );
@@ -733,22 +835,26 @@ export function nextDownbeatAfter(
       resolveTimelineRegionAtSeconds(seconds, resolvedRegions) ??
       resolvedRegions[resolvedRegions.length - 1];
     if (region) {
-      const localFrames = secondsToTimebaseFrames(seconds - region.startSeconds);
-      const totalBeats =
-        region.cumulativeBarsStart * region.beatsPerBar +
-        localFrames / region.beatFrames;
+      const totalBeatsStart = region.cumulativeBarsStart * region.beatsPerBar;
+      const totalBeats = totalBeatsStart + Math.max(0, regionBeatsAt(region, seconds));
       const totalBars = totalBeats / region.beatsPerBar;
       // Ceil to land *on or after* the requested seconds. The epsilon
       // prevents floating drift from spuriously bumping an already-on-bar
       // position to the next one.
       const targetBars = Math.ceil(totalBars - MUSICAL_POSITION_EPSILON);
       const targetTotalBeats = targetBars * region.beatsPerBar;
-      const localTargetFrames =
-        (targetTotalBeats - region.cumulativeBarsStart * region.beatsPerBar) *
-        region.beatFrames;
-      return (
-        region.startSeconds + timebaseFramesToSeconds(localTargetFrames)
+      const downbeat = Math.max(
+        region.startSeconds,
+        regionSecondsAtBeats(region, targetTotalBeats - totalBeatsStart),
       );
+      // Past this region's end the next one rules: it may restart the bar
+      // before this region's grid gets there (a song after one that does
+      // not end on a whole bar).
+      const next = resolvedRegions[resolvedRegions.indexOf(region) + 1];
+      if (next && seconds < next.startSeconds && downbeat > next.startSeconds + MUSICAL_POSITION_EPSILON) {
+        return nextDownbeatAfter(next.startSeconds, bpm, timeSignature, regions);
+      }
+      return downbeat;
     }
   }
 
@@ -769,7 +875,12 @@ function normalizeTimelineRegions(
       startSeconds: Math.max(0, region.startSeconds),
       endSeconds: Math.max(0, region.endSeconds),
       bpm: clampPositive(region.bpm, params.bpm),
+      endBpm:
+        region.endBpm !== undefined && Number.isFinite(region.endBpm) && region.endBpm > 0
+          ? region.endBpm
+          : undefined,
       timeSignature: region.timeSignature || params.timeSignature,
+      startsBar: region.startsBar ?? false,
     }))
     .filter((region) => region.endSeconds > region.startSeconds)
     .sort((left, right) => left.startSeconds - right.startSeconds);
@@ -778,7 +889,9 @@ function normalizeTimelineRegions(
     startSeconds: 0,
     endSeconds: Math.max(0, params.durationSeconds),
     bpm: clampPositive(params.bpm, 120),
+    endBpm: undefined,
     timeSignature: params.timeSignature,
+    startsBar: false,
   };
 
   const authoritativeRegions = inputRegions.length ? inputRegions : [fallbackRegion];
@@ -788,24 +901,43 @@ function normalizeTimelineRegions(
   let previousTimeSignature: string | null = null;
 
   for (const region of authoritativeRegions) {
-    const { beatsPerBar } = parseTimeSignature(region.timeSignature);
+    const { beatsPerBar, beatUnit } = parseTimeSignature(region.timeSignature);
     const beatFrames = getBeatFrames(region.bpm, region.timeSignature);
     const barFrames = beatFrames * beatsPerBar;
     const beatDurationSeconds = timebaseFramesToSeconds(beatFrames);
+    const ramp: TempoRamp | null =
+      region.endBpm !== undefined && region.endBpm !== region.bpm
+        ? {
+            startSeconds: region.startSeconds,
+            endSeconds: region.endSeconds,
+            startBpm: region.bpm,
+            endBpm: region.endBpm,
+          }
+        : null;
 
-    if (previousTimeSignature && previousTimeSignature !== region.timeSignature) {
-      cumulativeBarsStart = Math.ceil(cumulativeBarsStart - MUSICAL_POSITION_EPSILON);
+    // A meter change, or any time signature marker, starts a bar. A tempo
+    // change alone keeps the beat phase (see the "mid-beat" test).
+    if (
+      previousTimeSignature &&
+      (previousTimeSignature !== region.timeSignature || region.startsBar)
+    ) {
+      cumulativeBarsStart = barCountAtTimingBoundary(cumulativeBarsStart);
     }
 
-    resolvedRegions.push({
+    const resolved: ResolvedTimelineRegion = {
       ...region,
       beatsPerBar,
       beatFrames,
       barFrames,
       beatDurationSeconds,
       cumulativeBarsStart,
-    });
-    cumulativeBarsStart += secondsToTimebaseFrames(region.endSeconds - region.startSeconds) / barFrames;
+      ramp,
+      quartersPerBeat: 4 / beatUnit,
+    };
+    resolvedRegions.push(resolved);
+    cumulativeBarsStart += ramp
+      ? regionBeatsAt(resolved, region.endSeconds) / beatsPerBar
+      : secondsToTimebaseFrames(region.endSeconds - region.startSeconds) / barFrames;
     previousTimeSignature = region.timeSignature;
   }
 

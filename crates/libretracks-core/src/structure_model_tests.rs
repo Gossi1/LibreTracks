@@ -21,6 +21,7 @@ fn marker(id: &str, start: f64, kind: MarkerKind) -> Marker {
 fn full_structure() -> SongStructure {
     SongStructure {
         original: OriginalSnapshot {
+            keys: None,
             origin_seconds: 0.0,
             duration_seconds: 16.0,
             base_bpm: 120.0,
@@ -66,6 +67,7 @@ fn full_structure() -> SongStructure {
                 id: "t1".into(),
                 start_seconds: 0.0,
                 bpm: 120.0,
+                ramp: false,
             }],
             time_signature_markers: vec![TimeSignatureMarker {
                 id: "ts1".into(),
@@ -128,6 +130,7 @@ fn full_structure() -> SongStructure {
 
 fn region_with(structure: Option<SongStructure>) -> SongRegion {
     SongRegion {
+        key_changes: Vec::new(),
         id: "r1".into(),
         name: "Canción".into(),
         start_seconds: 10.0,
@@ -138,6 +141,8 @@ fn region_with(structure: Option<SongStructure>) -> SongRegion {
         warp_source_bpm: None,
         master: SongMaster::default(),
         compact_column_width_rem: None,
+        chart: None,
+        voice_guide_count_style: None,
         structure,
     }
 }

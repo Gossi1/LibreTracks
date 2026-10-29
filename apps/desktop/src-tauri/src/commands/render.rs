@@ -459,6 +459,7 @@ impl RenderJob<'_> {
                 volume: self.settings.voice_guide_volume as f32,
                 lead_bars: self.settings.voice_guide_lead_bars,
                 count_in_enabled: self.settings.voice_guide_count_in_enabled,
+                count_style: self.settings.voice_guide_count_style.as_engine_value(),
                 voices_dir: dir.clone(),
                 lang: self.settings.voice_guide_language.clone(),
             }),
@@ -476,6 +477,7 @@ impl RenderJob<'_> {
             normalize_peak_db: -0.3,
             apply_mixer: request.apply_mixer,
             dither: true,
+            measure_loudness: false,
             metronome: request
                 .include_metronome
                 .then(|| crate::audio::engine::metronome_render_config(self.settings)),

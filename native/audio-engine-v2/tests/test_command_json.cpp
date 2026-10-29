@@ -38,6 +38,36 @@ TEST_CASE("parse SetPauseAtSongEnd in both directions") {
     CHECK_FALSE(std::get<CmdSetPauseAtSongEnd>(off).enabled);
 }
 
+TEST_CASE("parse SetSongGapVamp and EndSongGapVamp") {
+    auto on = command_from_json(R"({"type":"SetSongGapVamp","enabled":true})");
+    REQUIRE(std::holds_alternative<CmdSetSongGapVamp>(on));
+    CHECK(std::get<CmdSetSongGapVamp>(on).enabled);
+
+    auto off = command_from_json(R"({"type":"SetSongGapVamp","enabled":false})");
+    REQUIRE(std::holds_alternative<CmdSetSongGapVamp>(off));
+    CHECK_FALSE(std::get<CmdSetSongGapVamp>(off).enabled);
+
+    auto end = command_from_json(R"({"type":"EndSongGapVamp"})");
+    CHECK(std::holds_alternative<CmdEndSongGapVamp>(end));
+}
+
+TEST_CASE("parse SetTrackMeterMode: camelCase names, unknown falls back to postFader") {
+    auto mode_of = [](const char* json) {
+        auto cmd = command_from_json(json);
+        REQUIRE(std::holds_alternative<CmdSetTrackMeterMode>(cmd));
+        return std::get<CmdSetTrackMeterMode>(cmd).mode;
+    };
+    CHECK(mode_of(R"({"type":"SetTrackMeterMode","mode":"postFader"})") == 0);
+    CHECK(mode_of(R"({"type":"SetTrackMeterMode","mode":"postPan"})") == 1);
+    CHECK(mode_of(R"({"type":"SetTrackMeterMode","mode":"preFader"})") == 2);
+    CHECK(mode_of(R"({"type":"SetTrackMeterMode","mode":"nope"})") == 0);
+    CHECK(mode_of(R"({"type":"SetTrackMeterMode"})") == 0);
+
+    auto again = command_from_json(command_to_json(CmdSetTrackMeterMode{2}));
+    REQUIRE(std::holds_alternative<CmdSetTrackMeterMode>(again));
+    CHECK(std::get<CmdSetTrackMeterMode>(again).mode == 2);
+}
+
 TEST_CASE("parse Pause command") {
     auto cmd = command_from_json(R"({"type":"Pause"})");
     CHECK(std::holds_alternative<CmdPause>(cmd));
@@ -170,7 +200,8 @@ TEST_CASE("parse SetSongTiming") {
         "bpm":132.5,
         "beats_per_bar":7,
         "beat_unit":8,
-        "tempo_markers":[{"id":"tempo_a","frame":96000,"bpm":99.0}],
+        "tempo_markers":[{"id":"tempo_a","frame":96000,"bpm":99.0},
+                         {"id":"tempo_b","frame":192000,"bpm":80.0,"ramp":true}],
         "time_signature_markers":[{"id":"sig_a","frame":144000,"beats_per_bar":3,"beat_unit":4}]
     })");
     REQUIRE(std::holds_alternative<CmdSetSongTiming>(cmd));
@@ -179,10 +210,13 @@ TEST_CASE("parse SetSongTiming") {
     CHECK(c.bpm == doctest::Approx(132.5));
     CHECK(c.beats_per_bar == 7);
     CHECK(c.beat_unit == 8);
-    REQUIRE(c.tempo_markers.size() == 1);
+    REQUIRE(c.tempo_markers.size() == 2);
     CHECK(c.tempo_markers[0].id == "tempo_a");
     CHECK(c.tempo_markers[0].frame == 96000);
     CHECK(c.tempo_markers[0].bpm == doctest::Approx(99.0));
+    // No "ramp" field: a step, as every session before ramps.
+    CHECK_FALSE(c.tempo_markers[0].ramp);
+    CHECK(c.tempo_markers[1].ramp);
     REQUIRE(c.time_signature_markers.size() == 1);
     CHECK(c.time_signature_markers[0].id == "sig_a");
     CHECK(c.time_signature_markers[0].beats_per_bar == 3);
@@ -273,6 +307,81 @@ TEST_CASE("parse SetSongTimelineWindow keeps region master_gain") {
     auto& l = std::get<CmdSetSongTimelineWindow>(legacy);
     REQUIRE(l.regions.size() == 1);
     CHECK(l.regions[0].master_gain == doctest::Approx(1.0f));
+}
+
+// Song fades ride along with the master gain through all three region parsers
+// (SetSongRegions, SetSongTimelineWindow, UpsertSongTracks). A parser that drops
+// them silently turns the song's fades off on that path.
+TEST_CASE("every region parser keeps the song fades") {
+    const char* region = R"({"id":"reg1","name":"A","start_frame":0,"end_frame":480000,
+                             "master_gain":0.8,"fade_in_frames":4800,"fade_out_frames":9600})";
+    auto check = [](const auto& regions) {
+        REQUIRE(regions.size() == 1);
+        CHECK(regions[0].fade_in_frames == 4800);
+        CHECK(regions[0].fade_out_frames == 9600);
+    };
+    const std::string tail = R"(,"markers":[],"bpm":128.0,"beats_per_bar":4,"beat_unit":4,
+                                "tempo_markers":[],"time_signature_markers":[]})";
+
+    auto regions_cmd = command_from_json(
+        std::string(R"({"type":"SetSongRegions","song_id":"s","regions":[)") + region + "]}");
+    check(std::get<CmdSetSongRegions>(regions_cmd).regions);
+
+    auto window_cmd = command_from_json(
+        std::string(R"({"type":"SetSongTimelineWindow","song_id":"s","clips":[],"regions":[)")
+        + region + "]" + tail);
+    check(std::get<CmdSetSongTimelineWindow>(window_cmd).regions);
+
+    auto upsert_cmd = command_from_json(
+        std::string(R"({"type":"UpsertSongTracks","song_id":"s","tracks":[],"sources":[],"regions":[)")
+        + region + "]" + tail);
+    check(std::get<CmdUpsertSongTracks>(upsert_cmd).regions);
+}
+
+// The per-song voice-guide count style rides the same three region parsers. A
+// parser that drops it makes the song fall back to the global count style on
+// that path (e.g. after a warp/transpose edit), which is the desync that the
+// master_gain bug already showed.
+TEST_CASE("every region parser keeps the voice-guide count style") {
+    const char* region = R"({"id":"reg1","name":"A","start_frame":0,"end_frame":480000,
+                             "voice_guide_count_style":2})";
+    const char* legacy = R"({"id":"reg2","name":"B","start_frame":480000,"end_frame":960000})";
+    auto check = [](const auto& regions) {
+        REQUIRE(regions.size() == 2);
+        CHECK(regions[0].voice_guide_count_style == 2);
+        CHECK(regions[1].voice_guide_count_style == -1);   // absent = follow global
+    };
+    const std::string list = std::string(region) + "," + legacy;
+    const std::string tail = R"(,"markers":[],"bpm":128.0,"beats_per_bar":4,"beat_unit":4,
+                                "tempo_markers":[],"time_signature_markers":[]})";
+
+    auto regions_cmd = command_from_json(
+        std::string(R"({"type":"SetSongRegions","song_id":"s","regions":[)") + list + "]}");
+    check(std::get<CmdSetSongRegions>(regions_cmd).regions);
+
+    auto window_cmd = command_from_json(
+        std::string(R"({"type":"SetSongTimelineWindow","song_id":"s","clips":[],"regions":[)")
+        + list + "]" + tail);
+    check(std::get<CmdSetSongTimelineWindow>(window_cmd).regions);
+
+    auto upsert_cmd = command_from_json(
+        std::string(R"({"type":"UpsertSongTracks","song_id":"s","tracks":[],"sources":[],"regions":[)")
+        + list + "]" + tail);
+    check(std::get<CmdUpsertSongTracks>(upsert_cmd).regions);
+}
+
+TEST_CASE("parse SetVoiceGuideConfig keeps the count style and round-trips it") {
+    auto cmd = command_from_json(
+        R"({"type":"SetVoiceGuideConfig","enabled":true,"volume":1.0,"route":"monitor",)"
+        R"("lead_bars":1,"count_in_enabled":true,"count_style":1})");
+    CHECK(std::get<CmdSetVoiceGuideConfig>(cmd).count_style == 1);
+    auto again = command_from_json(command_to_json(cmd));
+    CHECK(std::get<CmdSetVoiceGuideConfig>(again).count_style == 1);
+
+    // Older hosts never send it: the original "1 2 3 4".
+    auto legacy = command_from_json(
+        R"({"type":"SetVoiceGuideConfig","enabled":true,"volume":1.0})");
+    CHECK(std::get<CmdSetVoiceGuideConfig>(legacy).count_style == 0);
 }
 
 TEST_CASE("parse SetTrackGain") {

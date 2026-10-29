@@ -1,3 +1,5 @@
+import { GUEST_MIRRORED_EVENTS } from "./guestCommandTable";
+import { guestRouteFor } from "./guestRouting";
 import type {
   AppSettings,
   AudioDeviceStatusEvent,
@@ -34,6 +36,7 @@ import type {
   SystemResourceSnapshot,
   TrackKind,
   TransportLifecycleEvent,
+  SongChart,
   TransportSnapshot,
   VideoClipProps,
   VideoCalibrationGrid,
@@ -51,6 +54,7 @@ import type {
   VideoImportResult,
   VideoLibraryStatus,
   VideoThumbnailStrip,
+  VoiceGuideCountStyle,
   WaveformProgressEvent,
   WaveformReadyEvent,
   WaveformSummaryDto,
@@ -109,8 +113,41 @@ export function setIpcObserver(observer: IpcObserver | null) {
   ipcObserver = observer;
 }
 
-async function invokeCommand<T>(command: string, args?: Record<string, unknown>) {
+// --- Network sessions, guest mirror mode (docs/plans/network-sessions) ---
+//
+// A device that joined a host runs this same UI against the HOST's session:
+// session commands go to the host (which checks the guest's role), the ones
+// about this device stay here, and the session events come relayed from the
+// host under a prefix. Decided once at boot (main.tsx), before anything
+// loads, and the app reloads to enter or leave it, so no screen ever mixes
+// the two sessions.
+let guestMirrorMode = false;
+
+export function setGuestMirrorMode(on: boolean) {
+  guestMirrorMode = on;
+}
+
+export function isGuestMirrorMode() {
+  return guestMirrorMode;
+}
+
+/** The event name to listen to for a session event in the current mode. */
+export function sessionEventName(name: string) {
+  return guestMirrorMode && GUEST_MIRRORED_EVENTS.has(name) ? `link-mirror://${name}` : name;
+}
+
+/** Exported for feature APIs that live in their own module (networkApi). */
+export async function invokeCommand<T>(command: string, args?: Record<string, unknown>) {
   const { invoke } = await import("@tauri-apps/api/core");
+  if (guestMirrorMode) {
+    const route = guestRouteFor(command);
+    if (route === "blocked") {
+      throw new Error("guest:notAvailable");
+    }
+    if (route === "host") {
+      return invoke<T>("link_proxy_invoke", { command, args: args ?? {} });
+    }
+  }
   // Only read the clock when someone is listening: an unobserved call pays a
   // single null check.
   const startedAt = ipcObserver ? performance.now() : 0;
@@ -150,7 +187,7 @@ export async function listenToTransportLifecycle(
   handler: (event: TransportLifecycleEvent) => void,
 ): Promise<() => void> {
   const { listen } = await import("@tauri-apps/api/event");
-  return listen<TransportLifecycleEvent>("transport:lifecycle", (event) => {
+  return listen<TransportLifecycleEvent>(sessionEventName("transport:lifecycle"), (event) => {
     handler(event.payload);
   });
 }
@@ -166,6 +203,23 @@ export async function listenToAppCloseRequested(
   const { listen } = await import("@tauri-apps/api/event");
   return listen("app:close-requested", () => {
     handler();
+  });
+}
+
+/** What a song template organised in the last stem drop, for the toast. */
+export type TemplateDropSummary = { matched: number; unmatched: number };
+
+/**
+ * Fired after a drop of audio files that a song template organised (the
+ * default template, or a session whose tracks carry match aliases). Drops the
+ * template did not touch fire nothing.
+ */
+export async function listenToTemplateDropSummary(
+  handler: (summary: TemplateDropSummary) => void,
+): Promise<() => void> {
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<TemplateDropSummary>("song-template:drop-summary", (event) => {
+    handler(event.payload);
   });
 }
 
@@ -199,7 +253,7 @@ export async function listenToAudioMeters(
   handler: (levels: AudioMeterLevel[]) => void,
 ): Promise<() => void> {
   const { listen } = await import("@tauri-apps/api/event");
-  return listen<AudioMeterLevel[]>("audio:meters", (event) => {
+  return listen<AudioMeterLevel[]>(sessionEventName("audio:meters"), (event) => {
     handler(event.payload);
   });
 }
@@ -244,7 +298,7 @@ export async function listenToRegionMeters(
   handler: (levels: RegionMeterLevel[]) => void,
 ): Promise<() => void> {
   const { listen } = await import("@tauri-apps/api/event");
-  return listen<RegionMeterLevel[]>("audio:region_meters", (event) => {
+  return listen<RegionMeterLevel[]>(sessionEventName("audio:region_meters"), (event) => {
     handler(event.payload);
   });
 }
@@ -274,7 +328,7 @@ export async function listenToProjectLoadProgress(
   handler: (event: ProjectLoadProgressEvent) => void,
 ): Promise<() => void> {
   const { listen } = await import("@tauri-apps/api/event");
-  return listen<ProjectLoadProgressEvent>("project:load-progress", (event) => {
+  return listen<ProjectLoadProgressEvent>(sessionEventName("project:load-progress"), (event) => {
     handler(event.payload);
   });
 }
@@ -283,7 +337,7 @@ async function listenToProjectLoadComplete(
   handler: (event: ProjectLoadCompleteEvent) => void,
 ): Promise<() => void> {
   const { listen } = await import("@tauri-apps/api/event");
-  return listen<ProjectLoadCompleteEvent>("project:load-complete", (event) => {
+  return listen<ProjectLoadCompleteEvent>(sessionEventName("project:load-complete"), (event) => {
     handler(event.payload);
   });
 }
@@ -301,7 +355,7 @@ export async function listenToWaveformReady(
   handler: (event: WaveformReadyEvent) => void,
 ): Promise<() => void> {
   const { listen } = await import("@tauri-apps/api/event");
-  return listen<WaveformReadyEvent>("waveform:ready", (event) => {
+  return listen<WaveformReadyEvent>(sessionEventName("waveform:ready"), (event) => {
     handler(event.payload);
   });
 }
@@ -313,7 +367,7 @@ export async function listenToWaveformProgress(
   handler: (event: WaveformProgressEvent) => void,
 ): Promise<() => void> {
   const { listen } = await import("@tauri-apps/api/event");
-  return listen<WaveformProgressEvent>("waveform:progress", (event) => {
+  return listen<WaveformProgressEvent>(sessionEventName("waveform:progress"), (event) => {
     handler(event.payload);
   });
 }
@@ -322,7 +376,7 @@ export async function listenToSettingsUpdated(
   handler: (settings: AppSettings) => void,
 ): Promise<() => void> {
   const { listen } = await import("@tauri-apps/api/event");
-  return listen<AppSettings>("settings:updated", (event) => {
+  return listen<AppSettings>(sessionEventName("settings:updated"), (event) => {
     handler(event.payload);
   });
 }
@@ -412,7 +466,12 @@ export async function getSongView(
   options?: { includeWaveforms?: boolean },
 ): Promise<SongView | null> {
   const args = {
-    includeWaveforms: options?.includeWaveforms ?? true,
+    // A network-session guest never asks for the peaks inline: with a real
+    // session that is tens of MB in one message over the Wi-Fi (36 MB on the
+    // first test, which a phone could not take). The timeline then fetches
+    // them in small batches (useSongWaveforms), as it already does for any
+    // clip whose peaks are missing.
+    includeWaveforms: guestMirrorMode ? false : (options?.includeWaveforms ?? true),
   };
   const maxAttempts = 6;
 
@@ -842,6 +901,35 @@ export async function updateSongRegionKey(
   });
 }
 
+/** A key change as the UI sends it: timeline view seconds; no `id` = new. */
+export type KeyChangeInput = {
+  id?: string | null;
+  startSeconds: number;
+  key: string;
+};
+
+/**
+ * Replaces a song's key changes (the starting key stays). Changes outside the
+ * song or repeating the key already sounding are dropped. One undo step.
+ */
+export async function setSongRegionKeyChanges(
+  regionId: string,
+  changes: KeyChangeInput[],
+): Promise<TransportSnapshot> {
+  return invokeCommand<TransportSnapshot>("set_song_region_key_changes", {
+    regionId,
+    changes,
+  });
+}
+
+/** Replaces a song's lyrics and chords; `null` removes them. One undo step. */
+export async function setSongRegionChart(
+  regionId: string,
+  chart: SongChart | null,
+): Promise<TransportSnapshot> {
+  return invokeCommand<TransportSnapshot>("set_song_region_chart", { regionId, chart });
+}
+
 /**
  * Persists the width (in rem) of a song's column in the compact view.
  * Pure view state — it never affects playback. Pass `null` to restore the
@@ -862,6 +950,14 @@ export async function upsertSongTempoMarker(
   bpm: number,
 ): Promise<TransportSnapshot> {
   return invokeCommand<TransportSnapshot>("upsert_song_tempo_marker", { startSeconds, bpm });
+}
+
+/** Turn a tempo marker's ramp to the next tempo marker on or off. */
+export async function setSongTempoMarkerRamp(
+  markerId: string,
+  ramp: boolean,
+): Promise<TransportSnapshot> {
+  return invokeCommand<TransportSnapshot>("set_song_tempo_marker_ramp", { markerId, ramp });
 }
 
 export async function deleteSongTempoMarker(markerId: string): Promise<TransportSnapshot> {
@@ -1285,6 +1381,314 @@ export async function listenToRenderAudioProgress(
   });
 }
 
+/** "Nivelar canciones": measure songs as they reach the desk. See
+ * commands/level_songs.rs. */
+export type MeasureSongLoudnessRequest = {
+  regionIds: string[];
+  /** Audio tracks that count: the ones going to the PA, audible. */
+  trackIds: string[];
+};
+
+export type SongLoudness = {
+  regionId: string;
+  /** false: nothing audible among the chosen tracks in this song. */
+  hasSignal: boolean;
+  integratedLufs: number;
+  /** 90th percentile of the short-term (3 s) loudness: the loud parts. */
+  loudLufs: number;
+  loudnessRangeLu: number;
+  /** Linear sample peak of the mix with the song master at unity. */
+  samplePeak: number;
+  /** Chosen tracks with audio inside this song. */
+  tracksWithAudio: string[];
+};
+
+export type MeasureSongLoudnessResult = {
+  cancelled: boolean;
+  songs: SongLoudness[];
+  missingFiles: string[];
+};
+
+export type LevelSongsProgressEvent = {
+  fraction: number;
+  /** Songs already measured: several are measured at once. */
+  songsDone: number;
+  songCount: number;
+};
+
+export async function measureSongLoudness(
+  request: MeasureSongLoudnessRequest,
+): Promise<MeasureSongLoudnessResult> {
+  return invokeCommand<MeasureSongLoudnessResult>("measure_song_loudness", { request });
+}
+
+export async function cancelMeasureSongLoudness(): Promise<void> {
+  await invokeCommand<void>("cancel_measure_song_loudness");
+}
+
+export async function listenToLevelSongsProgress(
+  handler: (event: LevelSongsProgressEvent) => void,
+): Promise<() => void> {
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<LevelSongsProgressEvent>("level-songs-progress", (event) => {
+    handler(event.payload);
+  });
+}
+
+// "Analizar canción": tempo and meter from the song's click track, and the key
+// from its harmonic tracks. See docs/plans/song-analysis/. Positions in
+// `segments` and `warnings` are seconds from the song start; the proposal's
+// markers are absolute session seconds.
+
+export type ClickWarningKind =
+  | "noClick"
+  | "noAccent"
+  | "clickGap"
+  | "variableTempo"
+  | "irregularBar"
+  | "compoundGuess"
+  | "estimatedWithoutClick"
+  | "uncertainTempo"
+  | "unreliableClick"
+  | "freeTempo"
+  | "clickReadAsEighths"
+  | "downbeatFromGuide"
+  | "downbeatFromTempoChange";
+
+export type KeyAnalysis = {
+  /** Sharp spelling like the key picker ("Dm", "F#"); null: no pitched audio. */
+  key: string | null;
+  /** Correlation margin over the runner-up; below 0.1 it is a close call. */
+  confidence: number;
+  /** The runner-up, only when the call is close. */
+  alternative: string | null;
+  /** That close runner-up is the relative major/minor. */
+  relativeDoubt: boolean;
+  /** How far the band is from A = 440 Hz. */
+  tuningCents: number;
+  candidates: { key: string; score: number }[];
+  /**
+   * Where the song changes key, empty when it stays in one. `key` is then the
+   * one that lasts longest. Seconds from the song start.
+   */
+  sections: { startSeconds: number; key: string }[];
+};
+
+export type ClickTempoSegment = {
+  startSeconds: number;
+  /** Quarter-note BPM, like the song's. */
+  bpm: number;
+  beatsPerBar: number;
+  beatUnit: number;
+  bars: number;
+  /** A ramp from `bpm` to this across its bars. */
+  endBpm?: number;
+};
+
+export type ClickAnalysis = {
+  segments: ClickTempoSegment[];
+  warnings: { seconds: number; kind: ClickWarningKind }[];
+  beatCount: number;
+  /** false: the click has no accent and the bar start is a guess. */
+  downbeatKnown: boolean;
+};
+
+export type ProposedTempoMarker = {
+  startSeconds: number;
+  bpm: number;
+  /** Ramps to the next marker's bpm (a ritardando, an accelerando). */
+  ramp?: boolean;
+};
+
+export type ProposedSignatureMarker = {
+  startSeconds: number;
+  signature: string;
+};
+
+export type TempoProposal = {
+  tempoMarkers: ProposedTempoMarker[];
+  signatureMarkers: ProposedSignatureMarker[];
+  currentBpm: number;
+  currentSignature: string;
+  /** The song already has exactly these markers. */
+  unchanged: boolean;
+};
+
+/** The tempo map at one level of detail: its segments and its markers. */
+export type TempoLevel = { segments: ClickTempoSegment[]; proposal: TempoProposal };
+
+/**
+ * One reading of the click. `proposal` follows the click bar by bar;
+ * `simplified` gives a drifting passage one tempo; `initial` keeps only the
+ * tempo the song starts at.
+ */
+export type TempoReading = {
+  analysis: ClickAnalysis;
+  proposal: TempoProposal;
+  simplified: TempoLevel;
+  initial: TempoLevel;
+};
+
+export type AnalyzeSongRequest = {
+  regionId: string;
+  /** The click track. Empty: the tempo comes from `musicTempoTrackIds`. */
+  clickTrackIds: string[];
+  /** No click: estimate the tempo from these tracks. Both empty: no tempo. */
+  musicTempoTrackIds: string[];
+  /** Empty: no key analysis. */
+  keyTrackIds: string[];
+  /** The guide (cue) track. Empty: no section analysis. */
+  guideTrackIds: string[];
+};
+
+/** A section announcement on the guide track (seconds from `renderStartSeconds`). */
+export type GuideAnnouncement = {
+  startSeconds: number;
+  endSeconds: number;
+  group: number;
+  /** A count said on its own: each number and where it starts. */
+  countWords?: { number: number; startSeconds: number }[];
+};
+
+/**
+ * The announcements that are the same recording said again. `labels` are the
+ * markers it names, as voice-clip names (`verse_3`, `drums_in`);
+ * `["count"]` for the count-in of the announcement before it (places
+ * nothing) or `["spoken_count"]` for a count said on its own (a count marker
+ * per number); empty when nothing was recognised and the user names the
+ * group in the review.
+ */
+export type GuideGroup = {
+  labels: string[];
+  /** What speech recognition heard ("Verso 3, entra batería"), when it ran. */
+  transcript: string | null;
+  matchCost: number | null;
+  /** Said with a count-in: a cue here starts a section and goes in the
+   * section lane ("Toda la banda" + "tres, cuatro"). */
+  countedIn?: boolean;
+  occurrences: number;
+  firstStartSeconds: number;
+  firstEndSeconds: number;
+};
+
+export type GuideAnalysis = { announcements: GuideAnnouncement[]; groups: GuideGroup[] };
+
+/** A section marker to write, in rendered-timeline seconds. */
+export type SectionChange = {
+  startSeconds: number;
+  kind: MarkerKind;
+  variant: number | null;
+  name: string;
+  /** "cue": a section kind sharing its spot with a section goes in the cue lane. */
+  categoryOverride?: MarkerCategory | null;
+};
+
+export type AnalyzeSongResult = {
+  cancelled: boolean;
+  regionId: string;
+  /** The song as recorded (stored seconds): where the tempo markers are. */
+  regionStartSeconds: number;
+  regionEndSeconds: number;
+  /** The song's start as it plays (differs with warp/varispeed): the origin
+   * of the guide's times. */
+  renderStartSeconds: number;
+  /** Seconds as it plays per second as recorded. */
+  viewScale: number;
+  tempo:
+    | (TempoReading & {
+        /** A click without accent read as eighths (÷2): one click in two is the
+         * beat. Null when the click has an accent or the tempo is from the music. */
+        asEighths: TempoReading | null;
+      })
+    | null;
+  /** The key in the song's ORIGINAL key: the transpose is taken out. */
+  key: {
+    analysis: KeyAnalysis;
+    currentKey: string | null;
+    transposeSemitones: number;
+  } | null;
+  /** `speechRecognition`: the announcements were read by speech recognition,
+   * not only matched against the app's voice clips. */
+  guide: { analysis: GuideAnalysis; speechRecognition: boolean } | null;
+  missingFiles: string[];
+};
+
+export async function analyzeSong(request: AnalyzeSongRequest): Promise<AnalyzeSongResult> {
+  return invokeCommand<AnalyzeSongResult>("analyze_song", { request });
+}
+
+export type SpeechModelStatus = {
+  /** Speech recognition is built for this platform (desktop today). */
+  supported: boolean;
+  downloaded: boolean;
+  sizeBytes: number;
+};
+
+export async function speechModelStatus(): Promise<SpeechModelStatus> {
+  return invokeCommand<SpeechModelStatus>("speech_model_status");
+}
+
+/** Downloads the speech recognition model once (≈57 MB). */
+export async function downloadSpeechModel(): Promise<SpeechModelStatus> {
+  return invokeCommand<SpeechModelStatus>("download_speech_model");
+}
+
+export async function listenToSpeechModelProgress(
+  handler: (event: { fraction: number }) => void,
+): Promise<() => void> {
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<{ fraction: number }>("speech-model-progress", (event) => {
+    handler(event.payload);
+  });
+}
+
+export async function cancelAnalyzeSong(): Promise<void> {
+  await invokeCommand<void>("cancel_analyze_song");
+}
+
+/** Where "Analizar canción" is: bouncing the tracks, reading the tempo, the
+ * key, or listening to the guide (`done` of `total` announcements). */
+export type SongAnalysisProgress = {
+  fraction: number;
+  stage?: "render" | "tempo" | "key" | "guide" | "done";
+  done?: number | null;
+  total?: number | null;
+};
+
+export async function listenToSongAnalysisProgress(
+  handler: (event: SongAnalysisProgress) => void,
+): Promise<() => void> {
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<SongAnalysisProgress>("song-analysis-progress", (event) => {
+    handler(event.payload);
+  });
+}
+
+/**
+ * Applies the reviewed analysis as ONE undo step: `tempo` replaces the tempo
+ * and meter markers inside the song, `key` sets its original key, `sections`
+ * replaces its section and cue markers, `keyChanges` replaces its key changes
+ * (view seconds). Null leaves that part alone.
+ */
+export async function applySongAnalysis(
+  regionId: string,
+  tempo: {
+    tempoMarkers: ProposedTempoMarker[];
+    signatureMarkers: ProposedSignatureMarker[];
+  } | null,
+  key: string | null,
+  sections: SectionChange[] | null = null,
+  keyChanges: KeyChangeInput[] | null = null,
+): Promise<TransportSnapshot> {
+  return invokeCommand<TransportSnapshot>("apply_song_analysis", {
+    regionId,
+    tempo,
+    key,
+    keyChanges,
+    sections,
+  });
+}
+
 // Export the WHOLE session as a single portable .ltset (every region + library
 // + automation + waveforms, and — in full mode — the clip audio). The "build it
 // at home, open it at the venue" flow. The native save dialog runs on the Rust
@@ -1410,6 +1814,12 @@ export async function resolveMissingFile(
   return invokeCommand<TransportSnapshot>("resolve_missing_file", { oldPath, newPath });
 }
 
+/** Quitar de la sesión un fichero que falta: sus clips y su entrada de la
+ * biblioteca, en un solo paso de deshacer. */
+export async function removeMissingFile(filePath: string): Promise<TransportSnapshot> {
+  return invokeCommand<TransportSnapshot>("remove_missing_file", { filePath });
+}
+
 export async function deleteLibraryAsset(filePath: string): Promise<LibraryAssetSummary[]> {
   return invokeCommand<LibraryAssetSummary[]>("delete_library_asset", { filePath });
 }
@@ -1465,6 +1875,52 @@ export async function pauseTransport(): Promise<TransportSnapshot> {
 
 export async function stopTransport(): Promise<TransportSnapshot> {
   return invokeCommand<TransportSnapshot>("stop_transport");
+}
+
+/**
+ * «Fade out y parar»: fade the playing song out over the configured
+ * `fadeOutStopSeconds`, then stop. Calling it again during the fade stops at
+ * once. A no-op unless playing.
+ */
+export type LibraryDirEntry = {
+  name: string;
+  path: string;
+  kind: "folder" | "audio" | "video" | "package";
+};
+
+/** One level of a disk folder for the folder library: subfolders first, then
+ * the files the app can use. Rejects when the folder is gone. */
+export async function listLibraryDir(path: string): Promise<LibraryDirEntry[]> {
+  return invokeCommand<LibraryDirEntry[]>("list_library_dir", { path });
+}
+
+export type LibraryFolderAudio = {
+  paths: string[];
+  /** Too much audio for one song: `paths` stops at the limit. */
+  truncated: boolean;
+};
+
+/** The audio of a folder added as a song. Looks into subfolders, down to the
+ * first level that has audio in each (the stems of a Reaper project live in
+ * `Media/`). Rejects when the folder is gone. */
+export async function listLibraryFolderAudio(path: string): Promise<LibraryFolderAudio> {
+  return invokeCommand<LibraryFolderAudio>("list_library_folder_audio", { path });
+}
+
+/** Ask the user for a disk folder to add to the folder library. `null` =
+ * cancelled. */
+export async function pickLibraryPlace(): Promise<string | null> {
+  return invokeCommand<string | null>("pick_library_place");
+}
+
+/** A place was removed from the folder library. Android releases the
+ * persistable permission of its tree; elsewhere this does nothing. */
+export async function forgetLibraryPlace(path: string): Promise<void> {
+  return invokeCommand<void>("forget_library_place", { path });
+}
+
+export async function fadeOutAndStop(): Promise<TransportSnapshot> {
+  return invokeCommand<TransportSnapshot>("fade_out_and_stop");
 }
 
 export async function seekTransport(positionSeconds: number): Promise<TransportSnapshot> {
@@ -1627,9 +2083,18 @@ export async function createSongRegion(
  * existing song's end (or at the timeline start when the project has no
  * songs yet) and is itself one bar wide so it shows up in the DAW view.
  * It resizes to fit when the user drops the first clip into it.
+ *
+ * `template` lays the song out from a song template (`"builtin:band"` or a
+ * `.lttemplate` path); without it the default template in Settings applies.
  */
-export async function createEmptySong(name?: string): Promise<TransportSnapshot> {
-  return invokeCommand<TransportSnapshot>("create_empty_song", { name: name ?? null });
+export async function createEmptySong(
+  name?: string,
+  template?: string | null,
+): Promise<TransportSnapshot> {
+  return invokeCommand<TransportSnapshot>("create_empty_song", {
+    name: name ?? null,
+    template: template ?? null,
+  });
 }
 
 export async function updateSongRegion(
@@ -1785,6 +2250,21 @@ export async function updateSongRegionWarp(
 }
 
 /**
+ * Speed a whole song up or down to `bpm` (tempo at its start) without
+ * changing its pitch. Turns warp on in the same step when it was off, and
+ * scales every tempo marker inside the song by the same factor.
+ */
+export async function setSongRegionTempo(
+  regionId: string,
+  bpm: number,
+): Promise<TransportSnapshot> {
+  return invokeCommand<TransportSnapshot>("set_song_region_tempo", {
+    regionId,
+    bpm,
+  });
+}
+
+/**
  * Realtime stream of region master gain during a slider drag. Bridge-only:
  * the engine receives the new value but the model is not written and no
  * snapshot is returned. Call `updateSongRegionMasterGain` on pointer-up to
@@ -1801,6 +2281,36 @@ export async function updateLiveRegionMasterGain(
 }
 
 /**
+ * Set how the voice guide counts into this song's sections; `null` puts the
+ * song back on the global setting. Records undo and returns the new snapshot.
+ */
+export async function updateSongRegionVoiceGuideCountStyle(
+  regionId: string,
+  countStyle: VoiceGuideCountStyle | null,
+): Promise<TransportSnapshot> {
+  return invokeCommand<TransportSnapshot>(
+    "update_song_region_voice_guide_count_style",
+    { regionId, countStyle },
+  );
+}
+
+/**
+ * Set a song's fade in / fade out, in seconds (0 = none). Each is capped at the
+ * song's length. Records undo and returns the new snapshot.
+ */
+export async function updateSongRegionFades(
+  regionId: string,
+  fadeInSeconds: number,
+  fadeOutSeconds: number,
+): Promise<TransportSnapshot> {
+  return invokeCommand<TransportSnapshot>("update_song_region_fades", {
+    regionId,
+    fadeInSeconds,
+    fadeOutSeconds,
+  });
+}
+
+/**
  * Commit the master fader gain for a song region. `masterGain` is a linear
  * multiplier: 1.0 means unity, 0.0 means silent. Must be finite and >= 0.
  */
@@ -1811,6 +2321,15 @@ export async function updateSongRegionMasterGain(
   return invokeCommand<TransportSnapshot>("update_song_region_master_gain", {
     regionId,
     masterGain,
+  });
+}
+
+/** Several song masters in one edit: a single undo restores them all. */
+export async function updateSongRegionMasterGains(
+  gains: { regionId: string; masterGain: number }[],
+): Promise<TransportSnapshot> {
+  return invokeCommand<TransportSnapshot>("update_song_region_master_gains", {
+    gains,
   });
 }
 
@@ -2020,13 +2539,20 @@ export async function deleteMixScene(sceneId: string): Promise<TransportSnapshot
 
 export async function createSectionMarker(
   startSeconds: number,
-  options?: { kind?: MarkerKind; variant?: number | null; name?: string },
+  options?: {
+    kind?: MarkerKind;
+    variant?: number | null;
+    name?: string;
+    /** "cue" puts a section kind in the cue lane (the spot has a section). */
+    categoryOverride?: MarkerCategory | null;
+  },
 ): Promise<TransportSnapshot> {
   return invokeCommand<TransportSnapshot>("create_section_marker", {
     startSeconds,
     kind: options?.kind ?? null,
     variant: options?.variant ?? null,
     name: options?.name ?? null,
+    categoryOverride: options?.categoryOverride ?? null,
   });
 }
 
@@ -2049,6 +2575,35 @@ export async function updateSectionMarker(
 
 export async function deleteSectionMarker(sectionId: string): Promise<TransportSnapshot> {
   return invokeCommand<TransportSnapshot>("delete_section_marker", { sectionId });
+}
+
+/** A ruler marker of any kind: section/cue flags share `Marker`, tempo and
+ * time-signature markers are their own lists. */
+export type RulerMarkerKind = "section" | "tempo" | "timeSignature";
+export type RulerMarkerRef = { kind: RulerMarkerKind; id: string };
+/** A marker and where it should end up (move) or where its copy goes
+ * (duplicate), in view seconds. */
+export type RulerMarkerPlacement = RulerMarkerRef & { startSeconds: number };
+
+/** Moves a multi-selection of ruler markers. One undo step. */
+export async function moveRulerMarkers(
+  moves: RulerMarkerPlacement[],
+): Promise<TransportSnapshot> {
+  return invokeCommand<TransportSnapshot>("move_ruler_markers", { moves });
+}
+
+/** Copies each marker to the given position. One undo step. */
+export async function duplicateRulerMarkers(
+  copies: RulerMarkerPlacement[],
+): Promise<TransportSnapshot> {
+  return invokeCommand<TransportSnapshot>("duplicate_ruler_markers", { copies });
+}
+
+/** Deletes a multi-selection of ruler markers. One undo step. */
+export async function deleteRulerMarkers(
+  markers: RulerMarkerRef[],
+): Promise<TransportSnapshot> {
+  return invokeCommand<TransportSnapshot>("delete_ruler_markers", { markers });
 }
 
 export async function assignSectionMarkerDigit(
@@ -2214,6 +2769,18 @@ export async function updateTrackTransposeEnabled(args: {
   transposeEnabled: boolean;
 }): Promise<TransportSnapshot> {
   return invokeCommand<TransportSnapshot>("update_track_transpose_enabled", args);
+}
+
+/**
+ * Words a song template matches dropped stems against so they land on this
+ * track (or, on a folder, inside it). The backend trims them and drops empty
+ * and repeated ones; an empty list turns matching off for the track.
+ */
+export async function updateTrackMatchAliases(args: {
+  trackId: string;
+  aliases: string[];
+}): Promise<TransportSnapshot> {
+  return invokeCommand<TransportSnapshot>("update_track_match_aliases", args);
 }
 
 /**
@@ -2599,6 +3166,11 @@ export async function listVideoAssets(): Promise<VideoAssetSummary[]> {
   return invokeCommand<VideoAssetSummary[]>("list_video_assets");
 }
 
+/** Take a video out of the session library. Refused while a clip uses it. */
+export async function deleteVideoAsset(filePath: string): Promise<VideoAssetSummary[]> {
+  return invokeCommand<VideoAssetSummary[]>("delete_video_asset", { filePath });
+}
+
 export async function requestVideoThumbnails(
   filePaths: string[],
   urgent: boolean,
@@ -2620,7 +3192,7 @@ export async function listenToVideoThumbnailsReady(
   handler: (event: { filePath: string }) => void,
 ): Promise<() => void> {
   const { listen } = await import("@tauri-apps/api/event");
-  return listen<{ filePath: string }>("video:thumbnails-ready", (event) => {
+  return listen<{ filePath: string }>(sessionEventName("video:thumbnails-ready"), (event) => {
     handler(event.payload);
   });
 }
@@ -2661,6 +3233,10 @@ export async function showVideoTestPattern(on: boolean): Promise<void> {
   return invokeCommand<void>("video_test_pattern", { on });
 }
 
+export async function bringVideoOutputToFront(): Promise<void> {
+  return invokeCommand<void>("video_bring_to_front");
+}
+
 export async function listenToVideoOutputStatus(
   handler: (status: VideoOutputStatus) => void,
 ): Promise<() => void> {
@@ -2672,6 +3248,12 @@ export async function listenToVideoOutputStatus(
 
 export async function getVideoSyncStats(): Promise<VideoSyncStats> {
   return invokeCommand<VideoSyncStats>("video_sync_stats");
+}
+
+/** The playhead is being dragged to `positionSeconds` (view seconds): the
+ * video output shows the frame under it. `null` when the drag ends. */
+export async function setVideoScrub(positionSeconds: number | null): Promise<void> {
+  return invokeCommand<void>("video_scrub", { positionSeconds });
 }
 
 /** Start the latency calibration flash on a beat grid, or stop it (null). */

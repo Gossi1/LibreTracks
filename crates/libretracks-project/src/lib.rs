@@ -86,6 +86,7 @@ mod tests {
             tempo_markers: vec![],
             time_signature_markers: vec![],
             regions: vec![SongRegion {
+                key_changes: Vec::new(),
                 id: "region_intro".into(),
                 name: "Cancion".into(),
                 start_seconds: 0.0,
@@ -96,6 +97,8 @@ mod tests {
                 key: None,
                 master: libretracks_core::SongMaster::default(),
                 compact_column_width_rem: None,
+                chart: None,
+                voice_guide_count_style: None,
                 structure: None,
             }],
             tracks: vec![Track {
@@ -117,6 +120,8 @@ mod tests {
                 midi_enabled: true,
                 collapsed: false,
                 height_offset: None,
+                match_aliases: Vec::new(),
+                song_region_id: None,
             }],
             clips: vec![Clip {
                 id: "clip_click".into(),

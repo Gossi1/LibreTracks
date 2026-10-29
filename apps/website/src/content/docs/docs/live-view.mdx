@@ -11,11 +11,11 @@ import Legend from "../../../components/guide/Legend.astro";
 
 <Legend>
 
-1. **Header**: the song that is playing, its BPM and its key.
+1. **Header**: the song that is playing, its BPM, its key and its progress.
 2. **Performance settings**: marker jump, song jump and Vamp.
 3. **Live markers**: a big button per marker.
-4. **Setlist**: the current song with what is left of it, and the rest of the
-   songs.
+4. **Setlist**: the session's songs in a strip, with the current one
+   highlighted.
 
 </Legend>
 
@@ -25,7 +25,7 @@ Switch views with the three buttons on the bar (`view_timeline` for the DAW view
 
 ### Header
 
-Shows the song that is playing with its elapsed time, its effective BPM and its key, at a size you can read from a distance.
+Shows the song that is playing with its effective BPM, its key and a bar with the time elapsed and what is left, at a size you can read from a distance.
 
 ### Performance settings
 
@@ -34,28 +34,92 @@ The three settings you change on the fly are always visible, with no menus:
 - `Marker jump`: `Immediate`, `After bars` (with its count) or `Next marker`.
 - `Song jump`: `Immediate`, `Song end`, `After bars` or `Next marker`, with the transition set to `Clean` or `Fade`.
 - `Vamp type`: repeat the current `Section` or a number of `Bars`, with the `VAMP` button next to it to enter and leave the loop.
+  Next to `VAMP`, the `Between songs` button turns on [vamp between songs](/docs/tasks/songs/#going-from-one-song-to-the-next-live): when each song ends the click keeps going at its tempo and the pad keeps sounding until you press Play.
 
 These are the same settings as [Live control](/docs/live-control-flow/): changing them here changes them everywhere in the app.
 
 ### Live markers
 
-Every marker in the selected song is a large numbered button, in the colour you gave it on the timeline, with its time from the start of the song. Tapping it schedules the jump using the configured mode. On top of that:
+Every marker in the selected song is a large numbered button, **tinted with the marker's colour** (the one you see on the timeline), so you tell a chorus from a verse at a glance, with its time from the start of the song. Cues get a dimmer tint and a dashed border. Tapping it schedules the jump using the configured mode. On top of that:
 
-- The marker currently playing is highlighted as `Now` and carries its own progress bar.
+- The marker currently playing is highlighted as `Now`, with a turquoise border, and carries its own progress bar.
 - The next one shows a `Next in m:ss` countdown.
-- A jump already scheduled is marked `Queued`, and `Cancel jump` calls it off as long as it hasn't fired.
+- A jump already scheduled is marked `Queued`, with an amber border, and `Cancel jump` calls it off as long as it hasn't fired.
 - Cue markers appear as `Cue` next to the section they fall in, so you read the instruction without hunting for it.
 - With the vamp active, the marker being repeated carries its own `VAMP` badge.
 - The list scrolls itself to keep the playing marker in view.
 
 ### Setlist
 
-The setlist column shows the current song with its progress and the time remaining, and below it the rest of the songs in the session with their play button. Selecting a song shows its markers without jumping to it, so you can line up the next number while the current one plays.
+The setlist is the strip of songs in the header: each song with its number, its name and its play button, and the one playing highlighted. Selecting a song shows its markers without jumping to it, so you can line up the next number while the current one plays. If a song has an [arrangement](/docs/arrangements/) applied, it carries its name (`Arrangement: Sunday`).
 
 To change the order of the setlist, drag a song by its **handle** (the six
 dots on its left): the others move aside to show you where it will land. The
 song moves whole, with its audio, markers and tempo. It is the only thing you
-can edit from Live View.
+can edit from Live View. On a phone, **hold your finger** on the handle for a
+moment before dragging: that way it doesn't clash with the system gesture for
+switching apps (on the iPhone the setlist also sits above the home bar).
+
+To end the playing song with a fade, use **Fade out and stop** in the
+transport bar at the top. See
+[Fade out and stop](/docs/interface/main-screen/#fade-out-and-stop).
+
+## Lyrics and chords
+
+The Live View can show the **lyrics with their chords** next to the markers,
+so the singer and the band can follow them without paper or another app. The
+lyrics **follow the song**: they highlight the line playing and move between
+sections with the markers (also with a jump or a Vamp).
+
+![Lyrics and chords in the Live View](/guide/desktop-en/live-lyrics.png)
+
+<Legend>
+
+1. **Lyrics**: shows or hides the lyrics. The app remembers your choice.
+2. **Tools**: smaller or bigger text, show or hide the chords, record the line
+   times, edit the lyrics, show only the lyrics full width, and close.
+3. **The lyrics**: each section with its name, the line playing highlighted,
+   and the chords above the syllable they fall on.
+
+</Legend>
+
+### Adding a song's lyrics
+
+If the song has no lyrics, the panel offers two ways:
+
+![A song without lyrics](/guide/desktop-en/live-lyrics-empty.png)
+
+- **Import file…**: a chord **PDF**, a **ChordPro** file (`.cho`, `.pro`) or a
+  text with the chords above the lyrics. LibreTracks turns it into text: the
+  PDF is not saved in the session, only the lyrics. A scanned PDF (an image,
+  with no text) can't be converted; in that case, paste the lyrics by hand.
+- **Type or paste**: opens the editor empty.
+
+### Editing the lyrics and the sync
+
+The edit button opens the lyrics in ChordPro format and their link with the
+markers:
+
+![The lyrics and chords editor](/guide/desktop-en/lyrics-editor.png)
+
+- **Text (ChordPro)**: each section starts with `{section: Name}` and chords
+  go in brackets right before the syllable: `[Am]lyrics`. The time on the left
+  of each line, `[m:ss.d]`, says when it starts; change it, or delete it so
+  the lines spread across the section on their own.
+- **Which section plays at each marker**: links each of the song's markers to
+  a section of the lyrics. **Link automatically** does it by the names; a
+  marker with no lyrics (a guitar solo) is left on **— No lyrics —**.
+- **Remove lyrics** deletes them from the song.
+
+To set the times by ear, press the **record line times** button, play the song
+and press **Next line** as each one starts. When you finish they are saved as
+custom times.
+
+Chords **transpose with the song** and are spelled in the key playing in each
+part: if the last chorus [changes key](/docs/tasks/songs/#key-changes), its
+chords come out in the new key. The lyrics can also be shown on the
+[Remote](/docs/remote-control/#designing-your-tabs), with the
+**Lyrics & chords** widget.
 
 ## On Phone And Tablet
 

@@ -5,6 +5,7 @@
 #include <lt_engine/pitch/voice_priming.h>
 #include <lt_engine/render/mix_math.h>
 #include <lt_engine/render/pitch_resolution.h>
+#include <lt_engine/render/region_envelope.h>
 #include <lt_engine/session/session.h>
 #include <lt_engine/session/session_adapter.h>
 #include <lt_engine/sources/audio_decoder.h>
@@ -20,6 +21,7 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdarg>
@@ -494,15 +496,6 @@ std::pair<float, float> effective_gain_pan(const Song& song, const Track& track)
     return {gain, pan};
 }
 
-// Mixer::region_master_gain_at.
-float region_master_gain_at(const Session& session, Frame timeline_frame) noexcept {
-    for (const auto& song : session.songs)
-        for (const auto& region : song.regions)
-            if (timeline_frame >= region.start_frame && timeline_frame < region.end_frame)
-                return region.master_gain;
-    return 1.0f;
-}
-
 const Source* find_source(const Session& session, const Id& id) {
     for (const auto& source : session.sources)
         if (source.id == id) return &source;
@@ -623,33 +616,32 @@ Result<void> render_track(RenderContext& ctx, const Song& song, const Track& tra
 
         if (any) {
             // Mixer phase B for one track, without the per-block ramps (the
-            // controls do not move during a render).
-            float peak_l = 0.0f, peak_r = 0.0f;
-            for (int f = 0; f < n; ++f) {
-                peak_l = std::max(peak_l, std::abs(s.bus_l[static_cast<std::size_t>(f)]));
-                peak_r = std::max(peak_r, std::abs(s.bus_r[static_cast<std::size_t>(f)]));
-            }
-            const bool left_only = peak_l > 1.0e-7f && peak_r <= 1.0e-7f;
-            const bool right_only = peak_r > 1.0e-7f && peak_l <= 1.0e-7f;
+            // controls do not move during a render). A mono source is already
+            // on both sides (decode_window duplicates it); a stereo one is kept
+            // as it is even when one side is silent, as playback does.
             const bool mono_downmix = apply_mixer && track.mono_downmix;
-            const float gain = apply_mixer
-                ? track_gain * region_master_gain_at(ctx.session, timeline_frame)
-                : 1.0f;
             const float left_gain = pan_left_gain(track_pan);
             const float right_gain = pan_right_gain(track_pan);
             float* out_l = acc_l + (timeline_frame - ctx.range_start);
             float* out_r = acc_r + (timeline_frame - ctx.range_start);
+            // Song master gain and fades, per sample: the same envelope the
+            // mixer applies (region_envelope.h), so a render sounds like playback.
+            std::array<float, kRegionEnvelopeChunk> envelope{};
             for (int f = 0; f < n; ++f) {
+                if (f % kRegionEnvelopeChunk == 0) {
+                    fill_region_envelope(ctx.session, timeline_frame + f,
+                                         std::min(kRegionEnvelopeChunk, n - f),
+                                         envelope.data());
+                }
+                const float gain = apply_mixer
+                    ? track_gain * envelope[static_cast<std::size_t>(f % kRegionEnvelopeChunk)]
+                    : 1.0f;
                 float src_l = s.bus_l[static_cast<std::size_t>(f)];
                 float src_r = s.bus_r[static_cast<std::size_t>(f)];
                 if (mono_downmix) {
                     const float summed = 0.5f * (src_l + src_r);
                     src_l = summed;
                     src_r = summed;
-                } else if (left_only) {
-                    src_r = src_l;
-                } else if (right_only) {
-                    src_l = src_r;
                 }
                 out_l[f] += src_l * gain * left_gain;
                 out_r[f] += src_r * gain * right_gain;
@@ -878,7 +870,7 @@ Result<OfflineRenderReport> render_offline(const OfflineRenderRequest& request,
     double units_total = 0.0;
     bool wants_guide = false;
     for (const auto& output : request.outputs) {
-        if (output.path.empty())
+        if (output.path.empty() && !request.measure_loudness)
             return R::err("output path missing");
         std::vector<TrackRef> refs;
         std::unordered_set<Id> seen;
@@ -962,6 +954,21 @@ Result<OfflineRenderReport> render_offline(const OfflineRenderRequest& request,
                 peak = std::max(peak, std::abs(0.5f * (acc_l[i] + acc_r[i])));
         }
 
+        if (request.measure_loudness) {
+            // Before any limiter: the level the mix arrives at, which is what
+            // the song master scales.
+            LoudnessMeter meter(request.sample_rate);
+            meter.process(acc_l.data(), acc_r.data(), acc_l.size());
+            OfflineRenderedFile measured{output.path, total, peak};
+            measured.measured = true;
+            measured.loudness = meter.finish();
+            report.files.push_back(measured);
+            run.units_done += 0.25;
+            if (!run.report_progress(0.0))
+                return fail(kCancelled);
+            continue;
+        }
+
         if (request.normalize && peak > 1.0e-9f) {
             const float target = static_cast<float>(std::pow(10.0, request.normalize_peak_db / 20.0));
             const float g = target / peak;
@@ -1016,9 +1023,10 @@ Result<OfflineRenderRequest> offline_render_request_from_json(const std::string&
         req.normalize_peak_db = j.value("normalize_peak_db", -0.3);
         req.apply_mixer = j.value("apply_mixer", true);
         req.dither = j.value("dither", true);
+        req.measure_loudness = j.value("measure_loudness", false);
         for (const auto& jo : j.at("outputs")) {
             OfflineRenderOutput out;
-            out.path = jo.at("path").get<std::string>();
+            out.path = jo.value("path", std::string());
             out.track_ids = jo.value("track_ids", std::vector<std::string>{});
             out.include_metronome = jo.value("include_metronome", false);
             out.include_voice_guide = jo.value("include_voice_guide", false);
@@ -1042,6 +1050,7 @@ Result<OfflineRenderRequest> offline_render_request_from_json(const std::string&
             req.voice_guide.volume = v.value("volume", 1.0f);
             req.voice_guide.lead_bars = v.value("lead_bars", 1);
             req.voice_guide.count_in_enabled = v.value("count_in_enabled", true);
+            req.voice_guide.count_style = voice_guide_count_style_from_int(v.value("count_style", 0));
             req.voice_guide_dir = v.value("voices_dir", std::string());
             req.voice_guide_lang = v.value("lang", std::string());
         }
@@ -1061,8 +1070,19 @@ std::string offline_render_result_to_json(const Result<OfflineRenderReport>& res
     }
     const auto& report = result.unwrap();
     json files = json::array();
-    for (const auto& f : report.files)
-        files.push_back({{"path", f.path}, {"frames", f.frames}, {"peak", f.peak}});
+    for (const auto& f : report.files) {
+        json file{{"path", f.path}, {"frames", f.frames}, {"peak", f.peak}};
+        if (f.measured) {
+            file["loudness"] = {
+                {"has_signal", f.loudness.has_signal},
+                {"integrated_lufs", f.loudness.integrated_lufs},
+                {"loud_lufs", f.loudness.loud_lufs},
+                {"loudness_range_lu", f.loudness.loudness_range_lu},
+                {"sample_peak", f.loudness.sample_peak},
+            };
+        }
+        files.push_back(std::move(file));
+    }
     out["files"] = files;
     out["missing_clips"] = report.missing_clips;
     out["missing_files"] = report.missing_files;

@@ -1,5 +1,6 @@
 #include <lt_engine/render/metronome_renderer.h>
 #include <lt_engine/devices/device_channel_layout.h>
+#include <lt_engine/session/tempo_ramp.h>
 
 #include <algorithm>
 #include <array>
@@ -50,12 +51,8 @@ std::pair<int, int> signature_at(const Song* song, Frame frame) noexcept {
 
 double bpm_at(const Song* song, Frame frame) noexcept {
     if (!song) return 120.0;
-    double bpm = song->bpm;
-    for (const auto& marker : song->tempo_markers) {
-        if (marker.frame > frame) break;
-        bpm = marker.bpm;
-    }
-    return std::clamp(bpm, 20.0, 300.0);
+    // Inside a ramp, the tempo it has reached at this frame.
+    return tempo_span_at(song, frame).bpm_at(static_cast<double>(frame));
 }
 
 Frame timing_segment_start(const Song* song, Frame frame) noexcept {
@@ -70,6 +67,41 @@ Frame timing_segment_start(const Song* song, Frame frame) noexcept {
         start = std::max(start, marker.frame);
     }
     return start;
+}
+
+// Where the next grid starts after `frame`: a tempo or time signature marker
+// of the song, or the next song (`next_song_start`, -1 for none). -1 when
+// nothing follows.
+Frame next_grid_start(const Song* song, Frame frame, Frame next_song_start) noexcept {
+    Frame next = next_song_start > frame ? next_song_start : -1;
+    const auto earlier = [&](Frame candidate) {
+        if (candidate > frame && (next < 0 || candidate < next)) next = candidate;
+    };
+    for (const auto& marker : song->tempo_markers) {
+        if (marker.frame > frame) {
+            earlier(marker.frame);
+            break;
+        }
+    }
+    for (const auto& marker : song->time_signature_markers) {
+        if (marker.frame > frame) {
+            earlier(marker.frame);
+            break;
+        }
+    }
+    return next;
+}
+
+// A click this close to where the next grid starts (as a share of the space
+// between its clicks) is not played: that grid's own downbeat follows at
+// once. A change of song or tempo a few ms off the old grid ("Digno de
+// adorar" at 71 after 65, 3.5 ms past a beat of the 65) sounded as a double
+// click.
+constexpr double kClickBeforeGridShare = 0.25;
+
+bool lands_on_next_grid(Frame click_frame, double spacing_frames, Frame next_grid) noexcept {
+    return next_grid > click_frame
+        && static_cast<double>(next_grid - click_frame) < kClickBeforeGridShare * spacing_frames;
 }
 
 // The song whose timing map drives the click. Like the ambient pad, the
@@ -354,6 +386,32 @@ void MetronomeRenderer::trigger_voice(const VoiceSpec& spec, double sample_rate)
     v->rng = (trigger_rng_ ^= 0x6d2b79f5u, trigger_rng_ ? trigger_rng_ : 1u);
 }
 
+void MetronomeRenderer::fire_beat(bool downbeat, double sample_rate) noexcept {
+    const bool accent = accent_enabled_.load(std::memory_order_acquire) && downbeat;
+    VoiceSpec spec;
+    if (accent) {
+        // Accent emphasis: built-in freq/duration/gain boost on top of
+        // the chosen accent preset. The default (Sine, +0 st) reproduces
+        // the legacy accent click (1800 Hz / 0.030 s / 0.9) exactly.
+        spec = make_voice_spec(accent_preset_.load(std::memory_order_acquire),
+                               accent_pitch_.load(std::memory_order_acquire), 0.65f);
+        spec.base_freq *= 1800.0 / 1100.0;
+        spec.duration_sec *= 0.030 / 0.022;
+        spec.gain *= 0.9f / 0.65f;
+    } else {
+        spec = make_voice_spec(beat_preset_.load(std::memory_order_acquire),
+                               beat_pitch_.load(std::memory_order_acquire), 0.65f);
+    }
+    trigger_voice(spec, sample_rate);
+}
+
+void MetronomeRenderer::fire_subdivision(double sample_rate) noexcept {
+    VoiceSpec spec = make_voice_spec(subdivision_preset_.load(std::memory_order_acquire),
+                                     subdivision_pitch_.load(std::memory_order_acquire),
+                                     0.65f * subdivision_gain_.load(std::memory_order_acquire));
+    trigger_voice(spec, sample_rate);
+}
+
 void MetronomeRenderer::render(float** output_channels,
                                int num_channels,
                                int num_frames,
@@ -362,6 +420,59 @@ void MetronomeRenderer::render(float** output_channels,
                                const Session* session,
                                const int* active_output_channels,
                                int active_output_channel_count) noexcept {
+    // A song starting inside the block takes the click over on its first
+    // frame: the block is split there, or its downbeat was lost (or late) to
+    // the previous song's grid.
+    std::array<float*, 64> shifted{};
+    int done = 0;
+    while (done < num_frames) {
+        const Frame frame = timeline_frame + done;
+        const Song* song = active_song(session, frame);
+        Frame next_song_start = -1;
+        if (song) {
+            for (const auto& other : session->songs) {
+                if (other.start_frame > song->start_frame
+                    && (next_song_start < 0 || other.start_frame < next_song_start))
+                    next_song_start = other.start_frame;
+            }
+        }
+        int frames = num_frames - done;
+        if (next_song_start > frame && next_song_start < frame + frames)
+            frames = static_cast<int>(next_song_start - frame);
+        float** channels = output_channels;
+        if (done > 0) {
+            if (num_channels > static_cast<int>(shifted.size())) return;
+            for (int ch = 0; ch < num_channels; ++ch)
+                shifted[static_cast<std::size_t>(ch)] = output_channels[ch] + done;
+            channels = shifted.data();
+        }
+        render_song(channels, num_channels, frames, sample_rate, frame, song,
+                    active_output_channels, active_output_channel_count, next_song_start);
+        done += frames;
+    }
+}
+
+void MetronomeRenderer::freeze_timing_at(const Session* session,
+                                         Frame frame,
+                                         Song& out) noexcept {
+    const Song* song = active_song(session, frame);
+    out.start_frame = timing_segment_start(song, frame);
+    out.end_frame = out.start_frame;
+    out.bpm = bpm_at(song, frame);
+    const auto [beats_per_bar, beat_unit] = signature_at(song, frame);
+    out.beats_per_bar = beats_per_bar;
+    out.beat_unit = beat_unit;
+}
+
+void MetronomeRenderer::render_song(float** output_channels,
+                                    int num_channels,
+                                    int num_frames,
+                                    double sample_rate,
+                                    Frame timeline_frame,
+                                    const Song* song,
+                                    const int* active_output_channels,
+                                    int active_output_channel_count,
+                                    Frame next_song_start) noexcept {
     if (num_channels <= 0 || num_frames <= 0 || sample_rate <= 0.0) return;
 
     if (last_render_end_ >= 0 && timeline_frame != last_render_end_)
@@ -380,7 +491,6 @@ void MetronomeRenderer::render(float** output_channels,
         return;
     }
 
-    const Song* song = active_song(session, timeline_frame);
     if (!song) {
         copy_text(muted_reason_, "no_active_song");
         return;
@@ -422,7 +532,8 @@ void MetronomeRenderer::render(float** output_channels,
         if (std::abs(current_output_gain_ - target_gain) < 1.0e-6f)
             current_output_gain_ = target_gain;
         const Frame abs_frame = timeline_frame + f;
-        const double bpm = bpm_at(song, abs_frame);
+        const TempoSpan tempo = tempo_span_at(song, abs_frame);
+        const double bpm = tempo.bpm_at(static_cast<double>(abs_frame));
         const auto [beats_per_bar, beat_unit] = signature_at(song, abs_frame);
         const Frame segment_start = timing_segment_start(song, abs_frame);
         const double quarter_note_frames = sample_rate * 60.0 / bpm;
@@ -433,28 +544,59 @@ void MetronomeRenderer::render(float** output_channels,
         }
 
         const Frame rel = abs_frame - segment_start;
-        if (rel >= 0) {
+        if (rel >= 0 && tempo.is_ramp()) {
+            // Inside a ramp the beats are not evenly spaced: count them along
+            // the ramp from the segment start (the ramp's own marker, or a
+            // time signature marker inside it) and place each one where the
+            // ramp puts it.
+            const double quarters_per_beat = 4.0 / static_cast<double>(beat_unit);
+            const double start = static_cast<double>(segment_start);
+            const double beats =
+                tempo.quarters_between(start, static_cast<double>(abs_frame), sample_rate)
+                / quarters_per_beat;
+            const auto frame_of_beat = [&](double beat) {
+                return static_cast<Frame>(std::llround(
+                    tempo.frame_after(start, beat * quarters_per_beat, sample_rate)));
+            };
+            const int64_t beat_index = static_cast<int64_t>(std::floor(beats + 0.5));
+            const Frame beat_frame = frame_of_beat(static_cast<double>(beat_index));
+            if (beat_frame == abs_frame && beat_frame != last_started_beat_frame_
+                && !lands_on_next_grid(beat_frame, beat_frames,
+                                       next_grid_start(song, abs_frame, next_song_start))) {
+                fire_beat(beat_index % beats_per_bar == 0, sample_rate);
+                last_started_beat_frame_ = beat_frame;
+                last_beat_frame_.store(beat_frame, std::memory_order_release);
+                rendered_clicks_count_.fetch_add(1, std::memory_order_relaxed);
+            }
+            const int subdivision = subdivision_.load(std::memory_order_acquire);
+            const int64_t beat_floor = static_cast<int64_t>(std::floor(beats));
+            if (subdivision >= 2) {
+                for (int k = 1; k < subdivision; ++k) {
+                    const Frame sub_frame = frame_of_beat(
+                        static_cast<double>(beat_floor) + static_cast<double>(k) / subdivision);
+                    if (sub_frame == abs_frame && sub_frame != last_started_sub_frame_
+                        && sub_frame != last_started_beat_frame_
+                        && !lands_on_next_grid(sub_frame, beat_frames / subdivision,
+                                               next_grid_start(song, abs_frame, next_song_start))) {
+                        fire_subdivision(sample_rate);
+                        last_started_sub_frame_ = sub_frame;
+                    }
+                }
+            }
+            next_beat_frame_.store(frame_of_beat(static_cast<double>(beat_floor + 1)),
+                                   std::memory_order_release);
+            current_bar_.store(static_cast<int>(beat_index / beats_per_bar) + 1,
+                               std::memory_order_release);
+            current_beat_.store(static_cast<int>(beat_index % beats_per_bar) + 1,
+                                std::memory_order_release);
+        } else if (rel >= 0) {
             const int64_t beat_index = static_cast<int64_t>(
                 std::floor((static_cast<double>(rel) / beat_frames) + 0.5));
             const Frame beat_frame = rounded_beat_frame(segment_start, beat_frames, beat_index);
-            if (beat_frame == abs_frame && beat_frame != last_started_beat_frame_) {
-                const bool accent = accent_enabled_.load(std::memory_order_acquire)
-                    && (beat_index % beats_per_bar == 0);
-                VoiceSpec spec;
-                if (accent) {
-                    // Accent emphasis: built-in freq/duration/gain boost on top of
-                    // the chosen accent preset. The default (Sine, +0 st) reproduces
-                    // the legacy accent click (1800 Hz / 0.030 s / 0.9) exactly.
-                    spec = make_voice_spec(accent_preset_.load(std::memory_order_acquire),
-                                           accent_pitch_.load(std::memory_order_acquire), 0.65f);
-                    spec.base_freq *= 1800.0 / 1100.0;
-                    spec.duration_sec *= 0.030 / 0.022;
-                    spec.gain *= 0.9f / 0.65f;
-                } else {
-                    spec = make_voice_spec(beat_preset_.load(std::memory_order_acquire),
-                                           beat_pitch_.load(std::memory_order_acquire), 0.65f);
-                }
-                trigger_voice(spec, sample_rate);
+            if (beat_frame == abs_frame && beat_frame != last_started_beat_frame_
+                && !lands_on_next_grid(beat_frame, beat_frames,
+                                       next_grid_start(song, abs_frame, next_song_start))) {
+                fire_beat(beat_index % beats_per_bar == 0, sample_rate);
                 last_started_beat_frame_ = beat_frame;
                 last_beat_frame_.store(beat_frame, std::memory_order_release);
                 rendered_clicks_count_.fetch_add(1, std::memory_order_relaxed);
@@ -471,12 +613,10 @@ void MetronomeRenderer::render(float** output_channels,
                     const Frame sub_frame = segment_start
                         + static_cast<Frame>(std::llround(sub_pos * beat_frames));
                     if (sub_frame == abs_frame && sub_frame != last_started_sub_frame_
-                        && sub_frame != last_started_beat_frame_) {
-                        VoiceSpec spec = make_voice_spec(
-                            subdivision_preset_.load(std::memory_order_acquire),
-                            subdivision_pitch_.load(std::memory_order_acquire),
-                            0.65f * subdivision_gain_.load(std::memory_order_acquire));
-                        trigger_voice(spec, sample_rate);
+                        && sub_frame != last_started_beat_frame_
+                        && !lands_on_next_grid(sub_frame, beat_frames / subdivision,
+                                               next_grid_start(song, abs_frame, next_song_start))) {
+                        fire_subdivision(sample_rate);
                         last_started_sub_frame_ = sub_frame;
                     }
                 }

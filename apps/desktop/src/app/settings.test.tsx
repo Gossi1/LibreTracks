@@ -81,4 +81,57 @@ describe("App / settings", () => {
       ),
     );
   });
+
+  it("track meters are post-fader by default and the Audio selector persists the choice", async () => {
+    const desktopApi = await import("../features/transport/desktopApi");
+    const updateSpy = vi.mocked(desktopApi.updateAudioSettings);
+    updateSpy.mockClear();
+    await renderApp();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /^Settings$/i }));
+    });
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("tab", { name: /^Audio$/i }));
+    });
+
+    const select = (await screen.findByRole("combobox", {
+      name: textMatcher(en.transport.settingsModal.trackMeterMode),
+    })) as HTMLSelectElement;
+    expect(select.value).toBe("postFader");
+
+    await act(async () => {
+      fireEvent.change(select, { target: { value: "postPan" } });
+    });
+
+    await waitFor(() =>
+      expect(updateSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ trackMeterMode: "postPan" }),
+      ),
+    );
+  });
+
+  it("saves live jump settings through the host in guest mirror mode", async () => {
+    const desktopApi = await import("../features/transport/desktopApi");
+    const sharedDesktopApi = await import("@libretracks/shared/desktopApi");
+    const updateSpy = vi.mocked(desktopApi.updateAudioSettings);
+    const saveSpy = vi.mocked(desktopApi.saveSettings);
+    updateSpy.mockClear();
+    saveSpy.mockClear();
+    sharedDesktopApi.setGuestMirrorMode(true);
+
+    try {
+      await renderApp();
+      await chooseMarkerJumpMode(en.transport.jumpMode.nextMarker);
+
+      await waitFor(() =>
+        expect(saveSpy).toHaveBeenCalledWith(
+          expect.objectContaining({ globalJumpMode: "next_marker" }),
+        ),
+      );
+      expect(updateSpy).not.toHaveBeenCalled();
+    } finally {
+      sharedDesktopApi.setGuestMirrorMode(false);
+    }
+  });
 });

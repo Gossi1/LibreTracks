@@ -20,6 +20,7 @@ function setup(overrides: Partial<LibraryHandlerDeps> = {}) {
   const deps: LibraryHandlerDeps = {
     getPlaybackSongDir: () => "/songs/demo",
     getLibraryAssets: () => [],
+    getSong: () => null,
     runAction: vi.fn(async (action) => {
       await action();
     }),
@@ -36,6 +37,8 @@ function setup(overrides: Partial<LibraryHandlerDeps> = {}) {
     importLibraryAssetsFromDialog: vi.fn(async () => null),
     getLibraryFolders: vi.fn(async () => []),
     deleteLibraryAsset: vi.fn(async () => []),
+    removeMissingFile: vi.fn(async () => ({}) as never),
+    applyPlaybackSnapshot: vi.fn(),
     createLibraryFolder: vi.fn(async () => []),
     moveLibraryAsset: vi.fn(async () => []),
     renameLibraryFolder: vi.fn(async () => []),
@@ -48,6 +51,56 @@ function setup(overrides: Partial<LibraryHandlerDeps> = {}) {
 }
 
 describe("createLibraryHandlers", () => {
+  it("removes a missing file that clips still use, clips included", async () => {
+    const song = { clips: [{ filePath: "/a/Gone.wav" }], videoClips: [] } as never;
+    const gone = { ...asset("/a/Gone.wav"), isMissing: true };
+    const { handlers, deps } = setup({ getSong: () => song });
+    await handlers.handleDeleteLibraryAssets([gone, asset("/a/Here.wav")]);
+    expect(deps.confirm).toHaveBeenCalledWith("transport.confirm.removeMissingLibraryAssets");
+    expect(deps.removeMissingFile).toHaveBeenCalledWith("/a/Gone.wav");
+    expect(deps.applyPlaybackSnapshot).toHaveBeenCalled();
+    expect(deps.deleteLibraryAsset).toHaveBeenCalledWith("/a/Here.wav");
+    expect(deps.deleteLibraryAsset).not.toHaveBeenCalledWith("/a/Gone.wav");
+  });
+
+  it("deletes a missing file nothing uses like any other asset", async () => {
+    const gone = { ...asset("/a/Gone.wav"), isMissing: true };
+    const { handlers, deps } = setup({ getSong: () => ({ clips: [] }) as never });
+    await handlers.handleDeleteLibraryAssets([gone]);
+    expect(deps.removeMissingFile).not.toHaveBeenCalled();
+    expect(deps.deleteLibraryAsset).toHaveBeenCalledWith("/a/Gone.wav");
+  });
+
+  it("organises the unfiled audio into one folder per song", async () => {
+    const song = {
+      regions: [{ id: "r1", name: "Oceans", startSeconds: 0, endSeconds: 100 }],
+      clips: [{ filePath: "/a/Drums.wav", timelineStartSeconds: 0, durationSeconds: 90 }],
+    } as never;
+    const { handlers, deps } = setup({
+      getSong: () => song,
+      getLibraryAssets: () => [asset("/a/Drums.wav"), asset("/a/Unused.wav")],
+    });
+    await handlers.handleOrganizeUnfiledBySong();
+    expect(deps.createLibraryFolder).toHaveBeenCalledWith("Oceans");
+    expect(deps.moveLibraryAsset).toHaveBeenCalledWith("/a/Drums.wav", "Oceans");
+    expect(deps.moveLibraryAsset).toHaveBeenCalledTimes(1);
+  });
+
+  it("reuses a folder that already has the song's name", async () => {
+    const song = {
+      regions: [{ id: "r1", name: "Oceans", startSeconds: 0, endSeconds: 100 }],
+      clips: [{ filePath: "/a/Drums.wav", timelineStartSeconds: 0, durationSeconds: 90 }],
+    } as never;
+    const { handlers, deps } = setup({
+      getSong: () => song,
+      getLibraryAssets: () => [asset("/a/Drums.wav")],
+      getLibraryFolders: vi.fn(async () => ["Oceans"]),
+    });
+    await handlers.handleOrganizeUnfiledBySong();
+    expect(deps.createLibraryFolder).not.toHaveBeenCalled();
+    expect(deps.moveLibraryAsset).toHaveBeenCalledWith("/a/Drums.wav", "Oceans");
+  });
+
   it("import is blocked without an active session", async () => {
     const { handlers, deps } = setup({ getPlaybackSongDir: () => null });
     await handlers.handleImportLibraryAssetsClick();

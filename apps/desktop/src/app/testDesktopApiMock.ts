@@ -433,6 +433,7 @@ function buildInitialState(): DesktopApiMockState {
       voiceGuideVolume: 1.0,
       voiceGuideLeadBars: 1,
       voiceGuideCountInEnabled: true,
+      voiceGuideCountStyle: "full",
       voiceGuideLanguage: "es",
       padEnabled: false,
       padId: "",
@@ -448,12 +449,21 @@ function buildInitialState(): DesktopApiMockState {
       songJumpTrigger: "immediate",
       songJumpBars: 4,
       songTransitionMode: "instant",
+      fadeOutStopSeconds: 5,
+      // The jsdom suites exercise the classic library; the folder library has
+      // its own tests.
+      libraryMode: "classic",
+      libraryPlaces: [],
       vampMode: "section",
       vampBars: 4,
       pauseAtSongEnd: false,
+      vampBetweenSongs: false,
+      trackMeterMode: "postFader",
       timelineNavigationScheme: "ableton",
       timelinePlayheadFollowMode: "ahead",
       importMergeMatchingTracks: true,
+      songTrackLayout: "shared",
+      defaultSongTemplate: null,
       autoColorNewTracks: true,
       sessionStorageVolume: null,
       referenceImportedAudio: true,
@@ -860,6 +870,37 @@ export function useEmptySongForTest() {
   state.playbackState = "stopped";
 }
 
+/**
+ * Replace the song's tracks with `count` plain audio tracks named
+ * "Track 1".."Track N" and no clips: a session as big as the 138-track one
+ * from docs/plans/track-virtualization, for the row-window tests.
+ */
+export function useManyTracksSongForTest(
+  count: number,
+  /** Per-track overrides: own heights, folders, collapsed folders. */
+  overrides: (index: number) => Partial<SongView["tracks"][number]> = () => ({}),
+) {
+  replaceSong({
+    ...state.song,
+    tracks: Array.from({ length: count }, (_, index) => ({
+      id: `many-track-${index}`,
+      name: `Track ${index + 1}`,
+      kind: "audio" as const,
+      parentTrackId: null,
+      depth: 0,
+      hasChildren: false,
+      volume: 1,
+      pan: 0,
+      muted: false,
+      solo: false,
+      audioTo: "master",
+      transposeEnabled: false,
+      ...overrides(index),
+    })),
+    clips: [],
+  });
+}
+
 export function emitWaveformReadyForTest(
   filePath: string,
   durationSeconds: number,
@@ -1008,6 +1049,11 @@ export const testDesktopApiMock = {
   // así que el hueco está siempre vacío y nadie emite el evento.
   listenToOpenWithFile: async (_handler: (file: OpenWithFile) => void) => () => {},
   takePendingOpenWithFile: async (): Promise<OpenWithFile | null> => null,
+  // "Reanudar" tras un reposo largo: en los tests el audio nunca se duerme.
+  // Sin esto el AudioIdleWakePrompt llamaba al listen real de Tauri y dejaba
+  // decenas de promesas rechazadas sin manejar, que hacían fallar la suite.
+  listenToAudioIdleWake: async (_handler: () => void) => () => {},
+  takeAudioIdleWake: async (): Promise<boolean> => false,
   listenToMidiRawMessage:
     async (
       _handler: (message: {
@@ -1113,6 +1159,34 @@ export const testDesktopApiMock = {
     });
     return clone(buildSnapshot());
   },
+  setSongRegionKeyChanges: async (
+    regionId: string,
+    changes: { id?: string | null; startSeconds: number; key: string }[],
+  ) => {
+    replaceSong({
+      ...state.song,
+      regions: state.song.regions.map((region) =>
+        region.id === regionId
+          ? {
+              ...region,
+              keyChanges: changes
+                .filter(
+                  (change) =>
+                    change.startSeconds > region.startSeconds &&
+                    change.startSeconds < region.endSeconds,
+                )
+                .sort((left, right) => left.startSeconds - right.startSeconds)
+                .map((change) => ({
+                  id: change.id ?? nextId("key-change"),
+                  startSeconds: change.startSeconds,
+                  key: change.key,
+                })),
+            }
+          : region,
+      ),
+    });
+    return clone(buildSnapshot());
+  },
   upsertSongTempoMarker: async (args: {
     markerId?: string | null;
     startSeconds: number;
@@ -1129,6 +1203,15 @@ export const testDesktopApiMock = {
     replaceSong({
       ...state.song,
       tempoMarkers: nextMarkers,
+    });
+    return clone(buildSnapshot());
+  },
+  setSongTempoMarkerRamp: async (markerId: string, ramp: boolean) => {
+    replaceSong({
+      ...state.song,
+      tempoMarkers: state.song.tempoMarkers.map((marker) =>
+        marker.id === markerId ? { ...marker, ramp } : marker,
+      ),
     });
     return clone(buildSnapshot());
   },
@@ -1261,6 +1344,89 @@ export const testDesktopApiMock = {
     missingFiles: [] as string[],
   }),
   cancelRenderSongAudio: async () => {},
+  measureSongLoudness: async (request: { regionIds: string[]; trackIds: string[] }) => ({
+    cancelled: false,
+    songs: request.regionIds.map((regionId) => ({
+      regionId,
+      hasSignal: request.trackIds.length > 0,
+      integratedLufs: -16,
+      loudLufs: -14,
+      loudnessRangeLu: 5,
+      samplePeak: 0.5,
+      tracksWithAudio: [...request.trackIds],
+    })),
+    missingFiles: [] as string[],
+  }),
+  cancelMeasureSongLoudness: async () => {},
+  analyzeSong: async (request: {
+    regionId: string;
+    clickTrackIds: string[];
+    musicTempoTrackIds: string[];
+    keyTrackIds: string[];
+    guideTrackIds: string[];
+  }) => {
+    const region = state.song.regions.find((candidate) => candidate.id === request.regionId);
+    return {
+      cancelled: false,
+      regionId: request.regionId,
+      regionStartSeconds: region?.startSeconds ?? 0,
+      regionEndSeconds: region?.endSeconds ?? 0,
+      renderStartSeconds: region?.startSeconds ?? 0,
+      viewScale: 1,
+      tempo:
+        request.clickTrackIds.length > 0 || request.musicTempoTrackIds.length > 0
+          ? (() => {
+              const segments = [{ startSeconds: 0, bpm: 120, beatsPerBar: 4, beatUnit: 4, bars: 8 }];
+              const proposal = {
+                tempoMarkers: [],
+                signatureMarkers: [],
+                currentBpm: state.song.bpm,
+                currentSignature: state.song.timeSignature,
+                unchanged: true,
+              };
+              return {
+                analysis: { segments, warnings: [], beatCount: 32, downbeatKnown: true },
+                proposal,
+                simplified: { segments, proposal },
+                initial: { segments, proposal },
+                asEighths: null,
+              };
+            })()
+          : null,
+      guide:
+        request.guideTrackIds.length > 0
+          ? { analysis: { announcements: [], groups: [] }, speechRecognition: false }
+          : null,
+      key:
+        request.keyTrackIds.length > 0
+          ? {
+              analysis: {
+                key: "D",
+                confidence: 0.2,
+                alternative: null,
+                relativeDoubt: false,
+                tuningCents: 0,
+                candidates: [{ key: "D", score: 0.8 }],
+                sections: [],
+              },
+              currentKey: region?.key ?? null,
+              transposeSemitones: region?.transposeSemitones ?? 0,
+            }
+          : null,
+      missingFiles: [] as string[],
+    };
+  },
+  cancelAnalyzeSong: async () => {},
+  speechModelStatus: async () => ({ supported: true, downloaded: false, sizeBytes: 59_707_625 }),
+  downloadSpeechModel: async () => ({ supported: true, downloaded: true, sizeBytes: 59_707_625 }),
+  listenToSpeechModelProgress: async (_handler: (event: { fraction: number }) => void) =>
+    () => {},
+  listenToSongAnalysisProgress: async (_handler: (event: { fraction: number }) => void) =>
+    () => {},
+  applySongAnalysis: async () => clone(buildSnapshot()),
+  listenToLevelSongsProgress: async (
+    _handler: (event: { fraction: number; songsDone: number; songCount: number }) => void,
+  ) => () => {},
   listenToRenderAudioProgress: async (
     _handler: (event: { fraction: number; stage: string }) => void,
   ) => () => {},
@@ -1793,6 +1959,20 @@ export const testDesktopApiMock = {
     });
     return clone(buildSnapshot());
   },
+  updateSongRegionMasterGains: async (
+    gains: { regionId: string; masterGain: number }[],
+  ) => {
+    replaceSong({
+      ...state.song,
+      regions: state.song.regions.map((region) => {
+        const entry = gains.find((gain) => gain.regionId === region.id);
+        return entry
+          ? { ...region, master: { ...region.master, gain: entry.masterGain } }
+          : region;
+      }),
+    });
+    return clone(buildSnapshot());
+  },
   updateSongRegionTranspose: async (
     regionId: string,
     transposeSemitones: number,
@@ -2253,6 +2433,15 @@ export const testDesktopApiMock = {
         track.id === args.trackId
           ? { ...track, name: args.name ?? track.name }
           : track,
+      ),
+    });
+    return clone(buildSnapshot());
+  },
+  updateTrackMatchAliases: async (args: { trackId: string; aliases: string[] }) => {
+    replaceSong({
+      ...state.song,
+      tracks: state.song.tracks.map((track) =>
+        track.id === args.trackId ? { ...track, matchAliases: [...args.aliases] } : track,
       ),
     });
     return clone(buildSnapshot());

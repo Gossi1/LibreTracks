@@ -37,6 +37,14 @@ pub struct TransportSnapshot {
     pub sources: SourceReadinessSummary,
     pub last_drift_sample: Option<TransportDriftSummary>,
     pub project_revision: u64,
+    /// See `DesktopSession::mix_revision`: bumps when automation changes the
+    /// mix, so the UI knows to refetch the tracks' mute/solo/volume/pan.
+    pub mix_revision: u64,
+    /// A «Fade out y parar» is running: the UI lights its button.
+    pub fading_to_stop: bool,
+    /// The vamp between songs is holding: paused on a song end with the click
+    /// still going until Play.
+    pub song_gap_vamp: bool,
     pub song_dir: Option<String>,
     pub song_file_path: Option<String>,
     pub is_native_runtime: bool,
@@ -330,6 +338,12 @@ pub struct SongRegionSummary {
     pub master: SongMasterSummary,
     /// Persisted compact-view column width in rem; `None` = use the default.
     pub compact_column_width_rem: Option<f64>,
+    /// Partitura PDF de la canción y sus puntos por marca; `None` sin partitura.
+    pub chart: Option<libretracks_core::SongChart>,
+    /// Estilo de conteo de la voz guía propio de la canción; `None` = el global.
+    pub voice_guide_count_style: Option<libretracks_core::VoiceGuideCountStyle>,
+    /// Cambios de nota dentro de la canción, ordenados; `key` es la inicial.
+    pub key_changes: Vec<KeyChangeSummary>,
     /// Lo que pinta el editor de arreglos. No lleva la instantánea del
     /// original, que puede ser grande: sólo secciones y arreglos.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -430,6 +444,8 @@ pub struct DroppedArrangementBlocksSummary {
 #[serde(rename_all = "camelCase")]
 pub struct SongMasterSummary {
     pub gain: f64,
+    pub fade_in_seconds: f64,
+    pub fade_out_seconds: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -439,6 +455,7 @@ pub struct TempoMarkerSummary {
     pub start_seconds: f64,
     pub source_start_seconds: f64,
     pub bpm: f64,
+    pub ramp: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -482,6 +499,10 @@ pub struct TrackSummary {
     /// the arrangement can keep one track tall among collapsed ones. `None`
     /// = the track just follows the global height.
     pub height_offset: Option<i32>,
+    /// Words a dropped stem's file name is matched against to land here.
+    pub match_aliases: Vec<String>,
+    /// The song this track was created for; `None` = shared by every song.
+    pub song_region_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -819,6 +840,8 @@ pub(crate) fn song_to_view(
                 midi_enabled: track.midi_enabled,
                 collapsed: track.collapsed,
                 height_offset: track.height_offset,
+                match_aliases: track.match_aliases.clone(),
+                song_region_id: track.song_region_id.clone(),
             })
             .collect(),
         automation_cues: automation_cues_to_summary(song, &automation.cues, automation_run_counts),
@@ -1201,6 +1224,16 @@ pub(crate) fn marker_to_warped_summary(song: &Song, marker: &Marker) -> MarkerSu
     }
 }
 
+/// Un cambio de nota, en segundos de vista del timeline como el resto de
+/// posiciones del DTO (el modelo lo guarda relativo a la región, en fuente).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyChangeSummary {
+    pub id: String,
+    pub start_seconds: f64,
+    pub key: String,
+}
+
 pub(crate) fn region_to_summary(song: &Song, region: &SongRegion) -> SongRegionSummary {
     SongRegionSummary {
         id: region.id.clone(),
@@ -1213,8 +1246,24 @@ pub(crate) fn region_to_summary(song: &Song, region: &SongRegion) -> SongRegionS
         warp_source_bpm: region.warp_source_bpm,
         master: SongMasterSummary {
             gain: region.master.gain,
+            fade_in_seconds: region.master.fade_in_seconds,
+            fade_out_seconds: region.master.fade_out_seconds,
         },
         compact_column_width_rem: region.compact_column_width_rem,
+        chart: region.chart.clone(),
+        voice_guide_count_style: region.voice_guide_count_style,
+        key_changes: region
+            .key_changes
+            .iter()
+            .map(|change| KeyChangeSummary {
+                id: change.id.clone(),
+                start_seconds: warp_timeline_seconds_at(
+                    song,
+                    region.start_seconds + change.offset_seconds,
+                ),
+                key: change.key.clone(),
+            })
+            .collect(),
         structure: region
             .structure
             .as_ref()
@@ -1285,6 +1334,7 @@ fn tempo_marker_to_warped_summary(song: &Song, marker: &TempoMarker) -> TempoMar
         start_seconds: warp_timeline_seconds_at(song, marker.start_seconds),
         source_start_seconds: marker.start_seconds,
         bpm: marker.bpm,
+        ramp: marker.ramp,
     }
 }
 
@@ -1359,6 +1409,22 @@ pub(crate) fn musical_position_summary(
     }
 }
 
+/// How far (in bars) a time signature marker may sit from a bar line and still
+/// be on it: markers placed from audio land a few ms off the rounded grid.
+const BAR_BOUNDARY_TOLERANCE: f64 = 0.02;
+
+/// Bar count at a time signature marker. The engine's metronome restarts the
+/// bar there (`timing_segment_start`), so the count jumps to the next whole
+/// bar, unless it is already within the tolerance of one.
+fn bar_count_at_timing_boundary(cumulative_bars: f64) -> f64 {
+    let nearest = cumulative_bars.round();
+    if (cumulative_bars - nearest).abs() <= BAR_BOUNDARY_TOLERANCE {
+        nearest
+    } else {
+        (cumulative_bars - 1.0e-9).ceil()
+    }
+}
+
 #[derive(Debug, Clone)]
 struct TimingRegion {
     start_seconds: f64,
@@ -1400,6 +1466,10 @@ fn build_timing_regions(song: &Song, horizon_seconds: f64) -> Vec<TimingRegion> 
             }
             if let Some(next_signature) = boundary_signature {
                 time_signature = next_signature;
+                // A second marker at the same spot: the bar still restarts.
+                if start_seconds > 0.0 {
+                    cumulative_bars_end = bar_count_at_timing_boundary(cumulative_bars_end);
+                }
             }
             continue;
         }
@@ -1412,6 +1482,13 @@ fn build_timing_regions(song: &Song, horizon_seconds: f64) -> Vec<TimingRegion> 
                 / f64::from(TIMELINE_TIMEBASE_HZ);
         let bar_duration_seconds = beat_duration_seconds * f64::from(beats_per_bar);
         cumulative_bars_end += (boundary_seconds - start_seconds).max(0.0) / bar_duration_seconds;
+        // A time signature marker starts a bar, as the metronome and the
+        // timeline grid do (`barCountAtTimingBoundary` in
+        // packages/shared/src/timelineMath.ts). A tempo marker alone keeps
+        // the beat phase going.
+        if boundary_signature.is_some() {
+            cumulative_bars_end = bar_count_at_timing_boundary(cumulative_bars_end);
+        }
         regions.push(TimingRegion {
             start_seconds,
             end_seconds: boundary_seconds,
@@ -1556,6 +1633,8 @@ mod tests {
             midi_enabled: true,
             collapsed: false,
             height_offset: None,
+            match_aliases: Vec::new(),
+            song_region_id: None,
         }
     }
 
@@ -1576,6 +1655,7 @@ mod tests {
 
     fn region(id: &str, start: f64, end: f64) -> SongRegion {
         SongRegion {
+            key_changes: Vec::new(),
             id: id.into(),
             name: id.into(),
             start_seconds: start,
@@ -1586,6 +1666,8 @@ mod tests {
             key: None,
             master: SongMaster::default(),
             compact_column_width_rem: None,
+            chart: None,
+            voice_guide_count_style: None,
             structure: None,
         }
     }
@@ -1631,6 +1713,7 @@ mod tests {
             id: "t".into(),
             start_seconds: 0.0,
             bpm: 120.0,
+            ramp: false,
         }];
         song.regions = vec![region("r1", 0.0, 10.0), region("r2", 10.0, 26.0)];
         // r2 grabada a 100 BPM y estirada a los 120 del timeline.
@@ -1664,6 +1747,7 @@ mod tests {
                     id: "t_coro".into(),
                     start_seconds: 18.0,
                     bpm: 150.0,
+                    ramp: false,
                 }],
                 ..OriginalSnapshot::default()
             },

@@ -5,18 +5,22 @@
 
 use std::collections::HashSet;
 
-use libretracks_core::{source_seconds_at_view, Clip, Song, Track, TrackKind};
+use libretracks_core::{source_seconds_at_view, Song, Track, TrackKind};
 
 use crate::audio::engine::AudioController;
 use crate::infra::error::DesktopError;
 use crate::models::TransportSnapshot;
 
+use super::song_templates::{
+    organise_stem_drop, StemPlacement, TemplateDropSummary, TrackIdAllocator,
+};
 use super::track_colors::auto_color_for_new_track;
 use super::{
     append_clip_to_song, apply_clip_moves_with_region_reshape, delete_track_and_repair_hierarchy,
     ensure_region_covers_clip, file_stem_for_auto_track, insert_track,
     normalize_timeline_start_seconds, normalize_ui_color, prune_auto_created_empty_tracks,
-    prune_empty_regions, refresh_song_duration, reparent_track, timestamp_suffix, ui_locale,
+    prune_empty_regions, refresh_song_duration, reparent_track, split_clip_at_source,
+    timestamp_suffix, ui_locale,
     validate_clip_window, AudioChangeImpact, ClipMoveRequest, CreateAudioTrackWithClipRequest,
     UpdatePhase,
     CreateClipRequest, CreateClipWithAutoTrackRequest, DesktopSession,
@@ -534,6 +538,22 @@ impl DesktopSession {
 
         let locale = ui_locale(audio);
         let auto_color = auto_color_enabled(audio);
+        let drops: Vec<(&str, f64)> = requests
+            .iter()
+            .map(|request| {
+                (
+                    request.file_path.as_str(),
+                    source_seconds_at_view(&song, request.timeline_start_seconds),
+                )
+            })
+            .collect();
+        if let Some(placements) = organise_stem_drop(&mut song, &song_dir, &drops, true, audio)? {
+            let names: Vec<String> = requests
+                .iter()
+                .map(|request| file_stem_for_auto_track(&request.file_path))
+                .collect();
+            return self.place_organised_drop(song, &song_dir, &drops, &names, placements, true, audio);
+        }
         for (offset, request) in requests.iter().enumerate() {
             let source_start_seconds =
                 source_seconds_at_view(&song, request.timeline_start_seconds);
@@ -566,6 +586,8 @@ impl DesktopSession {
                 midi_enabled: true,
                 collapsed: false,
                 height_offset: None,
+                match_aliases: Vec::new(),
+                song_region_id: None,
             });
             append_clip_to_song(
                 &mut song,
@@ -607,13 +629,32 @@ impl DesktopSession {
 
         let locale = ui_locale(audio);
         let auto_color = auto_color_enabled(audio);
+        if requests
+            .iter()
+            .any(|request| request.track_name.trim().is_empty())
+        {
+            return Err(DesktopError::AudioCommand(
+                "track name must not be empty".into(),
+            ));
+        }
+        let drops: Vec<(&str, f64)> = requests
+            .iter()
+            .map(|request| {
+                (
+                    request.file_path.as_str(),
+                    source_seconds_at_view(&song, request.timeline_start_seconds),
+                )
+            })
+            .collect();
+        if let Some(placements) = organise_stem_drop(&mut song, &song_dir, &drops, false, audio)? {
+            let names: Vec<String> = requests
+                .iter()
+                .map(|request| request.track_name.trim().to_string())
+                .collect();
+            return self.place_organised_drop(song, &song_dir, &drops, &names, placements, false, audio);
+        }
         for (offset, request) in requests.iter().enumerate() {
             let trimmed_name = request.track_name.trim();
-            if trimmed_name.is_empty() {
-                return Err(DesktopError::AudioCommand(
-                    "track name must not be empty".into(),
-                ));
-            }
             // view-time -> source-time, same conversion create_clips_batch does
             // so warp/varispeed regions don't shift the clip from the drop point.
             let source_start_seconds =
@@ -645,6 +686,8 @@ impl DesktopSession {
                 midi_enabled: true,
                 collapsed: false,
                 height_offset: None,
+                match_aliases: Vec::new(),
+                song_region_id: None,
             });
             append_clip_to_song(
                 &mut song,
@@ -661,6 +704,113 @@ impl DesktopSession {
         refresh_song_duration(&mut song);
         self.persist_song_update(song, audio, AudioChangeImpact::StructureRebuild, true)?;
 
+        Ok(self.snapshot())
+    }
+
+    /// Coloca los clips de un drop que la plantilla ya organizó (ver
+    /// `song_templates::organise_stem_drop`). Los stems sin sitio en la
+    /// plantilla crean su pista como siempre (`names[i]`, `auto_created`), pero
+    /// dentro de la carpeta de la canción y marcada con ella si el modo es por
+    /// canción. Todo en una sola actualización: un solo paso de deshacer.
+    #[allow(clippy::too_many_arguments)]
+    fn place_organised_drop(
+        &mut self,
+        mut song: Song,
+        song_dir: &std::path::Path,
+        drops: &[(&str, f64)],
+        names: &[String],
+        placements: Vec<StemPlacement>,
+        auto_created: bool,
+        audio: &AudioController,
+    ) -> Result<TransportSnapshot, DesktopError> {
+        let locale = ui_locale(audio);
+        let auto_color = auto_color_enabled(audio);
+        let mut ids = TrackIdAllocator::new(&song);
+        for (index, placement) in placements.iter().enumerate() {
+            let track_id = match placement {
+                StemPlacement::Matched { track_id } => track_id.clone(),
+                StemPlacement::Unmatched {
+                    parent_track_id,
+                    song_region_id,
+                } => {
+                    let color =
+                        auto_color_for_new_track(&song.tracks, TrackKind::Audio, auto_color);
+                    let track = Track {
+                        id: ids.allocate(),
+                        name: names[index].clone(),
+                        kind: TrackKind::Audio,
+                        parent_track_id: parent_track_id.clone(),
+                        volume: 1.0,
+                        pan: 0.0,
+                        muted: false,
+                        solo: false,
+                        transpose_enabled: true,
+                        audio_to: if parent_track_id.is_some() {
+                            "inherit".to_string()
+                        } else {
+                            "master".to_string()
+                        },
+                        mono_downmix: false,
+                        color,
+                        auto_created,
+                        midi_port: None,
+                        midi_channel: 1,
+                        midi_enabled: true,
+                        collapsed: false,
+                        height_offset: None,
+                        match_aliases: Vec::new(),
+                        song_region_id: song_region_id.clone(),
+                    };
+                    let track_id = track.id.clone();
+                    insert_track(&mut song.tracks, track, None, parent_track_id.as_deref())?;
+                    track_id
+                }
+            };
+            append_clip_to_song(
+                &mut song,
+                song_dir,
+                &CreateClipRequest {
+                    track_id,
+                    file_path: drops[index].0.to_string(),
+                    timeline_start_seconds: drops[index].1,
+                },
+                locale.as_deref(),
+            )?;
+        }
+
+        refresh_song_duration(&mut song);
+        self.last_template_drop = Some(TemplateDropSummary::of(&placements));
+        self.persist_song_update(song, audio, AudioChangeImpact::StructureRebuild, true)?;
+        Ok(self.snapshot())
+    }
+
+    /// Cambia las palabras con las que una plantilla manda stems a esta pista
+    /// (o, en una carpeta, dentro de ella). Se limpian: sin espacios de más, sin
+    /// vacías y sin repetidas (sin distinguir mayúsculas), en el orden en que
+    /// llegan. No toca el audio, así que no reconstruye el motor.
+    pub fn update_track_match_aliases(
+        &mut self,
+        track_id: &str,
+        aliases: &[String],
+        audio: &AudioController,
+    ) -> Result<TransportSnapshot, DesktopError> {
+        let mut song = self
+            .engine
+            .song()
+            .cloned()
+            .ok_or(DesktopError::NoSongLoaded)?;
+        let aliases = clean_match_aliases(aliases);
+        let track = song
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == track_id)
+            .ok_or_else(|| DesktopError::TrackNotFound(track_id.to_string()))?;
+        if track.match_aliases == aliases {
+            return Ok(self.snapshot());
+        }
+        track.match_aliases = aliases;
+
+        self.persist_song_update(song, audio, AudioChangeImpact::TransportOnly, true)?;
         Ok(self.snapshot())
     }
 
@@ -1022,50 +1172,24 @@ impl DesktopSession {
             return Err(DesktopError::ClipNotFound(String::new()));
         }
 
-        // `timeline_start_seconds` and `duration_seconds` are stored in
-        // view-time, so the split point comparison stays in view-time too.
-        // We only convert to source-time when computing the right-hand
-        // clip's `source_start_seconds`, which is the only field that
-        // actually lives in the underlying audio file's clock.
+        // Clips are stored in source time; the cursor arrives in view time.
+        // Convert once and cut in source time (see `split_clip_at_source`).
         let split_seconds_source = source_seconds_at_view(&song, split_seconds_view);
         let suffix_base = timestamp_suffix();
         let mut any_split = false;
-        let mut last_invalid_clip: Option<String> = None;
 
         for (offset, clip_id) in clip_ids.iter().enumerate() {
             let clip_index = match song.clips.iter().position(|clip| clip.id == *clip_id) {
                 Some(index) => index,
                 None => continue,
             };
-            let clip = song.clips[clip_index].clone();
-            let clip_end = clip.timeline_start_seconds + clip.duration_seconds;
-            if split_seconds_view <= clip.timeline_start_seconds || split_seconds_view >= clip_end {
-                last_invalid_clip = Some(clip_id.clone());
+            let Some((left_clip, right_clip)) = split_clip_at_source(
+                &song.clips[clip_index],
+                split_seconds_source,
+                format!("clip_{}_{}_l", suffix_base, offset),
+                format!("clip_{}_{}_r", suffix_base, offset),
+            ) else {
                 continue;
-            }
-
-            let left_duration = split_seconds_view - clip.timeline_start_seconds;
-            let right_duration = clip_end - split_seconds_view;
-            // Source-time offset of the cut inside the original audio. With
-            // warp off this collapses to `left_duration`; with warp on it
-            // accounts for the stretch ratio in this region.
-            let split_seconds_source_clip =
-                source_seconds_at_view(&song, clip.timeline_start_seconds + left_duration);
-            let source_left_duration = (split_seconds_source_clip
-                - source_seconds_at_view(&song, clip.timeline_start_seconds))
-            .max(0.0);
-
-            let left_clip = Clip {
-                id: format!("clip_{}_{}_l", suffix_base, offset),
-                duration_seconds: left_duration,
-                ..clip.clone()
-            };
-            let right_clip = Clip {
-                id: format!("clip_{}_{}_r", suffix_base, offset),
-                timeline_start_seconds: split_seconds_view,
-                source_start_seconds: clip.source_start_seconds + source_left_duration,
-                duration_seconds: right_duration,
-                ..clip
             };
 
             song.clips
@@ -1079,13 +1203,25 @@ impl DesktopSession {
             return Err(DesktopError::InvalidSplitPoint);
         }
 
-        // Suppress an unused-variable warning on the diagnostic-only path
-        // where every clip in the batch was outside the cursor.
-        let _ = (split_seconds_source, last_invalid_clip);
-
         self.persist_song_update(song, audio, AudioChangeImpact::StructureRebuild, true)?;
         Ok(self.snapshot())
     }
+}
+
+/// Most aliases a track may carry, and the longest one. Only a sanity bound on
+/// what the frontend sends: real lists are a handful of short words.
+const MAX_MATCH_ALIASES: usize = 64;
+const MAX_MATCH_ALIAS_CHARS: usize = 64;
+
+/// Trimmed, non-empty, without case-insensitive repeats, in the given order.
+pub(super) fn clean_match_aliases(aliases: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    aliases
+        .iter()
+        .map(|alias| alias.trim().chars().take(MAX_MATCH_ALIAS_CHARS).collect::<String>())
+        .filter(|alias| !alias.is_empty() && seen.insert(alias.to_lowercase()))
+        .take(MAX_MATCH_ALIASES)
+        .collect()
 }
 
 /// A new track as "create track" makes it: default mix, the next auto colour,
@@ -1126,5 +1262,7 @@ pub(super) fn new_track(
         // they are about to drag into it.
         collapsed: false,
         height_offset: None,
+        match_aliases: Vec::new(),
+        song_region_id: None,
     }
 }

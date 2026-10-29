@@ -55,12 +55,11 @@ void request_source_range(const SourceManager& sources,
                           const Id& source_id,
                           Frame start,
                           int frames) {
-    if (frames <= 0) return;
-    const int first = static_cast<int>(std::max<Frame>(0, start) / kDefaultBlockFrames);
-    const int last = static_cast<int>(
-        std::max<Frame>(0, start + frames - 1) / kDefaultBlockFrames);
-    for (int block = first; block <= last; ++block)
-        sources.request_block(source_id, block, /*urgent=*/true);
+    // Through request_range, never block indices computed here: `start` is in
+    // engine frames, and a source resampled on the fly keeps its file's own
+    // frames in the cache. Dividing by the block size here asked for the wrong
+    // blocks, and the wait below then ran to its deadline for every voice.
+    sources.request_range(source_id, start, frames, /*urgent=*/true);
 }
 
 // Mirror of the LIBRETRACKS_AUDIO_DEBUG flag used in engine_impl.cpp. Cached
@@ -182,6 +181,30 @@ struct BungeeVoiceManager::Impl {
             retired.erase(retired.begin());   // destruye aquí, no en el audio
     }
 
+    // Igual que publish_from_control, pero sólo si el mapa activo sigue siendo
+    // `expected`. Para quien construye fuera del hilo de audio mientras éste
+    // puede publicar un salto preparado: si perdió la carrera, devuelve false
+    // y el llamante vuelve a fusionar sobre el mapa nuevo.
+    bool publish_from_control_if(std::shared_ptr<const VoiceMap> expected,
+                                 std::shared_ptr<const VoiceMap> next) {
+        auto outgoing = expected;
+#if !defined(_MSC_VER)
+        const bool swapped = std::atomic_compare_exchange_strong_explicit(
+            &active, &expected, std::move(next),
+            std::memory_order_acq_rel, std::memory_order_acquire);
+#else
+        const bool swapped = active.compare_exchange_strong(
+            expected, std::move(next), std::memory_order_acq_rel);
+#endif
+        if (!swapped) return false;
+        if (outgoing) {
+            retired.push_back(std::move(outgoing));
+            while (retired.size() > kRetiredMapsKept)
+                retired.erase(retired.begin());
+        }
+        return true;
+    }
+
     // Source-ready callbacks and explicit seeks can ask for rebuilds from
     // different control threads. Building/warming Bungee streams is expensive
     // and not guaranteed to be reentrant, so serialize build/publish work while
@@ -208,6 +231,9 @@ struct BungeeVoiceManager::Impl {
         std::shared_ptr<const Session> session;     // owned snapshot
         const SourceManager*           sources = nullptr;
         std::uint64_t                  expected_generation = 0;
+        // Only add the voices the live map lacks (enroll_missing_voices)
+        // instead of rebuilding them all at `target_frame`.
+        bool                           enroll_only = false;
     };
     std::mutex                  worker_mutex;
     std::condition_variable     worker_cv;
@@ -493,6 +519,61 @@ std::shared_ptr<BungeePitchVoice> build_voice_for_spec(
     return voice;
 }
 
+// Construye las voces de `specs` en paralelo; `out[i]` es la de `specs[i]`
+// (nula si falló). Cada BungeePitchVoice es independiente y SourceManager
+// admite lecturas concurrentes, igual que en build_seek_voice_map.
+//
+// Lo usa el enrolado de retime_existing_for_session: cambiar la nota de una
+// región con warp a ratio 1.0 enrola una voz por clip de golpe, y en serie
+// eran ~1,8 ms por voz en el PC (50 ms con 28 pistas; ~180 ms en el emulador)
+// con el cerrojo de sesión de Rust cogido (song-patches/state/09.md).
+//
+// Pool acotado en vez de un hilo por voz, y la hebra que llama trabaja
+// también: si no se puede crear ningún hilo, sale en serie como antes. Los
+// trabajadores bajan su prioridad para no robar CPU al hilo de audio; la hebra
+// que llama conserva la suya (es la de control y la prioridad no se restaura).
+std::vector<std::shared_ptr<BungeePitchVoice>> build_voices_parallel(
+        const std::vector<const VoiceSpec*>& specs,
+        const SourceManager& sources,
+        int sample_rate, int channel_count, int max_in_frames) {
+    std::vector<std::shared_ptr<BungeePitchVoice>> out(specs.size());
+    if (specs.empty()) return out;
+    std::atomic<std::size_t> next{0};
+    auto drain = [&] {
+        for (std::size_t i = next.fetch_add(1); i < specs.size();
+             i = next.fetch_add(1)) {
+            out[i] = build_voice_for_spec(*specs[i], sources, sample_rate,
+                                          channel_count, max_in_frames);
+        }
+    };
+
+    const std::size_t hw = std::max(1u, std::thread::hardware_concurrency());
+    const std::size_t helpers =
+        std::min<std::size_t>(specs.size(), std::min<std::size_t>(hw, 8)) - 1;
+    std::vector<std::thread> workers;
+    workers.reserve(helpers);
+    for (std::size_t w = 0; w < helpers; ++w) {
+        try {
+            workers.emplace_back([&] {
+#ifdef _WIN32
+                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#elif defined(__APPLE__)
+                pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+#elif defined(__linux__)
+                setpriority(PRIO_PROCESS, 0, 10);
+#endif
+                drain();
+            });
+        } catch (...) {
+            break;  // sin más hilos: lo que quede lo hace la hebra que llama
+        }
+    }
+    drain();
+    for (auto& worker : workers)
+        worker.join();
+    return out;
+}
+
 #endif // LT_ENGINE_HAVE_BUNGEE
 
 } // namespace
@@ -667,13 +748,13 @@ void BungeeVoiceManager::retime_existing_for_session(
     if (!to_enroll.empty()) try {
         std::lock_guard build_lock(impl_->build_mutex);
         auto next = std::make_shared<VoiceMap>(*current);
-        for (const VoiceSpec* spec : to_enroll) {
-            auto voice = build_voice_for_spec(*spec, sources,
-                                              impl_->sample_rate,
-                                              impl_->channel_count,
-                                              impl_->max_in_frames);
-            if (!voice) continue;
-            (*next)[spec->clip_id] = std::move(voice);
+        auto voices = build_voices_parallel(to_enroll, sources,
+                                            impl_->sample_rate,
+                                            impl_->channel_count,
+                                            impl_->max_in_frames);
+        for (std::size_t i = 0; i < to_enroll.size(); ++i) {
+            if (!voices[i]) continue;
+            (*next)[to_enroll[i]->clip_id] = std::move(voices[i]);
             ++enrolled;
             impl_->voices_built_total.fetch_add(1, std::memory_order_relaxed);
         }
@@ -919,6 +1000,48 @@ void BungeeVoiceManager::rebuild_for_seek_guarded(Frame target_frame,
 #endif
 }
 
+// Spawn the worker on first use. Single thread, runs at lowered priority
+// so it never starves the audio callback during the ~600ms warm. Same
+// reasoning as PrearmedJumpManager's worker — without this, transposes
+// mid-playback caused 50-200ms audio dropouts on macOS for several
+// seconds while the worker rebuilt voices in the background.
+void BungeeVoiceManager::ensure_async_worker() {
+#if LT_ENGINE_HAVE_BUNGEE
+    std::lock_guard lock(impl_->worker_mutex);
+    if (impl_->worker_thread.joinable() || impl_->worker_shutdown)
+        return;
+    impl_->worker_thread = std::thread([this] {
+      #ifdef _WIN32
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+      #elif defined(__APPLE__)
+        pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0);
+      #elif defined(__linux__)
+        setpriority(PRIO_PROCESS, 0, 10);
+      #endif
+        for (;;) {
+            Impl::AsyncJob job;
+            {
+                std::unique_lock lk(impl_->worker_mutex);
+                impl_->worker_cv.wait(lk, [this] {
+                    return impl_->worker_shutdown || impl_->pending_job.has_value();
+                });
+                if (impl_->worker_shutdown) return;
+                job = std::move(*impl_->pending_job);
+                impl_->pending_job.reset();
+            }
+            if (!job.session || !job.sources) continue;
+            if (job.enroll_only) {
+                enroll_missing_voices(*job.session, *job.sources, job.target_frame);
+                continue;
+            }
+            rebuild_for_seek_guarded(
+                job.target_frame, *job.session, *job.sources,
+                job.expected_generation);
+        }
+    });
+#endif
+}
+
 void BungeeVoiceManager::rebuild_for_seek_async(Frame target_frame,
                                                  const Session& session,
                                                  const SourceManager& sources) {
@@ -926,41 +1049,8 @@ void BungeeVoiceManager::rebuild_for_seek_async(Frame target_frame,
 #if !LT_ENGINE_HAVE_BUNGEE
     (void)target_frame; (void)session; (void)sources;
 #else
-    // Spawn the worker on first use. Single thread, runs at lowered priority
-    // so it never starves the audio callback during the ~600ms warm. Same
-    // reasoning as PrearmedJumpManager's worker — without this, transposes
-    // mid-playback caused 50-200ms audio dropouts on macOS for several
-    // seconds while the worker rebuilt voices in the background.
     {
         std::lock_guard lock(impl_->worker_mutex);
-        if (!impl_->worker_thread.joinable() && !impl_->worker_shutdown) {
-            impl_->worker_thread = std::thread([this] {
-              #ifdef _WIN32
-                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-              #elif defined(__APPLE__)
-                pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0);
-              #elif defined(__linux__)
-                setpriority(PRIO_PROCESS, 0, 10);
-              #endif
-                for (;;) {
-                    Impl::AsyncJob job;
-                    {
-                        std::unique_lock lk(impl_->worker_mutex);
-                        impl_->worker_cv.wait(lk, [this] {
-                            return impl_->worker_shutdown || impl_->pending_job.has_value();
-                        });
-                        if (impl_->worker_shutdown) return;
-                        job = std::move(*impl_->pending_job);
-                        impl_->pending_job.reset();
-                    }
-                    if (!job.session || !job.sources) continue;
-                    rebuild_for_seek_guarded(
-                        job.target_frame, *job.session, *job.sources,
-                        job.expected_generation);
-                }
-            });
-        }
-
         // Latest-wins: overwrite any pending job rather than queueing.
         impl_->pending_job = Impl::AsyncJob{
             target_frame,
@@ -969,6 +1059,7 @@ void BungeeVoiceManager::rebuild_for_seek_async(Frame target_frame,
             impl_->publish_generation.load(std::memory_order_acquire),
         };
     }
+    ensure_async_worker();
     impl_->worker_cv.notify_one();
     if (bungee_debug_enabled()) {
         lt_debug_log(
@@ -1022,6 +1113,93 @@ BungeeVoiceManager::build_prepared_voice_map(PreparedVoiceMap prepared_voices) c
         if (kv.second) next->emplace(kv.first, std::move(kv.second));
     }
     return next;
+#endif
+}
+
+void BungeeVoiceManager::enroll_missing_voices(const Session& session,
+                                               const SourceManager& sources,
+                                               Frame playhead) noexcept {
+    if (!is_available()) return;
+#if !LT_ENGINE_HAVE_BUNGEE
+    (void)session; (void)sources; (void)playhead;
+#else
+    int enrolled = 0;
+    try {
+        std::lock_guard build_lock(impl_->build_mutex);
+        const auto specs = enumerate_voices(session, sources, playhead);
+        const auto current = impl_->load_active();
+        std::vector<const VoiceSpec*> to_enroll;
+        for (const auto& spec : specs) {
+            auto it = current ? current->find(spec.clip_id) : VoiceMap::const_iterator{};
+            if (!current || it == current->end() || !it->second)
+                to_enroll.push_back(&spec);
+        }
+        if (to_enroll.empty()) return;
+
+        auto voices = build_voices_parallel(to_enroll, sources,
+                                            impl_->sample_rate,
+                                            impl_->channel_count,
+                                            impl_->max_in_frames);
+        // The audio thread publishes prepared maps without build_mutex, so a
+        // scheduled jump may have replaced `current` while we built. Merge onto
+        // whatever is live and only install if it is still the one we read;
+        // a clip the newer map already covers keeps the newer voice.
+        for (;;) {
+            auto live = impl_->load_active();
+            auto next = live ? std::make_shared<VoiceMap>(*live)
+                             : std::make_shared<VoiceMap>();
+            int added = 0;
+            for (std::size_t i = 0; i < to_enroll.size(); ++i) {
+                if (!voices[i]) continue;
+                auto& slot = (*next)[to_enroll[i]->clip_id];
+                if (slot) continue;
+                slot = voices[i];
+                ++added;
+            }
+            if (added == 0) break;
+            if (impl_->publish_from_control_if(
+                    live, std::shared_ptr<const VoiceMap>(std::move(next)))) {
+                enrolled = added;
+                impl_->voices_built_total.fetch_add(
+                    static_cast<std::uint64_t>(added), std::memory_order_relaxed);
+                break;
+            }
+        }
+    } catch (...) {
+        // noexcept: if anything fails the map stays as it was — the silence
+        // this exists to fix, never a terminate.
+    }
+    if (bungee_debug_enabled()) {
+        lt_debug_log(
+            "[BUNGEE] enroll_missing_voices playhead=%lld enrolled=%d\n",
+            static_cast<long long>(playhead), enrolled);
+    }
+#endif
+}
+
+void BungeeVoiceManager::enroll_missing_voices_async(Frame playhead,
+                                                     const Session& session,
+                                                     const SourceManager& sources) {
+    if (!is_available()) return;
+#if !LT_ENGINE_HAVE_BUNGEE
+    (void)playhead; (void)session; (void)sources;
+#else
+    {
+        std::lock_guard lock(impl_->worker_mutex);
+        // A pending full rebuild already builds every voice; replacing it with
+        // an enroll would lose its re-priming at the seek target.
+        if (impl_->pending_job && !impl_->pending_job->enroll_only)
+            return;
+        impl_->pending_job = Impl::AsyncJob{
+            playhead,
+            std::make_shared<const Session>(session),
+            &sources,
+            0,
+            /*enroll_only=*/true,
+        };
+    }
+    ensure_async_worker();
+    impl_->worker_cv.notify_one();
 #endif
 }
 

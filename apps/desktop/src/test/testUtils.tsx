@@ -23,14 +23,21 @@ import {
 } from "../features/transport/uiStore";
 import { App as AppComponent } from "../app/App";
 import { useTourStore } from "../features/tutorial/tourStore";
+import {
+  INITIAL_NETWORK_SESSION_STATE,
+  useNetworkSessionStore,
+} from "../features/network/networkSessionStore";
 import { useCloudStore } from "../features/transport/cloud/cloudStore";
+import { useLevelSongsStore } from "../features/transport/levelSongs/levelSongsStore";
 import { useRenderStore } from "../features/transport/render/renderStore";
+import { useSongAnalysisStore } from "../features/transport/songAnalysis/songAnalysisStore";
 import { INITIAL_VIDEO_STATE, useVideoStore } from "../features/transport/video/videoStore";
 import {
   INITIAL_STRUCTURE_STATE,
   useStructureStore,
 } from "../features/transport/structure/structureStore";
 import { resetVideoCanvasState } from "../features/transport/video/videoCanvasState";
+import { useTrackRowWindowStore } from "../features/transport/tracks/useTrackRowWindow";
 import { emitWaveformReadyForTest, resetTestDesktopApiMock, testDesktopApiMock } from "../app/testDesktopApiMock";
 
 export type MockWebviewDragDropEvent =
@@ -91,6 +98,8 @@ vi.mock("../features/transport/desktopApi", async (importOriginal) => {
     listenToWaveformReady: vi.fn(testDesktopApiMock.listenToWaveformReady),
     listenToWaveformProgress: vi.fn(testDesktopApiMock.listenToWaveformProgress),
     listenToSettingsUpdated: vi.fn(testDesktopApiMock.listenToSettingsUpdated),
+    listenToAudioIdleWake: vi.fn(testDesktopApiMock.listenToAudioIdleWake),
+    takeAudioIdleWake: vi.fn(testDesktopApiMock.takeAudioIdleWake),
     listenToMidiRawMessage: vi.fn(testDesktopApiMock.listenToMidiRawMessage),
     // Cerrar la app: la X no existe en los tests y salir no debe matar vitest.
     listenToAppCloseRequested: vi.fn(async () => () => {}),
@@ -103,6 +112,7 @@ vi.mock("../features/transport/desktopApi", async (importOriginal) => {
       reason: "libmpv not loaded in tests",
     })),
     listVideoAssets: vi.fn(async () => []),
+    deleteVideoAsset: vi.fn(async () => []),
     getVideoThumbnails: vi.fn(async () => null),
     listenToVideoThumbnailsReady: vi.fn(async () => () => {}),
     getVideoOutputStatus: vi.fn(async () => ({
@@ -121,6 +131,7 @@ vi.mock("../features/transport/desktopApi", async (importOriginal) => {
     showVideoTestPattern: vi.fn(async () => undefined),
     getVideoSyncStats: vi.fn(async () => null),
     setVideoCalibration: vi.fn(async () => undefined),
+    setVideoScrub: vi.fn(async () => undefined),
     extractVideoAudio: vi.fn(async () => null),
     getVideoExportPayload: vi.fn(async () => ({ count: 0, bytes: 0 })),
     videoLiveAction: vi.fn(async () => ({ forcedBlack: false, forcedIdle: false, outputEnabled: false })),
@@ -148,6 +159,7 @@ vi.mock("../features/transport/desktopApi", async (importOriginal) => {
     updateSongTempo: vi.fn(testDesktopApiMock.updateSongTempo),
     upsertSongTempoMarker: vi.fn(testDesktopApiMock.upsertSongTempoMarker),
     deleteSongTempoMarker: vi.fn(testDesktopApiMock.deleteSongTempoMarker),
+    setSongTempoMarkerRamp: vi.fn(testDesktopApiMock.setSongTempoMarkerRamp),
     openProject: vi.fn(testDesktopApiMock.openProject),
     pickAndImportSong: vi.fn(testDesktopApiMock.pickAndImportSong),
     pickAndImportExternalProject: vi.fn(testDesktopApiMock.pickAndImportExternalProject),
@@ -326,6 +338,8 @@ beforeEach(async () => {
     selectedSectionId: null,
     selectedTempoMarkerId: null,
     selectedTimeSignatureMarkerId: null,
+    selectedMarkers: [],
+    markerSelectionAnchor: null,
     snapEnabled: TIMELINE_DEFAULT_SNAP_ENABLED,
     followPlayheadEnabled: TIMELINE_DEFAULT_FOLLOW_PLAYHEAD_ENABLED,
     midiLearnMode: null,
@@ -334,8 +348,7 @@ beforeEach(async () => {
     expandedTrackId: null,
     selectionMixOpen: false,
     missingMediaOpen: false,
-    trackMultiSelect: false,
-    clipMultiSelect: false,
+    areaSelectMode: false,
     viewMode: DEFAULT_VIEW_MODE,
   });
   // La guia interactiva arranca sola la primera vez y su store sobrevive al
@@ -361,11 +374,21 @@ beforeEach(async () => {
   // El modal de renderizar se abre desde un store; sin cerrarlo, una prueba
   // que lo abra lo dejaria abierto encima de la siguiente.
   useRenderStore.setState({ target: null });
+  useLevelSongsStore.setState({ open: false });
+  useSongAnalysisStore.setState({ target: null });
+  useNetworkSessionStore.setState(INITIAL_NETWORK_SESSION_STATE);
   // Video selection and library, and the canvas thumbnail/preview registry.
   useVideoStore.setState(INITIAL_VIDEO_STATE);
   resetVideoCanvasState();
   // Arreglos: el diálogo de la guardia y el editor viven en un store.
   useStructureStore.setState(INITIAL_STRUCTURE_STATE);
+  // Ventana de filas de pista: sin métricas = montar todas.
+  useTrackRowWindowStore.setState({
+    metrics: null,
+    pressedTrackId: null,
+    focusedTrackId: null,
+    onRowsMounted: null,
+  });
   vi.clearAllMocks();
   vi.restoreAllMocks();
   await i18n.changeLanguage("en");

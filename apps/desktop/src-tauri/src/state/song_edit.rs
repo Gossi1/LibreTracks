@@ -287,6 +287,7 @@ pub(super) fn ensure_region_covers_clip_for_file(
     }
     let region_index = song.regions.len();
     song.regions.push(SongRegion {
+        key_changes: Vec::new(),
         id: format!("region_{}_{}", timestamp_suffix(), region_index),
         name: default_region_name(locale, region_index),
         start_seconds: clip_start,
@@ -297,6 +298,8 @@ pub(super) fn ensure_region_covers_clip_for_file(
         warp_source_bpm: None,
         master: libretracks_core::SongMaster::default(),
         compact_column_width_rem: None,
+        chart: None,
+        voice_guide_count_style: None,
         structure: None,
     });
     sort_song_regions(&mut song.regions);
@@ -427,6 +430,7 @@ mod region_message_tests {
 
     fn region(name: &str, start: f64, end: f64) -> SongRegion {
         SongRegion {
+            key_changes: Vec::new(),
             id: format!("region_{name}"),
             name: name.to_string(),
             start_seconds: start,
@@ -437,6 +441,8 @@ mod region_message_tests {
             warp_source_bpm: None,
             master: libretracks_core::SongMaster::default(),
             compact_column_width_rem: None,
+            chart: None,
+            voice_guide_count_style: None,
             structure: None,
         }
     }

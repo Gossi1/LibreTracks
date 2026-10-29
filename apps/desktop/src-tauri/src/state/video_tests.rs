@@ -16,6 +16,7 @@ use super::{DesktopSession, VideoClipProps};
 
 fn region(id: &str, start: f64, end: f64) -> SongRegion {
     SongRegion {
+        key_changes: Vec::new(),
         id: id.into(),
         name: id.into(),
         start_seconds: start,
@@ -26,6 +27,8 @@ fn region(id: &str, start: f64, end: f64) -> SongRegion {
         warp_source_bpm: None,
         master: SongMaster::default(),
         compact_column_width_rem: None,
+        chart: None,
+        voice_guide_count_style: None,
         structure: None,
     }
 }
@@ -50,6 +53,8 @@ fn track(id: &str, kind: TrackKind) -> Track {
         midi_enabled: true,
         collapsed: false,
         height_offset: None,
+        match_aliases: Vec::new(),
+        song_region_id: None,
     }
 }
 
@@ -625,6 +630,75 @@ fn forgetting_a_linked_audio_entry_never_deletes_the_video() {
 }
 
 // ---------------------------------------------------------------------------
+// Deleting videos from the library.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_video_on_the_timeline_cannot_be_deleted_from_the_library() {
+    let mut session = two_song_session();
+    session
+        .register_video_assets(vec![("D:/Visuales/letras.mp4".into(), video_info(true))], None)
+        .expect("register");
+
+    assert!(session.delete_video_asset("D:/Visuales/letras.mp4").is_err());
+    assert_eq!(session.list_video_assets().expect("list").len(), 1);
+}
+
+#[test]
+fn deleting_an_external_video_forgets_it_but_keeps_the_file() {
+    let mut session = two_song_session();
+    let outside = tempdir().expect("outside dir");
+    let video_file = outside.path().join("intro.mp4");
+    fs::write(&video_file, b"not really a video").expect("video file");
+    let path = video_file.to_string_lossy().into_owned();
+    session
+        .register_video_assets(vec![(path.clone(), video_info(false))], None)
+        .expect("register");
+
+    let left = session.delete_video_asset(&path).expect("delete");
+
+    assert!(left.is_empty());
+    assert!(video_file.is_file(), "a video referenced in place is the user's file");
+}
+
+#[test]
+fn deleting_a_session_copy_of_a_video_removes_the_file() {
+    let mut session = two_song_session();
+    let song_dir = session.song_dir.clone().unwrap();
+    fs::create_dir_all(song_dir.join("video")).expect("video dir");
+    let video_file = song_dir.join("video").join("intro.mp4");
+    fs::write(&video_file, b"not really a video").expect("video file");
+    session
+        .register_video_assets(vec![("video/intro.mp4".into(), video_info(false))], None)
+        .expect("register");
+
+    let left = session.delete_video_asset("video/intro.mp4").expect("delete");
+
+    assert!(left.is_empty());
+    assert!(!video_file.exists());
+}
+
+#[test]
+fn deleting_a_video_keeps_the_file_an_audio_clip_still_plays() {
+    // On a phone the audio of a video is the video file itself.
+    let mut session = two_song_session();
+    let song_dir = session.song_dir.clone().unwrap();
+    fs::create_dir_all(song_dir.join("video")).expect("video dir");
+    let video_file = song_dir.join("video").join("intro.mp4");
+    fs::write(&video_file, b"not really a video").expect("video file");
+    session
+        .register_video_assets(vec![("video/intro.mp4".into(), video_info(true))], None)
+        .expect("register");
+    let mut edited = song(&session);
+    edited.clips[0].file_path = "video/intro.mp4".into();
+    session.engine.load_song(edited).expect("reload");
+
+    session.delete_video_asset("video/intro.mp4").expect("delete");
+
+    assert!(video_file.is_file(), "the audio clip still plays it");
+}
+
+// ---------------------------------------------------------------------------
 // Videos carried by a .ltpkg (paso 12).
 // ---------------------------------------------------------------------------
 
@@ -696,4 +770,65 @@ fn a_packaged_video_whose_original_is_still_here_is_reused() {
         .expect("place");
     assert!(song.video_clips.iter().all(|clip| clip.file_path == original_path));
     assert!(!song_dir.join("video/letras-original.mp4").exists());
+}
+
+// ---------------------------------------------------------------------------
+// Removing a missing file from the session (clips + library).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn removing_a_missing_audio_takes_its_clips_and_keeps_the_songs() {
+    let mut session = two_song_session();
+    let audio = AudioController::default();
+    let mut edited = song(&session);
+    edited.clips[0].file_path = "audio/gone.wav".into();
+    session.engine.load_song(edited).expect("reload");
+    assert!(session
+        .get_library_assets()
+        .expect("library")
+        .iter()
+        .any(|asset| asset.file_path == "audio/gone.wav" && asset.is_missing));
+
+    session.remove_missing_file("audio/gone.wav", &audio).expect("remove");
+
+    let after = song(&session);
+    assert_eq!(after.clips.iter().map(|clip| clip.id.as_str()).collect::<Vec<_>>(), ["c2"]);
+    assert_eq!(after.regions.len(), 2, "a song is never lost to a missing audio");
+    assert!(!session
+        .missing_media()
+        .expect("missing")
+        .iter()
+        .any(|entry| entry.file_path == "audio/gone.wav"));
+    assert!(!session
+        .get_library_assets()
+        .expect("library")
+        .iter()
+        .any(|asset| asset.file_path == "audio/gone.wav"));
+
+    session.undo_action(&audio).expect("undo");
+    assert_eq!(song(&session).clips.len(), 2);
+}
+
+#[test]
+fn removing_a_missing_video_takes_its_clips_and_library_entry() {
+    let mut session = two_song_session();
+    let audio = AudioController::default();
+    session
+        .register_video_assets(vec![("D:/Visuales/letras.mp4".into(), video_info(true))], None)
+        .expect("register");
+
+    session
+        .remove_missing_file("D:/Visuales/letras.mp4", &audio)
+        .expect("remove");
+
+    assert!(song(&session).video_clips.is_empty());
+    assert!(session.list_video_assets().expect("list").is_empty());
+}
+
+#[test]
+fn a_file_that_is_there_is_not_removed_as_missing() {
+    let mut session = two_song_session();
+    let audio = AudioController::default();
+    assert!(session.remove_missing_file("audio/test.wav", &audio).is_err());
+    assert_eq!(song(&session).clips.len(), 2);
 }

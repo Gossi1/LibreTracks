@@ -15,7 +15,11 @@ pub fn effective_bpm_at(song: &Song, position_seconds: f64) -> f64 {
                 .partial_cmp(&b.start_seconds)
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
-        .map(|marker| marker.bpm)
+        .map(|marker| {
+            // Inside a ramp, the tempo it has reached there.
+            crate::tempo_ramp::tempo_span_at(song, marker.start_seconds)
+                .bpm_at(position_seconds.max(marker.start_seconds))
+        })
         .unwrap_or(song.bpm)
 }
 
@@ -243,6 +247,7 @@ mod tests {
 
     fn region(enabled: bool, source_bpm: Option<f64>) -> SongRegion {
         SongRegion {
+            key_changes: Vec::new(),
             id: "r".into(),
             name: "r".into(),
             start_seconds: 0.0,
@@ -253,6 +258,8 @@ mod tests {
             key: None,
             master: crate::model::SongMaster::default(),
             compact_column_width_rem: None,
+            chart: None,
+            voice_guide_count_style: None,
             structure: None,
         }
     }
@@ -288,6 +295,8 @@ mod tests {
                 midi_enabled: true,
                 collapsed: false,
                 height_offset: None,
+                match_aliases: Vec::new(),
+                song_region_id: None,
             }],
             clips: vec![Clip {
                 id: "c".into(),
@@ -361,11 +370,13 @@ mod tests {
                     id: "m1".into(),
                     start_seconds: 2.0,
                     bpm: 90.0,
+                    ramp: false,
                 },
                 TempoMarker {
                     id: "m2".into(),
                     start_seconds: 5.0,
                     bpm: 140.0,
+                    ramp: false,
                 },
             ],
         );
@@ -382,10 +393,12 @@ mod tests {
                 id: "m1".into(),
                 start_seconds: 4.0,
                 bpm: 140.0,
+                ramp: false,
             }],
         );
         // Region starting at 5.0 inherits 140 BPM from the marker.
         let r = SongRegion {
+            key_changes: Vec::new(),
             id: "r1".into(),
             name: "r1".into(),
             start_seconds: 5.0,
@@ -396,6 +409,8 @@ mod tests {
             key: None,
             master: crate::model::SongMaster::default(),
             compact_column_width_rem: None,
+            chart: None,
+            voice_guide_count_style: None,
             structure: None,
         };
         s.regions.push(r.clone());
@@ -410,6 +425,7 @@ mod tests {
     fn warp_timeline_seconds_shortens_positions_after_faster_region() {
         let mut s = song(120.0, vec![]);
         s.regions.push(SongRegion {
+            key_changes: Vec::new(),
             id: "r1".into(),
             name: "r1".into(),
             start_seconds: 10.0,
@@ -420,6 +436,8 @@ mod tests {
             key: None,
             master: crate::model::SongMaster::default(),
             compact_column_width_rem: None,
+            chart: None,
+            voice_guide_count_style: None,
             structure: None,
         });
 
@@ -435,6 +453,7 @@ mod tests {
     ) -> Song {
         let mut s = song(120.0, vec![]);
         s.regions.push(SongRegion {
+            key_changes: Vec::new(),
             id: "r1".into(),
             name: "r1".into(),
             start_seconds: 0.0,
@@ -445,6 +464,8 @@ mod tests {
             key: None,
             master: crate::model::SongMaster::default(),
             compact_column_width_rem: None,
+            chart: None,
+            voice_guide_count_style: None,
             structure: None,
         });
         s
@@ -502,6 +523,7 @@ mod tests {
     fn source_seconds_at_view_is_inverse_of_warp_for_warp_region() {
         let mut s = song(120.0, vec![]);
         s.regions.push(SongRegion {
+            key_changes: Vec::new(),
             id: "r1".into(),
             name: "r1".into(),
             start_seconds: 10.0,
@@ -512,6 +534,8 @@ mod tests {
             key: None,
             master: crate::model::SongMaster::default(),
             compact_column_width_rem: None,
+            chart: None,
+            voice_guide_count_style: None,
             structure: None,
         });
 
@@ -531,6 +555,7 @@ mod tests {
     fn source_seconds_at_view_is_inverse_of_warp_for_varispeed_region() {
         let mut s = song(120.0, vec![]);
         s.regions.push(SongRegion {
+            key_changes: Vec::new(),
             id: "r1".into(),
             name: "r1".into(),
             start_seconds: 10.0,
@@ -541,6 +566,8 @@ mod tests {
             key: None,
             master: crate::model::SongMaster::default(),
             compact_column_width_rem: None,
+            chart: None,
+            voice_guide_count_style: None,
             structure: None,
         });
 
@@ -558,6 +585,7 @@ mod tests {
         // (5s instead of 10s). A marker at 30s should slide left by 5s.
         let mut s = song(120.0, vec![]);
         s.regions.push(SongRegion {
+            key_changes: Vec::new(),
             id: "r1".into(),
             name: "r1".into(),
             start_seconds: 10.0,
@@ -568,6 +596,8 @@ mod tests {
             key: None,
             master: crate::model::SongMaster::default(),
             compact_column_width_rem: None,
+            chart: None,
+            voice_guide_count_style: None,
             structure: None,
         });
         assert!((warp_timeline_seconds_at(&s, 10.0) - 10.0).abs() < 1e-9);
@@ -579,6 +609,7 @@ mod tests {
     fn warp_timeline_duration_expands_slower_region_span() {
         let mut s = song(90.0, vec![]);
         s.regions.push(SongRegion {
+            key_changes: Vec::new(),
             id: "r1".into(),
             name: "r1".into(),
             start_seconds: 0.0,
@@ -589,6 +620,8 @@ mod tests {
             key: None,
             master: crate::model::SongMaster::default(),
             compact_column_width_rem: None,
+            chart: None,
+            voice_guide_count_style: None,
             structure: None,
         });
 

@@ -9,8 +9,10 @@ mod audio;
 mod commands;
 mod external_project;
 mod infra;
+mod link;
 mod models;
 mod platform;
+mod session_feed;
 mod state;
 mod video;
 
@@ -191,8 +193,13 @@ pub fn run() {
             // available; degrade gracefully (no logging) if it can't resolve
             // rather than aborting startup.
             if let Ok(app_data_dir) = app.handle().path().app_data_dir() {
-                infra::error_log::init(app_data_dir);
+                infra::error_log::init(app_data_dir.clone());
+                // Desktop only: a phone's OS kills backgrounded apps as a
+                // matter of course, which would read as a crash every time.
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                infra::crash_report::install(&app_data_dir);
             }
+            libretracks_video::diagnostics::set_trace_sink(infra::crash_report::breadcrumb_sink);
 
             // Point the C++ engine's debug/diagnostic log at a KNOWN, writable
             // path before the engine is first used. Without this, a packaged
@@ -237,88 +244,44 @@ pub fn run() {
             // take effect for the very first decode.
             infra::settings::apply_decoding_cache_env(&app.handle(), &runtime_settings);
 
+            // Before the audio device opens: on mobile that runs inline below
+            // and takes seconds, while the WebView is already up and asking.
+            // A mirror-mode guest calls `link_guest_snapshot` as it boots, and
+            // with the state not managed yet that was a panic across the JNI
+            // bridge (abort, emulator 2026-10-11). Both only read a config
+            // file here. The feed goes first: the remote subscribes to it.
+            session_feed::initialize_session_feed(app);
+            link::initialize_link(app);
+
             let state = app.state::<DesktopState>();
             state.audio.attach_app_handle(app.handle().clone());
             video_setup::start(app.handle(), &state);
             // The worker parks while the song has no MIDI clips, so starting
             // it on every platform costs nothing when unused.
             state.start_midi_runtime();
-            let initial_device = runtime_settings.selected_output_device_id.clone();
-            let apply_result = state.audio.apply_settings(runtime_settings);
-            // Desktop: a failure to apply the initial audio settings is fatal.
-            // Mobile: tolerate an unavailable output so Android can recover its
-            // route and the first iOS smoke build can boot with the no-link engine.
+            // Desktop: abrir el dispositivo de audio tarda segundos (DirectSound
+            // 2,5-7 s) y `setup` corre en el hilo del bucle de eventos, DESPUES
+            // de crear la ventana: mientras tanto la ventana existe pero nadie
+            // la puede pintar y se queda en negro. Va a un hilo; la interfaz
+            // carga y enseña su pantalla de carga mientras tanto, y cualquier
+            // comando que necesite el motor espera a su cerrojo. Abrirlo fuera
+            // del hilo principal ya pasa hoy: `update_audio_settings` es async.
+            // Movil: igual que siempre, en linea.
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            apply_result.map_err(|error| std::io::Error::other(error.to_string()))?;
-            #[cfg(any(target_os = "android", target_os = "ios"))]
-            if let Err(error) = apply_result {
-                eprintln!(
-                    "[libretracks-audio] mobile: initial audio settings not applied: {error}"
-                );
-            }
-            // If apply_settings nulled out the saved output device (because
-            // the device couldn't be opened — see apply_settings_with_stream_rebuild
-            // in audio/engine.rs), persist the cleaned-up settings to disk so
-            // the next launch doesn't hit the same failure and we don't keep
-            // showing a stale device name to the user.
-            if let Ok(after) = state.audio.current_settings() {
-                if initial_device.is_some() && after.selected_output_device_id.is_none() {
-                    if let Err(e) = infra::settings::save_app_settings(&app.handle(), &after) {
-                        if audio::engine::audio_debug_logging_enabled() {
-                            eprintln!(
-                                "[libretracks-settings] could not persist cleaned-up \
-                                 audio settings after fallback to default device: {e}"
-                            );
+            {
+                let handle = app.handle().clone();
+                std::thread::Builder::new()
+                    .name("lt-startup-audio".into())
+                    .spawn(move || {
+                        if let Err(error) = start_audio_and_midi(&handle, runtime_settings) {
+                            report_fatal_startup_error(&handle, &error);
                         }
-                    }
-                    // Also update the in-memory AppSettingsStore so commands
-                    // that read it (e.g. get_settings) reflect the fallback.
-                    let store = app.state::<AppSettingsStore>();
-                    let _ = store.set(after);
-                }
+                    })
+                    .map_err(std::io::Error::other)?;
             }
-            // Virtual ports and the iOS network session first, so a saved
-            // selection of "LibreTracks In"/"Out" finds its port below.
-            if let Ok(settings) = state.audio.current_settings() {
-                midi::apply_platform_settings(&settings);
-            }
-            state
-                .midi
-                .restart(
-                    app.handle().clone(),
-                    state.audio.command_sender(),
-                    state
-                        .audio
-                        .current_settings()
-                        .ok()
-                        .and_then(|settings| settings.selected_midi_device),
-                )
-                .unwrap_or_else(|error| {
-                    if audio::engine::audio_debug_logging_enabled() {
-                        eprintln!("[libretracks-midi] startup warning: {error}");
-                    }
-                });
-            // Reopen the output port too, so a saved show device is live before
-            // the user presses play. A missing device is a warning, never fatal.
-            state
-                .midi_output
-                .restart(
-                    state
-                        .audio
-                        .current_settings()
-                        .ok()
-                        .and_then(|settings| settings.selected_midi_output_device),
-                )
-                .unwrap_or_else(|error| {
-                    if audio::engine::audio_debug_logging_enabled() {
-                        eprintln!("[libretracks-midi] output startup warning: {error}");
-                    }
-                });
-            // Hot-plug: reopen selected MIDI ports when their device comes
-            // back (plan mobile-midi, paso 04).
-            midi::watch::init(app.handle());
-            // Android: BLE MIDI pedals are only published while held open.
-            midi::bluetooth::reopen_remembered(app.handle());
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            start_audio_and_midi(app.handle(), runtime_settings)
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
             remote::initialize_remote(app)
                 .map_err(|error| std::io::Error::other(error.to_string()))?;
 
@@ -337,6 +300,21 @@ pub fn run() {
             commands::app_close::exit_app,
             commands::app_close::cancel_app_close,
             commands::system::get_telemetry_platform,
+            link::commands::link_get_settings,
+            link::commands::link_save_settings,
+            link::commands::link_start_hosting,
+            link::commands::link_stop_hosting,
+            link::commands::link_host_status,
+            link::commands::link_set_guest_role,
+            link::commands::link_kick_guest,
+            link::commands::link_revoke_trusted,
+            link::commands::link_join,
+            link::commands::link_leave,
+            link::commands::link_guest_snapshot,
+            link::commands::link_guest_command,
+            link::commands::link_proxy_invoke,
+            link::commands::link_start_discovery,
+            link::commands::link_stop_discovery,
             commands::system::get_remote_server_info,
             commands::system::get_remote_firewall_status,
             commands::system::allow_remote_through_firewall,
@@ -350,6 +328,11 @@ pub fn run() {
             commands::system::reconnect_bluetooth_midi,
             commands::system::send_midi_test_note,
             commands::transport::get_transport_snapshot,
+            commands::transport::fade_out_and_stop,
+            commands::library_places::list_library_dir,
+            commands::library_places::list_library_folder_audio,
+            commands::library_places::pick_library_place,
+            commands::library_places::forget_library_place,
             commands::settings::get_settings,
             commands::settings::save_settings,
             commands::settings::update_audio_settings,
@@ -445,6 +428,13 @@ pub fn run() {
             commands::project::video_export_payload,
             commands::render::render_song_audio,
             commands::render::cancel_render_song_audio,
+            commands::level_songs::measure_song_loudness,
+            commands::level_songs::cancel_measure_song_loudness,
+            commands::song_analysis::analyze_song,
+            commands::song_analysis::cancel_analyze_song,
+            commands::song_analysis::apply_song_analysis,
+            commands::speech::speech_model_status,
+            commands::speech::download_speech_model,
             commands::project::import_song_package,
             commands::project::export_session_package,
             commands::project::export_session_package_at,
@@ -452,6 +442,7 @@ pub fn run() {
             commands::project::start_import_session_package_from_dialog,
             commands::project::import_external_project,
             commands::project::resolve_missing_file,
+            commands::project::remove_missing_file,
             commands::project::get_missing_media,
             commands::library::delete_library_asset,
             commands::library::forget_library_assets,
@@ -494,6 +485,9 @@ pub fn run() {
             commands::timeline::create_section_marker,
             commands::timeline::update_section_marker,
             commands::timeline::delete_section_marker,
+            commands::timeline::move_ruler_markers,
+            commands::timeline::duplicate_ruler_markers,
+            commands::timeline::delete_ruler_markers,
             commands::timeline::create_song_region,
             commands::timeline::create_empty_song,
             commands::timeline::update_song_region,
@@ -506,8 +500,13 @@ pub fn run() {
             commands::timeline::discard_song_structure,
             commands::timeline::update_song_region_transpose,
             commands::timeline::update_song_region_warp,
+            commands::timeline::set_song_region_tempo,
+            commands::timeline::set_song_region_key_changes,
             commands::timeline::update_live_region_master_gain,
             commands::timeline::update_song_region_master_gain,
+            commands::timeline::update_song_region_master_gains,
+            commands::timeline::update_song_region_fades,
+            commands::timeline::update_song_region_voice_guide_count_style,
             commands::timeline::delete_song_region,
             commands::timeline::split_song_region,
             commands::timeline::upsert_midi_clip,
@@ -515,6 +514,7 @@ pub fn run() {
             commands::timeline::move_midi_clip,
             commands::timeline::preview_midi_clip,
             commands::video::create_video_clip,
+            commands::video::video_scrub,
             commands::video::update_video_clip,
             commands::video::move_video_clip,
             commands::video::trim_video_clip,
@@ -523,6 +523,7 @@ pub fn run() {
             commands::video::delete_video_clips,
             commands::video::video_media_status,
             commands::video::import_video_files,
+            commands::video::delete_video_asset,
             commands::video::list_video_assets,
             commands::video::request_video_thumbnails,
             commands::video::get_video_thumbnails,
@@ -532,6 +533,7 @@ pub fn run() {
             commands::video::video_apply_settings,
             commands::video::video_identify_displays,
             commands::video::video_test_pattern,
+            commands::video::video_bring_to_front,
             commands::video::video_sync_stats,
             commands::video::video_calibration,
             commands::video::extract_video_audio,
@@ -555,8 +557,10 @@ pub fn run() {
             commands::timeline::update_song_tempo,
             commands::timeline::update_song_region_key,
             commands::timeline::set_song_region_compact_width,
+            commands::charts::set_song_region_chart,
             commands::timeline::upsert_song_tempo_marker,
             commands::timeline::delete_song_tempo_marker,
+            commands::timeline::set_song_tempo_marker_ramp,
             commands::timeline::update_song_time_signature,
             commands::timeline::upsert_song_time_signature_marker,
             commands::timeline::delete_song_time_signature_marker,
@@ -573,6 +577,7 @@ pub fn run() {
             commands::timeline::update_track_color,
             commands::timeline::update_track_transpose_enabled,
             commands::timeline::update_track_mono_downmix,
+            commands::timeline::update_track_match_aliases,
             commands::timeline::update_track_collapsed,
             commands::timeline::update_track_height_offset,
             commands::timeline::delete_track,
@@ -618,7 +623,122 @@ pub fn run() {
             if matches!(event, tauri::RunEvent::ExitRequested { .. }) {
                 save_session_on_exit(app);
             }
+            // Exit (not ExitRequested, which can still be cancelled): from
+            // here on the process ends on purpose.
+            if matches!(event, tauri::RunEvent::Exit) {
+                infra::crash_report::mark_clean_exit();
+            }
         });
+}
+
+/// Abre el dispositivo de audio con los ajustes guardados y levanta el MIDI.
+/// Es lo lento del arranque: en escritorio corre en un hilo propio (ver la
+/// llamada en `setup`). Un error aqui es fatal en escritorio.
+fn start_audio_and_midi(
+    app: &tauri::AppHandle,
+    runtime_settings: infra::settings::AppSettings,
+) -> Result<(), String> {
+    let state = app.state::<DesktopState>();
+    let initial_device = runtime_settings.selected_output_device_id.clone();
+    let apply_result = state.audio.apply_settings(runtime_settings);
+    // Desktop: a failure to apply the initial audio settings is fatal.
+    // Mobile: tolerate an unavailable output so Android can recover its
+    // route and the first iOS smoke build can boot with the no-link engine.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    apply_result.map_err(|error| error.to_string())?;
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    if let Err(error) = apply_result {
+        eprintln!(
+            "[libretracks-audio] mobile: initial audio settings not applied: {error}"
+        );
+    }
+    // If apply_settings nulled out the saved output device (because
+    // the device couldn't be opened — see apply_settings_with_stream_rebuild
+    // in audio/engine.rs), persist the cleaned-up settings to disk so
+    // the next launch doesn't hit the same failure and we don't keep
+    // showing a stale device name to the user.
+    if let Ok(after) = state.audio.current_settings() {
+        if initial_device.is_some() && after.selected_output_device_id.is_none() {
+            if let Err(e) = infra::settings::save_app_settings(app, &after) {
+                if audio::engine::audio_debug_logging_enabled() {
+                    eprintln!(
+                        "[libretracks-settings] could not persist cleaned-up \
+                         audio settings after fallback to default device: {e}"
+                    );
+                }
+            }
+            // Also update the in-memory AppSettingsStore so commands
+            // that read it (e.g. get_settings) reflect the fallback.
+            let store = app.state::<AppSettingsStore>();
+            let _ = store.set(after.clone());
+            // On desktop the UI may already be up and showing the saved
+            // device (audio starts on its own thread): tell it about the
+            // fallback, the same way save_settings does.
+            let _ = tauri::Emitter::emit(app, "settings:updated", after);
+        }
+    }
+    // Virtual ports and the iOS network session first, so a saved
+    // selection of "LibreTracks In"/"Out" finds its port below.
+    if let Ok(settings) = state.audio.current_settings() {
+        midi::apply_platform_settings(&settings);
+    }
+    state
+        .midi
+        .restart(
+            app.clone(),
+            state.audio.command_sender(),
+            state
+                .audio
+                .current_settings()
+                .ok()
+                .and_then(|settings| settings.selected_midi_device),
+        )
+        .unwrap_or_else(|error| {
+            if audio::engine::audio_debug_logging_enabled() {
+                eprintln!("[libretracks-midi] startup warning: {error}");
+            }
+        });
+    // Reopen the output port too, so a saved show device is live before
+    // the user presses play. A missing device is a warning, never fatal.
+    state
+        .midi_output
+        .restart(
+            state
+                .audio
+                .current_settings()
+                .ok()
+                .and_then(|settings| settings.selected_midi_output_device),
+        )
+        .unwrap_or_else(|error| {
+            if audio::engine::audio_debug_logging_enabled() {
+                eprintln!("[libretracks-midi] output startup warning: {error}");
+            }
+        });
+    // Hot-plug: reopen selected MIDI ports when their device comes
+    // back (plan mobile-midi, paso 04).
+    midi::watch::init(app);
+    // Android: BLE MIDI pedals are only published while held open.
+    midi::bluetooth::reopen_remembered(app);
+    Ok(())
+}
+
+/// El arranque del audio fallo en su hilo: ya no hay un `setup` al que
+/// devolverle el error, asi que se dice en un dialogo y se cierra, en vez de
+/// dejar una ventana viva sin motor.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn report_fatal_startup_error(app: &tauri::AppHandle, error: &str) {
+    eprintln!("[libretracks-audio] startup failed: {error}");
+    rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Error)
+        .set_title("LibreTracks")
+        .set_description(format!(
+            "No se pudo iniciar el audio / Could not start audio:
+
+{error}"
+        ))
+        .set_buttons(rfd::MessageButtons::Ok)
+        .show();
+    app.exit(1);
 }
 
 /// Best-effort flush of the loaded session during app shutdown.

@@ -132,6 +132,18 @@ pub(super) fn register_video_entries(
     Ok(registered)
 }
 
+/// Drop the library entries that name `file_path` (its file is gone).
+pub(super) fn forget_video_entries(song_dir: &Path, file_path: &str) -> Result<(), DesktopError> {
+    let mut entries = read_video_entries(song_dir)?;
+    let file_path = normalize_library_file_path(file_path);
+    let before = entries.len();
+    entries.retain(|entry| normalize_library_file_path(&entry.file_path) != file_path);
+    if entries.len() != before {
+        write_video_entries(song_dir, entries)?;
+    }
+    Ok(())
+}
+
 /// Point library entries that named `old_path` at `new_path` (relink).
 pub(super) fn relink_video_entries(
     song_dir: &Path,
@@ -241,6 +253,61 @@ impl DesktopSession {
             write_video_entries(&song_dir, entries)?;
         }
         Ok(())
+    }
+
+    /// Take a video out of the session library.
+    ///
+    /// Refused while a video clip still uses it, like the audio delete. Videos
+    /// are referenced where they are, so the file itself is only removed when
+    /// it is a copy living inside the session (a package's `video/`, a phone's
+    /// import) that no other library entry or audio clip still points at —
+    /// on a phone the audio of a video is the video file itself.
+    pub fn delete_video_asset(
+        &mut self,
+        file_path: &str,
+    ) -> Result<Vec<VideoAssetSummary>, DesktopError> {
+        let song_dir = self.song_dir.clone().ok_or(DesktopError::NoSongLoaded)?;
+        let song = self.engine.song().cloned().ok_or(DesktopError::NoSongLoaded)?;
+        let normalized_file_path = normalize_library_file_path(file_path);
+        let doomed_key = library_file_identity(&song_dir, &normalized_file_path);
+
+        if song
+            .video_clips
+            .iter()
+            .any(|clip| library_file_identity(&song_dir, &clip.file_path) == doomed_key)
+        {
+            return Err(DesktopError::AudioCommand(
+                "cannot delete a library video that is already used on the timeline".into(),
+            ));
+        }
+
+        let mut entries = read_video_entries(&song_dir)?;
+        entries.retain(|entry| entry.file_path != normalized_file_path);
+        write_video_entries(&song_dir, entries.clone())?;
+
+        let still_claimed = entries
+            .iter()
+            .any(|entry| library_file_identity(&song_dir, &entry.file_path) == doomed_key)
+            || song
+                .clips
+                .iter()
+                .any(|clip| library_file_identity(&song_dir, &clip.file_path) == doomed_key)
+            || read_library_manifest(&song_dir)?.is_some_and(|manifest| {
+                manifest
+                    .file_paths
+                    .iter()
+                    .chain(manifest.assets.iter().map(|asset| &asset.file_path))
+                    .any(|path| library_file_identity(&song_dir, path) == doomed_key)
+            });
+        let source = resolve_video_source(&song_dir, &normalized_file_path);
+        let inside_session = !crate::platform::content_uri::is_external_audio_path(
+            &normalized_file_path,
+        );
+        if inside_session && !still_claimed && source.is_file() {
+            std::fs::remove_file(&source)?;
+        }
+
+        self.list_video_assets()
     }
 
     /// The name the library shows for a video path, if it stores one.

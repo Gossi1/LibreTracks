@@ -115,6 +115,7 @@ struct CmdSetVoiceGuideConfig {
     std::string route = "monitor";
     int lead_bars = 1;
     bool count_in_enabled = true;
+    int count_style = 0;   // VoiceGuideCountStyle (0 = Full)
 };
 
 struct CmdLoadVoiceGuideBank {
@@ -143,6 +144,21 @@ struct CmdSetPadConfig {
 // (region) ends, instead of rolling into the next one. Off by default. A
 // scheduled jump due on that same boundary still wins: the user asked for it.
 struct CmdSetPauseAtSongEnd { bool enabled = false; };
+
+// Vamp between songs
+// ---------------------------------------------------------------------------
+// Pauses on a song end like the above, but keeps the click going at the ended
+// song's tempo and meter (and a pad that stops with the transport sounding)
+// until the next Play. CmdEndSongGapVamp silences it without playing: the
+// host sends it for a user Pause/Stop, never for its own mirror of the pause.
+struct CmdSetSongGapVamp { bool enabled = false; };
+struct CmdEndSongGapVamp {};
+
+// Punto de medida de los vumetros de pista y carpeta (ajuste global de la
+// app). JSON: {"type":"SetTrackMeterMode","mode":"postFader"|"postPan"|
+// "preFader"}; un valor desconocido cae en postFader. Ver lt::TrackMeterMode
+// (render/mixer.h): 0 = PostFader, 1 = PostPan, 2 = PreFader.
+struct CmdSetTrackMeterMode { int mode = 0; };
 
 // Decode a single pad key from disk and hand it to the renderer. Runs the
 // (slow) decode on the command thread; the resulting clip is swapped in
@@ -186,6 +202,9 @@ struct CmdSetSongRegions {
         bool        warp_enabled = false;
         double      warp_source_bpm = 0.0;
         float       master_gain = 1.0f;
+        Frame       fade_in_frames = 0;
+        Frame       fade_out_frames = 0;
+        int         voice_guide_count_style = -1;   // -1 = follow global
     };
     Id song_id;
     std::vector<RegionUpdate> regions;
@@ -230,6 +249,7 @@ struct CmdSetSongTiming {
         Id     id;
         Frame  frame = 0;
         double bpm = 120.0;
+        bool   ramp = false;
     };
     struct TimeSignatureMarkerUpdate {
         Id     id;
@@ -392,7 +412,8 @@ using EngineCommand = std::variant<
     CmdSetMetronomeConfig,
     CmdSetVoiceGuideConfig, CmdLoadVoiceGuideBank,
     CmdSetPadConfig, CmdLoadPadClip,
-    CmdSetPauseAtSongEnd,
+    CmdSetPauseAtSongEnd, CmdSetSongGapVamp, CmdEndSongGapVamp,
+    CmdSetTrackMeterMode,
     CmdSetSongTranspose, CmdSetRegionTranspose, CmdSetRegionWarp, CmdSetRegionMasterGain, CmdSetSongRegions,
     CmdSetSongClips, CmdSetSongMarkers, CmdSetSongTiming, CmdSetSongTimelineWindow,
     CmdUpsertSongTracks, CmdPrepareSources,

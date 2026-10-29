@@ -10,6 +10,7 @@ import {
   redoAction,
   seekTransport,
   stopTransport,
+  fadeOutAndStop,
   undoAction,
 } from "../desktopApi";
 import {
@@ -90,6 +91,11 @@ type TimelineKeyboardShortcutsProps = {
   /** Split/delete/duplicate for selected VIDEO clips (video/videoClipHandlers).
    * Each returns whether a video selection handled the key; the audio action
    * still runs for any selected audio clips. */
+  /** Supr y Ctrl+D sobre una seleccion multiple de marcas (rulerMarkers/). */
+  rulerMarkers?: {
+    deleteSelected: () => boolean;
+    duplicateSelected: () => boolean;
+  };
   videoEdits?: {
     splitSelected: () => Promise<boolean>;
     deleteSelected: () => boolean;
@@ -136,10 +142,13 @@ export function useTimelineKeyboardShortcuts({
   t,
   toggleViewMode,
   toggleViewModeBackward,
+  rulerMarkers,
   videoEdits,
 }: TimelineKeyboardShortcutsProps) {
   const videoEditsRef = useRef(videoEdits);
   videoEditsRef.current = videoEdits;
+  const rulerMarkersRef = useRef(rulerMarkers);
+  rulerMarkersRef.current = rulerMarkers;
   // Kept in a ref, not the effect's dep array: it closes over per-render
   // values in the panel, so listing it would re-register the key listener on
   // every render.
@@ -197,6 +206,12 @@ export function useTimelineKeyboardShortcuts({
           const nextSnapshot = await stopTransport();
           applyPlaybackSnapshot(nextSnapshot);
           setStatus(t("transport.status.playbackStopped"));
+        });
+      },
+      "transport.fadeOutStop": (event) => {
+        event.preventDefault();
+        void runAction(async () => {
+          applyPlaybackSnapshot(await fadeOutAndStop());
         });
       },
       "transport.gotoStart": (event) => {
@@ -266,6 +281,11 @@ export function useTimelineKeyboardShortcuts({
         if (videoEditsRef.current?.duplicateSelected() && selectedClipIds.length === 0) {
           return;
         }
+        // Marcas de la regla: seleccionarlas suelta clips y pistas, asi que si
+        // hay marcas elegidas son lo que se duplica.
+        if (selectedClipIds.length === 0 && rulerMarkersRef.current?.duplicateSelected()) {
+          return;
+        }
         void runAction(async () => {
           if (await duplicateSelectedClips()) {
             setStatus(t("transport.status.clipsDuplicated"));
@@ -322,6 +342,13 @@ export function useTimelineKeyboardShortcuts({
         // Selected video clips go first. With no audio clip also selected,
         // stop there: the fallbacks below would delete tracks or the song.
         if (videoEditsRef.current?.deleteSelected() && !selectedClipId && selectedClipIds.length === 0) {
+          return;
+        }
+        if (
+          selectedClipIds.length === 0 &&
+          selectedTrackIds.length === 0 &&
+          rulerMarkersRef.current?.deleteSelected()
+        ) {
           return;
         }
         if (selectedClipIds.length > 1) {

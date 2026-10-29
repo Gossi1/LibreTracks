@@ -11,7 +11,7 @@ import type {
   ActiveVampSummary,
   PendingAutomationCueSummary,
   PendingJumpSummary,
-  MarkerCategory,
+  RulerMarkerRef,
   SectionMarkerSummary,
   SongRegionSummary,
   TempoMarkerSummary,
@@ -27,6 +27,7 @@ import {
   InputManager,
   type TimelineNavigationScheme,
 } from "../Renderer/InputManager";
+import type { MarkerMovePreview } from "./useMarkerMoveDrag";
 import {
   drawGridLines,
   drawRulerBackgroundLayer,
@@ -60,6 +61,7 @@ import {
   timelineVisibleTrackHeight,
 } from "../Renderer/canvasPixelRatio";
 import { intersectVisibleBounds } from "../Renderer/gestureBounds";
+import type { AreaSelectGesture } from "../mobile/MobileTimelineNavigation";
 import { createTimelineVerticalScroller } from "./timelineVerticalScroll";
 import { isMobileApp } from "../desktopApi";
 import { consumeVideoRepaint } from "../video/videoCanvasState";
@@ -84,7 +86,8 @@ type RulerCanvasProps = {
   tempoMarkers: TempoMarkerSummary[];
   timeSignatureMarkers: TimeSignatureMarkerSummary[];
   selectedRegionId: string | null;
-  selectedMarkerId: string | null;
+  /** Ids de las marcas seleccionadas, de cualquier tipo (seleccion multiple). */
+  selectedMarkerIds: readonly string[];
   pendingMarkerJump: PendingJumpSummary | null;
   pendingAutomationCue: PendingAutomationCueSummary | null;
   activeVamp: ActiveVampSummary | null;
@@ -98,11 +101,7 @@ type RulerCanvasProps = {
    * El bucle sustituye la marca arrastrada por su posición y carril de
    * previsualización justo antes de pintar.
    */
-  markerMovePreviewRef?: MutableRefObject<{
-    markerId: string;
-    startSeconds: number;
-    category: MarkerCategory;
-  } | null>;
+  markerMovePreviewRef?: MutableRefObject<MarkerMovePreview>;
   interactionContainerRef: RefObject<HTMLDivElement | null>;
   canNativeZoom: boolean;
   navigationScheme: TimelineNavigationScheme;
@@ -143,6 +142,8 @@ type TrackCanvasProps = {
   onTouchShouldEdit?: (clientX: number, clientY: number, target: EventTarget | null) => boolean;
   /** Tactil: toque sin arrastre; selecciona el clip bajo el dedo o limpia. */
   onTouchTap?: (clientX: number, clientY: number, target: EventTarget | null) => void;
+  /** Tactil: recuadro de seleccion por area (ver mobile/areaSelection). */
+  touchAreaSelect?: AreaSelectGesture;
   clipPreviewSecondsRef: MutableRefObject<Record<string, number>>;
   clipPreviewTrackIdRef: MutableRefObject<Record<string, string>>;
   trackHeightForInput: number;
@@ -290,14 +291,13 @@ function buildWaveformCacheSignature(
  */
 export function applyMarkerMovePreview(
   markers: SectionMarkerSummary[],
-  preview: {
-    markerId: string;
-    startSeconds: number;
-    category: MarkerCategory;
-  } | null,
+  preview: MarkerMovePreview,
 ): SectionMarkerSummary[] {
   if (!preview) {
     return markers;
+  }
+  if (preview.group) {
+    return applyGroupMovePreview(markers, preview, "section");
   }
   return markers.map((marker) =>
     marker.id === preview.markerId
@@ -306,6 +306,32 @@ export function applyMarkerMovePreview(
           startSeconds: preview.startSeconds,
           categoryOverride: preview.category,
         }
+      : marker,
+  );
+}
+
+/**
+ * Arrastre de GRUPO: desplaza lo mismo a cada marca de este tipo que este en
+ * el grupo. Misma regla que arriba: sin grupo devuelve la MISMA lista.
+ */
+export function applyGroupMovePreview<T extends { id: string; startSeconds: number }>(
+  markers: T[],
+  preview: MarkerMovePreview,
+  kind: RulerMarkerRef["kind"],
+): T[] {
+  const group = preview?.group;
+  if (!group || group.deltaSeconds === 0) {
+    return markers;
+  }
+  const ids = new Set(
+    group.markers.filter((marker) => marker.kind === kind).map((marker) => marker.id),
+  );
+  if (ids.size === 0) {
+    return markers;
+  }
+  return markers.map((marker) =>
+    ids.has(marker.id)
+      ? { ...marker, startSeconds: marker.startSeconds + group.deltaSeconds }
       : marker,
   );
 }
@@ -323,7 +349,7 @@ export function TimelineRulerCanvas({
   tempoMarkers,
   timeSignatureMarkers,
   selectedRegionId,
-  selectedMarkerId,
+  selectedMarkerIds,
   pendingMarkerJump,
   pendingAutomationCue,
   activeVamp,
@@ -354,7 +380,7 @@ export function TimelineRulerCanvas({
     tempoMarkers,
     timeSignatureMarkers,
     selectedRegionId,
-    selectedMarkerId,
+    selectedMarkerIds,
     pendingMarkerJump,
     pendingAutomationCue,
     activeVamp,
@@ -373,7 +399,7 @@ export function TimelineRulerCanvas({
     tempoMarkers,
     timeSignatureMarkers,
     selectedRegionId,
-    selectedMarkerId,
+    selectedMarkerIds,
     pendingMarkerJump,
     pendingAutomationCue,
     activeVamp,
@@ -386,7 +412,7 @@ export function TimelineRulerCanvas({
       regions
         .map(
           (region) =>
-            `${region.id}:${region.name}:${region.startSeconds}:${region.endSeconds}:${region.warpEnabled ? 1 : 0}:${region.warpSourceBpm ?? 0}:${region.transposeSemitones}:${region.key ?? ""}`,
+            `${region.id}:${region.name}:${region.startSeconds}:${region.endSeconds}:${region.warpEnabled ? 1 : 0}:${region.warpSourceBpm ?? 0}:${region.transposeSemitones}:${region.key ?? ""}:${(region.keyChanges ?? []).map((change) => `${change.startSeconds}=${change.key}`).join(",")}`,
         )
         .join("|"),
     [regions],
@@ -404,6 +430,7 @@ export function TimelineRulerCanvas({
     [markers],
   );
 
+  const selectedMarkersSignature = selectedMarkerIds.join("|");
   const tempoMarkersSignature = useMemo(
     () =>
       tempoMarkers.map((m) => `${m.id}:${m.startSeconds}:${m.bpm}`).join("|"),
@@ -439,7 +466,7 @@ export function TimelineRulerCanvas({
     activeVampSignature,
     pixelsPerSecond,
     selectedRegionId,
-    selectedMarkerId,
+    selectedMarkersSignature,
     timelineGrid,
     width,
   ]);
@@ -678,7 +705,7 @@ export function TimelineRulerCanvas({
           // lista mientras hay un arrastre, y sólo cuando el preview cambia.
           const markerPreview = snapshot.markerMovePreviewRef?.current ?? null;
           const markerPreviewKey = markerPreview
-            ? `${markerPreview.markerId}:${markerPreview.startSeconds}:${markerPreview.category}`
+            ? `${markerPreview.markerId}:${markerPreview.startSeconds}:${markerPreview.category}:${markerPreview.group?.deltaSeconds ?? ""}`
             : "";
           const shouldRedrawOverlay =
             lastOverlaySceneVersion !== sceneVersionRef.current ||
@@ -704,11 +731,19 @@ export function TimelineRulerCanvas({
               pixelsPerSecond: livePixelsPerSecond,
               playheadSeconds,
               markers: applyMarkerMovePreview(snapshot.markers, markerPreview),
-              tempoMarkers: snapshot.tempoMarkers,
-              timeSignatureMarkers: snapshot.timeSignatureMarkers,
+              tempoMarkers: applyGroupMovePreview(
+                snapshot.tempoMarkers,
+                markerPreview,
+                "tempo",
+              ),
+              timeSignatureMarkers: applyGroupMovePreview(
+                snapshot.timeSignatureMarkers,
+                markerPreview,
+                "timeSignature",
+              ),
               pendingMarkerJump: snapshot.pendingMarkerJump,
               pendingAutomationCue: snapshot.pendingAutomationCue,
-              selectedMarkerId: snapshot.selectedMarkerId,
+              selectedMarkerIds: snapshot.selectedMarkerIds,
               currentMarkerId,
               pulseAlpha,
             });
@@ -797,6 +832,7 @@ export function TimelineTrackCanvas({
   selectedClipIds,
   onTouchShouldEdit,
   onTouchTap,
+  touchAreaSelect,
   clipPreviewSecondsRef,
   clipPreviewTrackIdRef,
   trackHeightForInput,
@@ -851,6 +887,8 @@ export function TimelineTrackCanvas({
   const onTouchTapRef = useRef(onTouchTap);
   onTouchShouldEditRef.current = onTouchShouldEdit;
   onTouchTapRef.current = onTouchTap;
+  const touchAreaSelectRef = useRef(touchAreaSelect);
+  touchAreaSelectRef.current = touchAreaSelect;
   // Espejo en refs de TODO lo que el gesto llama.
   //
   // Estas props llegan como funciones nuevas en cada render del panel de
@@ -943,6 +981,15 @@ export function TimelineTrackCanvas({
           onTouchShouldEditRef.current?.(clientX, clientY, target) ?? false,
         onTap: (clientX, clientY, target) =>
           onTouchTapRef.current?.(clientX, clientY, target),
+        areaSelect: {
+          active: () => touchAreaSelectRef.current?.active() ?? false,
+          begin: (clientX, clientY) =>
+            touchAreaSelectRef.current?.begin(clientX, clientY),
+          update: (clientX, clientY) =>
+            touchAreaSelectRef.current?.update(clientX, clientY),
+          end: () => touchAreaSelectRef.current?.end(),
+          cancel: () => touchAreaSelectRef.current?.cancel(),
+        },
         // El dedo no puede pagar un reflujo por muestra: el gesto lleva su
         // propio objetivo de desplazamiento y solo ESCRIBE (ver
         // timelineVerticalScroll). La rueda se queda con el `+=` de arriba.

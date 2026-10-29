@@ -250,6 +250,7 @@ pub fn import_wav_song(
         tempo_markers: vec![],
         time_signature_markers: vec![],
         regions: vec![SongRegion {
+            key_changes: Vec::new(),
             id: format!("region_{}", slugify(&request.title)),
             name: request.title.clone(),
             start_seconds: 0.0,
@@ -260,6 +261,8 @@ pub fn import_wav_song(
             warp_source_bpm: None,
             master: libretracks_core::SongMaster::default(),
             compact_column_width_rem: None,
+            chart: None,
+            voice_guide_count_style: None,
             structure: None,
         }],
         tracks: imported_files
@@ -283,6 +286,8 @@ pub fn import_wav_song(
                 midi_enabled: true,
                 collapsed: false,
                 height_offset: None,
+                match_aliases: Vec::new(),
+                song_region_id: None,
             })
             .collect(),
         clips: imported_files
@@ -373,6 +378,8 @@ pub fn append_wav_files_to_song(
             midi_enabled: true,
             collapsed: false,
             height_offset: None,
+            match_aliases: Vec::new(),
+            song_region_id: None,
         });
 
         next_song.clips.push(Clip {

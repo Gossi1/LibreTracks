@@ -25,6 +25,21 @@
 
 namespace lt {
 
+// Punto de medida del vumetro de PISTA (y de carpeta). Ajuste global de la app
+// (CmdSetTrackMeterMode). El master no cambia nunca.
+//
+//   PostFader (por defecto, como Ableton): lo que la pista manda a la mezcla
+//     tras su paneo, su volumen, su mute y el solo (una pista muteada o
+//     silenciada por el solo de otra marca 0). La ganancia y el mute de las
+//     CARPETAS padre NO entran en el medidor de la pista: igual que en
+//     Ableton/Reaper/Logic, el fader del grupo va despues y se ve en el medidor
+//     del grupo. El medidor de carpeta si lleva su propio fader (y los de sus
+//     carpetas padre).
+//   PostPan: post-paneo, pre-fader (no lo mueven volumen, mute ni solo).
+//   PreFader: la entrada cruda de la pista, lo que entregan sus clips, antes
+//     de suma a mono, paneo y volumen.
+enum class TrackMeterMode : int { PostFader = 0, PostPan = 1, PreFader = 2 };
+
 // ---------------------------------------------------------------------------
 // Mixer — JUCE AudioRenderCallback implementation.
 //
@@ -60,6 +75,17 @@ public:
     // Pause the transport by itself on the frame where a song (region) ends.
     // Command thread; read by the audio thread at the top of each block.
     void set_pause_at_song_end(bool enabled) noexcept;
+    // "Vamp between songs": the transport pauses on the frame a song ends on
+    // (as with pause at song end), but the click keeps going at that song's
+    // tempo and meter, and a pad that stops with the transport stays on, until
+    // the next Play or end_song_gap_vamp() (a user Pause/Stop). Command thread.
+    void set_song_gap_vamp(bool enabled) noexcept;
+    void end_song_gap_vamp() noexcept;
+    // Punto de medida de los vumetros de pista y carpeta (ver TrackMeterMode).
+    // Hebra de control; el hilo de audio lo lee una vez por bloque.
+    void set_track_meter_mode(TrackMeterMode mode) noexcept;
+    TrackMeterMode track_meter_mode() const noexcept;
+    bool song_gap_vamp_active() const noexcept;
     // preserve_realtime_state=true: keep existing gain/pan/mute/solo atomics for known tracks
     //   (used for session pointer swaps during transpose/region changes — slider state survives).
     // preserve_realtime_state=false: always load values from session
@@ -147,6 +173,12 @@ public:
 
     // Sentinel returned by take_pending_scheduled_jump() when no jump is pending.
     static constexpr Frame kNoJumpPending = -1;
+
+    // Same handshake for a PREPARED scheduled jump: its voice set only covers
+    // the clips audible at the target, so the control thread must enroll the
+    // ones that start later (BungeeVoiceManager::enroll_missing_voices) or they
+    // play silent when the playhead reaches them. kNoJumpPending if none.
+    Frame take_pending_prepared_jump() noexcept;
 
 #if defined(LT_ENGINE_TEST_HOOKS)
     // Test-only latch: exercise the render fallback used while rebuilding the
@@ -308,12 +340,17 @@ private:
         float start_pan = 0.f, end_pan = 0.f;
         float start_mute_gain = 0.f, end_mute_gain = 0.f;
         float start_solo_gain = 0.f, end_solo_gain = 0.f;
-        float peak_l = 0.f, peak_r = 0.f;
-        float rms_l = 0.f, rms_r = 0.f;
+        // Lo que marca el medidor de la pista (segun TrackMeterMode); las
+        // carpetas acumulan esto.
+        float meter_peak_l = 0.f, meter_peak_r = 0.f;
+        float meter_rms_l = 0.f, meter_rms_r = 0.f;
         int   left_channel = 0, right_channel = -1;
         const Track* track = nullptr;
         std::size_t  map_index = 0;
         bool         has_ancestor_map = false;
+        // Modo de medida con el que se midio este bloque: las carpetas lo
+        // siguen (en PostFader aplican su propio fader).
+        TrackMeterMode meter_mode = TrackMeterMode::PostFader;
     };
     std::vector<TrackBlockState> track_block_state_;
 
@@ -353,16 +390,22 @@ private:
     std::atomic<int> track_meter_count_{0};
 
     // Per-region meters. Updated inside update_region_meters so the value
-    // reflects the post-master signal of whichever region holds the playhead.
+    // reflects the post-master signal of the TRACKS of whichever region holds
+    // the playhead (never the metronome, voice guide or pad).
     // Inactive regions decay toward zero with a fixed release time so the bar
     // doesn't snap off when crossing region boundaries.
     static constexpr int kMaxRegions = 128;
     struct RegionMeterSlot {
         Id region_id;
-        std::atomic<float> peak{0.f};
+        std::atomic<float> left_peak{0.f};
+        std::atomic<float> right_peak{0.f};
     };
     std::array<RegionMeterSlot, kMaxRegions> region_meters_;
     std::atomic<int> region_meter_count_{0};
+    // Track-bus peak (L, R) of the current callback, captured right after the
+    // song master is applied and before the click/guide/pad are mixed in.
+    // Audio thread only; update_region_meters consumes and clears it.
+    float region_block_peaks_[2] = {0.f, 0.f};
 
     // Callback stats.
     std::atomic<int>    callback_count_{0};
@@ -397,6 +440,15 @@ private:
     std::atomic<std::uint64_t> scheduled_jump_executed_count_{0};
     std::atomic<bool> pause_at_song_end_{false};
     std::atomic<std::uint64_t> song_end_pause_count_{0};
+    std::atomic<bool> song_gap_vamp_enabled_{false};
+    std::atomic<int> track_meter_mode_{static_cast<int>(TrackMeterMode::PostFader)};
+    // Set by the audio thread when it pauses on a song end with the vamp on;
+    // cleared by Play (either thread) or end_song_gap_vamp().
+    std::atomic<bool> song_gap_vamp_active_{false};
+    // Audio thread only: the ended song's frozen click timing and the virtual
+    // playhead the click runs on while the transport is parked.
+    Song song_gap_vamp_timing_;
+    Frame song_gap_vamp_frame_ = 0;
 
     std::atomic<std::uint64_t> master_fade_request_seq_{0};
     std::atomic<float> master_fade_target_gain_{1.0f};
@@ -416,6 +468,8 @@ private:
     // so the control thread can call prepare_for_transport_discontinuity() for pitch.
     // Sentinel: -1 means no pending jump. Written from audio thread, read from control thread.
     std::atomic<Frame> pending_scheduled_jump_frame_{kNoJumpPending};
+    // Target of the last prepared scheduled jump, awaiting its voice top-up.
+    std::atomic<Frame> pending_prepared_jump_frame_{kNoJumpPending};
 
     // Click-free crossfade around seeks/jumps.
     FadeProcessor fade_;
@@ -432,7 +486,9 @@ private:
                                        float right_peak,
                                        float left_rms,
                                        float right_rms,
-                                       const std::array<int, kMaxFolderDepth>* precomputed_ancestors = nullptr) noexcept;
+                                       const std::array<int, kMaxFolderDepth>* precomputed_ancestors = nullptr,
+                                       bool apply_folder_faders = false,
+                                       std::size_t song_slot_base = 0) noexcept;
     void render_timeline_span(float** output_channels,
                               int num_channels,
                               int num_frames,
@@ -459,6 +515,12 @@ private:
                                      int output_offset) noexcept;
     void end_master_fade_block(int num_frames) noexcept;
     void apply_output_limiter(float** output_channels, int num_channels, int num_frames) noexcept;
+    // Clicks the vamp between songs into `num_frames` frames from
+    // `output_offset`, advancing its virtual playhead. Audio thread.
+    void render_song_gap_vamp(float** output_channels,
+                              int num_channels,
+                              int num_frames,
+                              int output_offset) noexcept;
     // Multiplies the track bus by the master_gain of whichever region
     // contains `timeline_frame`. Called right after the track render loop and
     // BEFORE the metronome/voice-guide are mixed in, so the song master volume
@@ -472,13 +534,15 @@ private:
                                             int output_offset,
                                             const Session* session,
                                             Frame timeline_frame) noexcept;
-    // master_gain of whichever region contains `timeline_frame` (1.0 if none).
-    float region_master_gain_at(const Session* session, Frame timeline_frame) const noexcept;
-    // Updates the per-region meters from the final output bus (post master
-    // fade), so the bar reflects what the song actually sends to the device.
-    void update_region_meters(float** output_channels,
-                              int num_channels,
-                              int num_frames,
+    // Accumulates the track-bus peak into region_block_peaks_. Called right
+    // after the song master / transition fade, BEFORE the metronome and voice
+    // guide are mixed in: the song meter must show the song, not the click.
+    void capture_region_track_peaks(float** output_channels,
+                                    int num_channels,
+                                    int num_frames,
+                                    int output_offset) noexcept;
+    // Updates the per-region meters from the peaks captured this callback.
+    void update_region_meters(int num_frames,
                               const Session* session,
                               Frame timeline_frame) noexcept;
     TrackControlState* control_for_track(const Id& track_id) noexcept;

@@ -32,6 +32,9 @@ export const MARKER_KINDS: readonly MarkerKind[] = [
   "breakdown",
   "drop",
   "solo",
+  "drum_solo",
+  "bass_solo",
+  "guitar_solo",
   "outro",
   "acapella",
   "instrumental",
@@ -96,6 +99,12 @@ const MARKER_KIND_LABELS: Record<MarkerKind, string> = {
   get_ready: "Get Ready",
   ease_down: "Ease Down",
   next_song: "Next Song",
+  drum_solo: "Drum Solo",
+  bass_solo: "Bass Solo",
+  guitar_solo: "Guitar Solo",
+  tempo_up: "Speed Up",
+  tempo_down: "Slow Down",
+  count: "Count",
 };
 
 
@@ -120,6 +129,8 @@ const MARKER_KIND_MAX_VARIANT: Partial<Record<MarkerKind, number>> = {
   chorus: 4,
   bridge: 4,
   pre_chorus: 4,
+  // The numbers: counts/1..7.wav in every bundled language.
+  count: 7,
 };
 
 /** Available numbered variants for a kind, e.g. [1,2,3,4] for chorus, [] when
@@ -128,6 +139,12 @@ export function markerKindVariants(kind: MarkerKind | undefined): number[] {
   const max = kind ? MARKER_KIND_MAX_VARIANT[kind] : undefined;
   if (!max) return [];
   return Array.from({ length: max }, (_, i) => i + 1);
+}
+
+/** Kinds whose marker means nothing without a number: a Count with no
+ * variant says nothing, so the menus offer only "Count 1".."Count 7". */
+export function markerKindNeedsVariant(kind: MarkerKind | undefined): boolean {
+  return kind === "count";
 }
 
 /** Cue kinds that have NO voice recording in a given language, so creating one

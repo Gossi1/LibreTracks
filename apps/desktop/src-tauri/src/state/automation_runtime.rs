@@ -26,6 +26,12 @@ use super::{
     DesktopSession, PendingAutomationJump,
 };
 
+/// Margin a jump needs ahead of the playhead to be armed natively: the native
+/// scheduler only fires trigger frames it has not rendered past yet, so a jump
+/// whose instant the landing already reached is armed this far ahead instead
+/// (otherwise it would never fire and would hold every later cue hostage).
+const LANDING_JUMP_MARGIN_SECONDS: f64 = 0.05;
+
 pub(super) fn native_region_jump_trigger_view_seconds(
     source_song: &Song,
     pending_jump: &PendingMarkerJump,
@@ -363,6 +369,39 @@ impl DesktopSession {
         }
     }
 
+    /// Re-arm automation and MIDI after the user moved the playhead with a
+    /// jump: like a seek, cues at/after the landing point get their full quota
+    /// back, the job that was in flight is dropped for the next one ahead, and
+    /// whatever sits exactly on the landing point (a lyrics MIDI event on the
+    /// chorus marker, a cue on it) fires.
+    pub(super) fn land_after_user_jump(
+        &mut self,
+        audio: &AudioController,
+        landing_seconds: f64,
+    ) -> Result<(), DesktopError> {
+        self.land_midi_cursor(landing_seconds);
+        self.reset_automation_run_counts(Some(landing_seconds));
+        self.active_mix_ramps.clear();
+        self.pending_automation_jump = None;
+        self.active_automation_job = None;
+        self.arm_automation_from_landing(audio, landing_seconds, None)
+    }
+
+    /// Arm the next cue after the playhead LANDED somewhere (a jump, a vamp
+    /// wrap, a seek, Play): unlike the steady-state arming, a cue sitting
+    /// exactly on the landing point counts as ahead — a cue on the chorus
+    /// marker has to fire when a jump lands on the chorus. `skip_cue_id` is the
+    /// cue whose own jump caused the landing, so a cue targeting its own spot
+    /// cannot re-fire itself forever.
+    pub(super) fn arm_automation_from_landing(
+        &mut self,
+        audio: &AudioController,
+        landing_seconds: f64,
+        skip_cue_id: Option<&str>,
+    ) -> Result<(), DesktopError> {
+        self.arm_next_automation_cue(audio, Some((landing_seconds, skip_cue_id)))
+    }
+
     /// Arm the next automation cue (job). The terminal jump — if the job has one
     /// — is scheduled sample-exact in the native engine at its effective time
     /// (`at_seconds + Σ pre-jump waits`); the job's pre-jump mix actions fire as
@@ -372,6 +411,14 @@ impl DesktopSession {
         &mut self,
         audio: &AudioController,
     ) -> Result<(), DesktopError> {
+        self.arm_next_automation_cue(audio, None)
+    }
+
+    fn arm_next_automation_cue(
+        &mut self,
+        audio: &AudioController,
+        landing: Option<(f64, Option<&str>)>,
+    ) -> Result<(), DesktopError> {
         if self.engine.playback_state() != PlaybackState::Playing {
             return Ok(());
         }
@@ -379,9 +426,22 @@ impl DesktopSession {
         if !self.automation.track_enabled {
             return Ok(());
         }
-        if self.engine.pending_marker_jump().is_some() || self.engine.active_vamp().is_some() {
-            return Ok(());
-        }
+        // A user jump waiting for its trigger (next marker, after N bars,
+        // region end) or a vamp owns the native jump scheduler — arming
+        // anything else would cancel it — and the playhead never gets past the
+        // point where it moves the playhead. Cues before that point still have
+        // to fire (a mute halfway to the programmed jump, a jump back in front
+        // of the vamp), so they are armed as timeline-driven jobs with their
+        // own jump left out: the jump the user asked for wins.
+        let horizon_seconds = self
+            .engine
+            .pending_marker_jump()
+            .map(|pending_jump| pending_jump.execute_at_seconds)
+            .or_else(|| {
+                self.engine
+                    .active_vamp()
+                    .map(|active_vamp| active_vamp.end_seconds)
+            });
 
         let source_song = self
             .engine
@@ -401,11 +461,22 @@ impl DesktopSession {
             .iter()
             .filter(|cue| {
                 cue.enabled
-                    && cue.at_seconds > position_seconds + 0.001
+                    && match landing {
+                        None => cue.at_seconds > position_seconds + 0.001,
+                        // The skipped cue is only kept off the landing point: a
+                        // cue that jumps back still has to fire on the next
+                        // pass, as it always did.
+                        Some((landing_seconds, skip_cue_id)) => {
+                            cue.at_seconds > position_seconds + 0.001
+                                || (cue.at_seconds >= landing_seconds - 0.001
+                                    && skip_cue_id != Some(cue.id.as_str()))
+                        }
+                    }
                     // Skip cues that already hit their per-session run limit, so
                     // a "jump back" loop fires only the configured number of
                     // times and then the playhead passes through.
                     && self.cue_has_runs_left(cue)
+                    && horizon_seconds.map_or(true, |horizon| cue.at_seconds < horizon)
             })
             .min_by(|left, right| {
                 left.at_seconds
@@ -421,11 +492,16 @@ impl DesktopSession {
 
         let timed_actions = cue.timed_pre_jump_actions();
 
+        let jump_action = if horizon_seconds.is_some() {
+            None
+        } else {
+            cue.jump_action().cloned()
+        };
         let Some(AutomationAction::Jump {
             target,
             transition,
             mix_scene_id,
-        }) = cue.jump_action().cloned()
+        }) = jump_action
         else {
             // Pure mix/scene/wait job: nothing to schedule natively. Track it so
             // the per-tick advance fires its actions on time.
@@ -443,7 +519,12 @@ impl DesktopSession {
 
         // Job with a terminal jump. Effective jump time accounts for waits.
         self.active_automation_job = None;
-        let execute_at_seconds = cue.at_seconds + cue.pre_jump_wait_seconds();
+        let mut execute_at_seconds = cue.at_seconds + cue.pre_jump_wait_seconds();
+        if landing.is_some() {
+            // A jump sitting on the landing point fires right after landing.
+            execute_at_seconds =
+                execute_at_seconds.max(position_seconds + LANDING_JUMP_MARGIN_SECONDS);
+        }
         let target_seconds = automation_target_source_seconds(&source_song, &target)?;
         let trigger_seconds = warp_timeline_seconds_at(&source_song, execute_at_seconds);
         let target_view_seconds = Some(warp_timeline_seconds_at(&source_song, target_seconds));
@@ -536,6 +617,12 @@ impl DesktopSession {
         }
     }
 
+    /// Tell the UI the mix in the model changed under it (see
+    /// `DesktopSession::mix_revision`).
+    pub(super) fn bump_mix_revision(&mut self) {
+        self.mix_revision = self.mix_revision.wrapping_add(1);
+    }
+
     /// Apply a single non-jump job action immediately (mute/solo/mix/scene).
     pub(super) fn apply_automation_action(
         &mut self,
@@ -546,10 +633,12 @@ impl DesktopSession {
             AutomationAction::SetTrackMute { track_id, muted } => {
                 audio.update_live_track_mix(track_id, None, None, Some(*muted), None, None)?;
                 self.mirror_track_mix_into_model(track_id, None, None, Some(*muted), None);
+                self.bump_mix_revision();
             }
             AutomationAction::SetTrackSolo { track_id, solo } => {
                 audio.update_live_track_mix(track_id, None, None, None, Some(*solo), None)?;
                 self.mirror_track_mix_into_model(track_id, None, None, None, Some(*solo));
+                self.bump_mix_revision();
             }
             AutomationAction::SetTrackMix {
                 track_id,
@@ -578,6 +667,7 @@ impl DesktopSession {
                 } else {
                     audio.update_live_track_mix(track_id, *volume, *pan, None, None, None)?;
                     self.mirror_track_mix_into_model(track_id, *volume, *pan, None, None);
+                    self.bump_mix_revision();
                 }
             }
             AutomationAction::ApplyScene {
@@ -651,9 +741,15 @@ impl DesktopSession {
             // fader the ramp moved reads correctly the moment the user grabs it.
             self.mirror_track_mix_into_model(&track_id, volume, pan, None, None);
         }
-        // Drop ramps that have reached their end.
+        // Drop ramps that have reached their end. The UI hears about a ramp
+        // only when it lands (not per tick): refetching the mix every 250 ms
+        // poll would be wasted work for a fader nobody is looking at mid-fade.
+        let ramps_before = self.active_mix_ramps.len();
         self.active_mix_ramps
             .retain(|ramp| position - ramp.start_position_seconds < ramp.duration_seconds);
+        if self.active_mix_ramps.len() != ramps_before {
+            self.bump_mix_revision();
+        }
         Ok(())
     }
 
@@ -792,6 +888,7 @@ impl DesktopSession {
                 .retain(|existing| existing.track_id != ramp.track_id);
         }
         self.active_mix_ramps.extend(new_ramps);
+        self.bump_mix_revision();
 
         Ok(())
     }

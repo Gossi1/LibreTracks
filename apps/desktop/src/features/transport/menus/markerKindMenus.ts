@@ -1,14 +1,17 @@
+import { confirmDialog } from "../../../shared/dialog/dialogService";
 import type { MarkerKind, SectionMarkerSummary } from "../desktopApi";
-import { createSectionMarker, setSectionMarkerKind } from "../desktopApi";
+import { createSectionMarker, setSectionMarkerKind, updateSectionMarker } from "../desktopApi";
 import {
   availableCueKinds,
   availableSectionKinds,
   markerKindCategory,
   markerKindColor,
   markerKindLabel,
+  markerKindNeedsVariant,
   markerKindVariants,
 } from "../markerKinds";
 import { formatClock } from "../helpers";
+import { laneFor, sectionMarkerAt } from "./sectionCollision";
 import type { TimelineMenuDeps } from "./timelineMenus";
 
 /**
@@ -36,7 +39,21 @@ export function createMarkerKindMenus(
     const d = getDeps();
     const { t } = d;
     void d.runAction(async () => {
-      const nextSnapshot = await setSectionMarkerKind(section.id, kind, variant);
+      // Turning it into a section where another section already sits: two
+      // sections cannot share a spot, so offer the cue lane.
+      const asCue =
+        laneFor(kind, section.categoryOverride) === "section" &&
+        sectionMarkerAt(d.songRef.current, section.startSeconds, section.id) !== null;
+      if (asCue && !(await confirmDialog(t("transport.markerCollision.askCue")))) return;
+      let nextSnapshot = await setSectionMarkerKind(section.id, kind, variant);
+      if (asCue) {
+        nextSnapshot = await updateSectionMarker(
+          section.id,
+          section.name,
+          section.startSeconds,
+          "cue",
+        );
+      }
       d.applyPlaybackSnapshot(nextSnapshot);
       const kindLabel = markerKindLabel(kind, t);
       d.setStatus(
@@ -58,6 +75,11 @@ export function createMarkerKindMenus(
     const d = getDeps();
     const { t } = d;
     void d.runAction(async () => {
+      // A section where another section already sits: two sections cannot
+      // share a spot. Offer the cue lane; "no" creates nothing.
+      const asCue =
+        laneFor(kind) === "section" && sectionMarkerAt(d.songRef.current, positionSeconds) !== null;
+      if (asCue && !(await confirmDialog(t("transport.markerCollision.askCue")))) return;
       const name =
         kind && kind !== "custom"
           ? variant
@@ -68,6 +90,7 @@ export function createMarkerKindMenus(
         kind: kind ?? undefined,
         variant,
         name,
+        categoryOverride: asCue ? "cue" : null,
       });
       d.applyPlaybackSnapshot(nextSnapshot);
       d.clearSelection();
@@ -94,11 +117,15 @@ export function createMarkerKindMenus(
       y: next.y,
       title: markerKindLabel(kind, d.t),
       actions: [
-        {
-          label: markerKindLabel(kind, d.t),
-          swatch: markerKindColor(kind),
-          onSelect: () => createTypedMarker(positionSeconds, kind, null),
-        },
+        ...(markerKindNeedsVariant(kind)
+          ? []
+          : [
+              {
+                label: markerKindLabel(kind, d.t),
+                swatch: markerKindColor(kind),
+                onSelect: () => createTypedMarker(positionSeconds, kind, null),
+              },
+            ]),
         ...variants.map((n) => ({
           label: `${markerKindLabel(kind, d.t)} ${n}`,
           swatch: markerKindColor(kind),
@@ -206,11 +233,15 @@ export function createMarkerKindMenus(
       y: next.y,
       title: markerKindLabel(kind, d.t),
       actions: [
-        {
-          label: `${markerKindLabel(kind, d.t)}${current == null ? " ✓" : ""}`,
-          swatch: markerKindColor(kind),
-          onSelect: () => applyMarkerKind(section, kind, null),
-        },
+        ...(markerKindNeedsVariant(kind)
+          ? []
+          : [
+              {
+                label: `${markerKindLabel(kind, d.t)}${current == null ? " ✓" : ""}`,
+                swatch: markerKindColor(kind),
+                onSelect: () => applyMarkerKind(section, kind, null),
+              },
+            ]),
         ...variants.map((n) => ({
           label: `${markerKindLabel(kind, d.t)} ${n}${current === n ? " ✓" : ""}`,
           swatch: markerKindColor(kind),

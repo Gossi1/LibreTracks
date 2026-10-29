@@ -58,9 +58,11 @@ use crate::infra::settings::AppSettings;
 /// here. See docs/REDESIGN_state_rs_module_split.md.
 mod arrangement;
 mod audio_prep;
+mod charts;
 mod automation_runtime;
 mod cue_follow;
 mod external_import;
+mod fade_stop;
 mod history;
 mod library;
 mod midi_edit;
@@ -69,9 +71,17 @@ mod video_edit;
 mod video_library;
 mod video_audio;
 mod regions;
+pub use regions::KeyChangeInput;
+use regions::set_region_key_changes;
+mod ruler_markers;
 mod session;
+pub use external_import::parse_external_project;
 pub use session::ExistingProjectDir;
+pub use ruler_markers::{RulerMarkerKind, RulerMarkerPlacement, RulerMarkerRef};
+mod song_analysis;
+pub use song_analysis::AnalysedSection;
 mod song_edit;
+mod song_templates;
 mod song_reorder;
 mod song_structure;
 mod structure_guard;
@@ -395,6 +405,9 @@ pub struct DesktopSession {
     /// moves, the mixer paused on a song end by itself ("pause at song end")
     /// and the Rust transport has to follow.
     pub(super) last_native_song_end_pause_count: u64,
+    /// That song-end pause left the vamp between songs holding (click still
+    /// going). Cleared by Play, Pause and Stop.
+    pub(super) song_gap_vamp_holding: bool,
     /// The vamp loop currently programmed in the native scheduler, as
     /// `(start_seconds, end_seconds)` in source time.
     ///
@@ -428,6 +441,16 @@ pub struct DesktopSession {
     /// In-progress controller sweeps from `ControlCurve` events.
     pub(super) active_midi_curves: Vec<ActiveMidiCurve>,
     pub(super) project_revision: u64,
+    /// Bumped when automation changes a track's mute/solo/volume/pan in the
+    /// model. Separate from `project_revision` on purpose: automation is
+    /// playback state, not an edit (no autosave, no undo), but the UI still
+    /// has to refetch the mix or it keeps showing the pre-automation buttons.
+    pub(super) mix_revision: u64,
+    /// «Fade out y parar» in progress (see `fade_stop`).
+    pub(super) fade_stop: Option<fade_stop::FadeStop>,
+    /// Lo que organizó la plantilla en el último drop de stems, para el
+    /// toast. El comando lo recoge (`take`) y lo emite como evento.
+    pub(crate) last_template_drop: Option<song_templates::TemplateDropSummary>,
     pub(super) undo_stack: Vec<Song>,
     pub(super) redo_stack: Vec<Song>,
     pub(super) live_history_anchor: Option<Song>,
@@ -558,6 +581,7 @@ impl Default for DesktopSession {
             last_transport_pitch_sync_at: None,
             last_native_scheduled_jump_executed_count: 0,
             last_native_song_end_pause_count: 0,
+            song_gap_vamp_holding: false,
             scheduled_native_vamp_loop: None,
             automation: AutomationDocument::default(),
             pending_automation_jump: None,
@@ -569,6 +593,9 @@ impl Default for DesktopSession {
             active_midi_notes: Vec::new(),
             active_midi_curves: Vec::new(),
             project_revision: 0,
+            mix_revision: 0,
+            fade_stop: None,
+            last_template_drop: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             live_history_anchor: None,
@@ -820,21 +847,15 @@ impl WaveformGenerationQueue {
     }
 }
 
-/// Read the user's "merge tracks with the same name on import" preference.
-/// Falls back to the historical merging behaviour when the settings store is
-/// unavailable (e.g. very early startup) so an import never silently changes
-/// shape because a read failed.
+/// Read where the user wants each song's tracks (the `song_track_layout`
+/// setting). Falls back to the historical merging behaviour when the settings
+/// store is unavailable (e.g. very early startup) so an import never silently
+/// changes shape because a read failed.
 pub(crate) fn song_import_track_mode(app: &AppHandle) -> SongImportTrackMode {
-    let merge = app
-        .try_state::<crate::infra::settings::AppSettingsStore>()
+    app.try_state::<crate::infra::settings::AppSettingsStore>()
         .and_then(|store| store.current().ok())
-        .map(|settings| settings.import_merge_matching_tracks)
-        .unwrap_or(true);
-    if merge {
-        SongImportTrackMode::MergeIntoExisting
-    } else {
-        SongImportTrackMode::KeepSeparate
-    }
+        .map(|settings| settings.track_layout())
+        .unwrap_or(SongImportTrackMode::MergeIntoExisting)
 }
 
 fn waveform_job_key(song_dir: &Path, waveform_key: &str) -> String {
@@ -1530,6 +1551,10 @@ pub(super) struct DesktopPerformanceMetrics {
     transport_snapshot_bytes: usize,
     song_view_bytes: usize,
     last_react_render_millis: f64,
+    /// Last `song_view_with_options`: building the view, and serializing it
+    /// only to count its bytes (network sessions bench, plan song-patches/01).
+    song_view_build_micros: u128,
+    song_view_count_micros: u128,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1608,11 +1633,14 @@ pub(crate) fn plan_audio_settings_change(
         || previous.voice_guide_output != next.voice_guide_output
         || (previous.voice_guide_volume - next.voice_guide_volume).abs() > f64::EPSILON
         || previous.voice_guide_lead_bars != next.voice_guide_lead_bars
-        || previous.voice_guide_count_in_enabled != next.voice_guide_count_in_enabled;
+        || previous.voice_guide_count_in_enabled != next.voice_guide_count_in_enabled
+        || previous.voice_guide_count_style != next.voice_guide_count_style;
 
-    // Pure mixer flag, flipped between blocks: goes to the engine, never
-    // reopens the stream.
-    let pause_at_song_end_changed = previous.pause_at_song_end != next.pause_at_song_end;
+    // Pure mixer flags (pause at song end, vamp between songs, meter point),
+    // flipped between blocks: go to the engine, never reopen the stream.
+    let pause_at_song_end_changed = previous.pause_at_song_end != next.pause_at_song_end
+        || previous.vamp_between_songs != next.vamp_between_songs
+        || previous.track_meter_mode != next.track_meter_mode;
 
     AudioSettingsChangePlan {
         apply: device_changed
@@ -1667,6 +1695,15 @@ impl DesktopSession {
     /// that don't touch clip audio (transpose, gain, mute, solo, region rename
     /// — none of these change the peaks). The frontend keeps the previously
     /// hydrated waveforms in its local cache.
+    /// Microseconds the last song view took to build, and to serialize once
+    /// only to count its bytes.
+    pub(crate) fn last_song_view_micros(&self) -> (u128, u128) {
+        (
+            self.perf_metrics.song_view_build_micros,
+            self.perf_metrics.song_view_count_micros,
+        )
+    }
+
     pub fn song_view_with_options(
         &mut self,
         include_waveforms: bool,
@@ -1683,18 +1720,30 @@ impl DesktopSession {
                 include_waveforms,
             )
         });
-        let build_ms = started_at.elapsed().as_millis();
+        let build_micros = started_at.elapsed().as_micros();
+        let build_ms = build_micros / 1000;
         let serialize_started = Instant::now();
-        let bytes = song_view
-            .as_ref()
-            .map(|view| to_vec(view).map(|bytes| bytes.len()))
-            .transpose()
-            .map_err(|error| DesktopError::AudioCommand(error.to_string()))?
-            .unwrap_or(0);
-        let serialize_ms = serialize_started.elapsed().as_millis();
+        // Serializing only to count bytes is a full extra pass over the view
+        // (and over ~27 MB of peaks when the UI asks with waveforms), and the
+        // caller serializes it again anyway. Only the debug log reads it.
+        let debug_log = jump_debug_logging_enabled();
+        let bytes = if debug_log {
+            song_view
+                .as_ref()
+                .map(|view| to_vec(view).map(|bytes| bytes.len()))
+                .transpose()
+                .map_err(|error| DesktopError::AudioCommand(error.to_string()))?
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let count_micros = serialize_started.elapsed().as_micros();
+        let serialize_ms = count_micros / 1000;
+        self.perf_metrics.song_view_build_micros = build_micros;
+        self.perf_metrics.song_view_count_micros = count_micros;
         self.perf_metrics.song_view_build_millis = build_ms;
         self.perf_metrics.song_view_bytes = bytes;
-        if jump_debug_logging_enabled() {
+        if debug_log {
             eprintln!(
                 "[SONG_VIEW_PERF] build_ms={} serialize_ms={} bytes={} include_wfs={} clips={} tracks={} regions={}",
                 build_ms,
@@ -1896,11 +1945,17 @@ impl DesktopSession {
         }
 
         audio.apply_settings_with_stream_rebuild(next_settings.clone(), plan.rebuild_stream)?;
+        // Turning the vamp between songs off silences a holding one in the
+        // engine (SetSongGapVamp false).
+        if !next_settings.vamp_between_songs {
+            self.song_gap_vamp_holding = false;
+        }
 
         Ok(next_settings)
     }
 
     pub fn play(&mut self, audio: &AudioController) -> Result<TransportSnapshot, DesktopError> {
+        self.cancel_fade_stop(audio)?;
         self.sync_position(audio)?;
         let song = self
             .engine
@@ -1924,14 +1979,17 @@ impl DesktopSession {
             .map(|snapshot| snapshot.pitch.mixer_song_end_pause_count)
             .unwrap_or(self.last_native_song_end_pause_count);
         audio.prepare_song_buffers_async(song_dir.clone(), song.clone());
+        // The engine's Play ends a holding vamp between songs by itself.
+        self.song_gap_vamp_holding = false;
         audio.play(song_dir, song, runtime_position_seconds, start_reason)?;
         self.engine.play()?;
         self.transport_clock
             .start_from(self.engine.position_seconds());
         // Anchor MIDI at the start position so the first tick only fires what
-        // lies ahead, not everything since the top of the song.
-        self.reset_midi_cursor(self.engine.position_seconds());
-        self.schedule_next_automation_jump(audio)?;
+        // lies ahead (what sits right on it included), not everything since
+        // the top of the song.
+        self.land_midi_cursor(self.engine.position_seconds());
+        self.arm_automation_from_landing(audio, self.engine.position_seconds(), None)?;
         self.capture_transport_drift_sample(
             audio,
             "play",
@@ -1944,6 +2002,8 @@ impl DesktopSession {
 
     pub fn pause(&mut self, audio: &AudioController) -> Result<TransportSnapshot, DesktopError> {
         self.sync_position(audio)?;
+        self.cancel_fade_stop(audio)?;
+        self.end_song_gap_vamp(audio)?;
 
         audio.stop()?;
 
@@ -1958,7 +2018,10 @@ impl DesktopSession {
     }
 
     pub fn stop(&mut self, audio: &AudioController) -> Result<TransportSnapshot, DesktopError> {
+        self.end_song_gap_vamp(audio)?;
         audio.stop()?;
+        // After the audio stops, so lifting the gain back to 1 is never heard.
+        self.cancel_fade_stop(audio)?;
 
         self.engine.stop()?;
         self.transport_clock.stop();
@@ -1998,12 +2061,12 @@ impl DesktopSession {
         self.active_mix_ramps.clear();
         // Re-anchor MIDI at the new position and release anything sounding, so
         // a seek mid-note can't leave a hanging note on the show device.
-        self.reset_midi_cursor(self.engine.position_seconds());
+        self.land_midi_cursor(self.engine.position_seconds());
         if was_playing {
             self.reposition_audio(audio, PlaybackStartReason::Seek)?;
             self.transport_clock
                 .seek_while_playing(self.engine.position_seconds());
-            self.schedule_next_automation_jump(audio)?;
+            self.arm_automation_from_landing(audio, self.engine.position_seconds(), None)?;
             self.capture_transport_drift_sample(
                 audio,
                 "seek",
@@ -2097,6 +2160,11 @@ impl DesktopSession {
                 self.current_position(),
                 self.engine.position_seconds(),
             );
+            // Nothing else re-arms automation and MIDI after an immediate
+            // jump: without this a jump back left the cues it plays through
+            // again unarmed, and MIDI stayed silent until the playhead got
+            // back to where the jump started.
+            self.land_after_user_jump(audio, self.engine.position_seconds())?;
         } else if matches!(
             transition,
             TransitionType::Instant | TransitionType::FadeOut { .. }
@@ -2120,6 +2188,11 @@ impl DesktopSession {
             }
         } else {
             self.cancel_native_scheduled_jumps(audio)?;
+        }
+        if !(trigger == JumpTrigger::Immediate && transition == TransitionType::Instant) {
+            // Scheduling cleared the armed cue: arm again so the cues before
+            // the programmed jump still fire while it waits.
+            self.schedule_next_automation_jump(audio)?;
         }
 
         Ok(self.snapshot())
@@ -2165,6 +2238,11 @@ impl DesktopSession {
                 self.current_position(),
                 self.engine.position_seconds(),
             );
+            // Nothing else re-arms automation and MIDI after an immediate
+            // jump: without this a jump back left the cues it plays through
+            // again unarmed, and MIDI stayed silent until the playhead got
+            // back to where the jump started.
+            self.land_after_user_jump(audio, self.engine.position_seconds())?;
         } else if trigger == JumpTrigger::RegionEnd
             && matches!(
                 transition,
@@ -2216,6 +2294,11 @@ impl DesktopSession {
         } else if scheduled_jump.is_none() {
             self.cancel_native_scheduled_jumps(audio)?;
         }
+        if !(trigger == JumpTrigger::Immediate && transition == TransitionType::Instant) {
+            // Scheduling cleared the armed cue: arm again so the cues before
+            // the programmed jump still fire while it waits.
+            self.schedule_next_automation_jump(audio)?;
+        }
 
         if was_playing && trigger == JumpTrigger::Immediate {
             if let TransitionType::FadeOut { duration_seconds } = &transition {
@@ -2237,6 +2320,8 @@ impl DesktopSession {
         self.pending_automation_jump = None;
         self.active_automation_job = None;
         self.cancel_native_scheduled_jumps(audio)?;
+        // With the programmed jump gone the cues ahead run whole again.
+        self.schedule_next_automation_jump(audio)?;
         Ok(self.snapshot())
     }
 
@@ -2259,6 +2344,10 @@ impl DesktopSession {
                 self.schedule_native_vamp_jump(audio, &source_song, &active_vamp)?;
             }
         }
+        // Both ways: with the vamp on, the cues before its end still fire;
+        // with it off, the next cue ahead has to be armed again or automation
+        // stays silent until the next seek.
+        self.schedule_next_automation_jump(audio)?;
         Ok(self.snapshot())
     }
 
@@ -2781,6 +2870,10 @@ impl DesktopSession {
         // engine reporting Playing, which MIDI has no reason to wait for.
         self.advance_midi_playback()?;
 
+        if self.finish_fade_stop_if_due(audio)? {
+            return Ok(());
+        }
+
         if self.sync_native_scheduled_jump_if_needed(audio)? {
             return Ok(());
         }
@@ -2803,9 +2896,18 @@ impl DesktopSession {
                 // cancel and re-enqueue the wrap on every tick, which is what
                 // made vamp wraps miss their sample-exact trigger frame.
                 self.schedule_native_vamp_jump(audio, &source_song, &active_vamp)?;
+                // The cues before the vamp's end are armed without their jump
+                // (see schedule_next_automation_jump); their mix actions still
+                // fire as the playhead crosses them.
+                self.advance_automation_job_actions(audio)?;
+                self.advance_mix_ramps(audio)?;
                 return Ok(());
             }
             if self.engine.pending_marker_jump().is_some() {
+                // Same as the vamp: the cues before the programmed jump are
+                // armed without their own jump and still fire on time.
+                self.advance_automation_job_actions(audio)?;
+                self.advance_mix_ramps(audio)?;
                 return Ok(());
             }
             // Fire any job pre-jump mix actions whose effective time the
@@ -2858,7 +2960,7 @@ impl DesktopSession {
                         .note_jump_while_playing(target_position);
                     // A jump is a discontinuity: re-anchor MIDI at the landing
                     // point so events between here and there don't all fire.
-                    self.reset_midi_cursor(target_position);
+                    self.land_after_user_jump(audio, target_position)?;
                     self.capture_transport_drift_sample(
                         audio,
                         "jump",
@@ -2890,6 +2992,8 @@ impl DesktopSession {
                 // trigger frame we already passed. Drop the guard so the next
                 // tick re-arms the loop from the new position.
                 self.scheduled_native_vamp_loop = None;
+                self.active_automation_job = None;
+                self.arm_automation_from_landing(audio, vamp_start_seconds, None)?;
             }
         }
 
@@ -2899,7 +3003,11 @@ impl DesktopSession {
                 .note_jump_while_playing(advanced_position);
             // Same as the faded-jump path: re-anchor rather than replay the
             // span the playhead skipped over (or looped back across).
-            self.reset_midi_cursor(advanced_position);
+            if jump_executed {
+                self.land_after_user_jump(audio, advanced_position)?;
+            } else {
+                self.land_midi_cursor(advanced_position);
+            }
             self.capture_transport_drift_sample(
                 audio,
                 "jump",
@@ -2946,11 +3054,22 @@ impl DesktopSession {
             source_seconds_at_view(&source_song, snapshot.current_seconds.max(0.0));
         self.engine
             .sync_position_preserving_transport_state(position_seconds)?;
+        // Engine Stop, not EndSongGapVamp: with the vamp between songs on, the
+        // click keeps going over this pause until the user plays or stops.
         audio.stop()?;
         self.engine.pause()?;
         self.transport_clock.pause_at(position_seconds);
         self.release_all_midi_notes();
+        self.song_gap_vamp_holding = snapshot.pitch.mixer_song_gap_vamp_active;
         Ok(true)
+    }
+
+    fn end_song_gap_vamp(&mut self, audio: &AudioController) -> Result<(), DesktopError> {
+        if self.song_gap_vamp_holding {
+            audio.end_song_gap_vamp()?;
+            self.song_gap_vamp_holding = false;
+        }
+        Ok(())
     }
 
     fn sync_native_scheduled_jump_if_needed(
@@ -3009,6 +3128,12 @@ impl DesktopSession {
                 // the vamp only ever loops once.
                 self.scheduled_native_vamp_loop = None;
                 self.schedule_native_vamp_jump(audio, &source_song, &active_vamp)?;
+                // The playhead is back at the vamp's start: arm the cues
+                // inside the loop again for this pass.
+                self.active_automation_job = None;
+                let landing_seconds = active_vamp.start_seconds.min(runtime_source_position);
+                self.land_midi_cursor(landing_seconds);
+                self.arm_automation_from_landing(audio, landing_seconds, None)?;
                 return Ok(true);
             }
 
@@ -3044,7 +3169,18 @@ impl DesktopSession {
                 // Count this firing before re-arming so a cue at its run limit is
                 // not immediately re-scheduled (which would loop forever).
                 self.record_automation_cue_run(&pending_automation.cue_id);
-                self.schedule_next_automation_jump(audio)?;
+                // What sits on the jump's target (a cue, a lyrics MIDI event on
+                // that marker) fires as if the playhead had played into it.
+                let landing_seconds =
+                    automation_target_source_seconds(&source_song, &pending_automation.target)
+                        .map(|target| target.min(runtime_source_position))
+                        .unwrap_or(runtime_source_position);
+                self.land_midi_cursor(landing_seconds);
+                self.arm_automation_from_landing(
+                    audio,
+                    landing_seconds,
+                    Some(&pending_automation.cue_id),
+                )?;
                 return Ok(true);
             }
 
@@ -3097,7 +3233,7 @@ impl DesktopSession {
             runtime_source_position,
             runtime_source_position,
         );
-        self.schedule_next_automation_jump(audio)?;
+        self.land_after_user_jump(audio, target_position.min(runtime_source_position))?;
         Ok(true)
     }
 
@@ -3236,6 +3372,9 @@ impl DesktopSession {
                 .clone()
                 .map(|sample| transport_drift_summary_to_view(source_song.as_ref(), sample)),
             project_revision: self.project_revision,
+            mix_revision: self.mix_revision,
+            fading_to_stop: self.is_fading_to_stop(),
+            song_gap_vamp: self.song_gap_vamp_holding,
             song_dir: self
                 .song_dir
                 .as_ref()
@@ -3268,9 +3407,14 @@ impl DesktopSession {
                 .map(|vamp| (vamp.start_seconds, vamp.end_seconds)),
         );
         self.perf_metrics.transport_snapshot_build_millis = started_at.elapsed().as_millis();
-        self.perf_metrics.transport_snapshot_bytes = to_vec(&snapshot)
-            .map(|bytes| bytes.len())
-            .unwrap_or_default();
+        // Same as the song view: a serialization only to count bytes, under
+        // the session lock and on every poll. Nobody reads it outside the
+        // debug log, so it is only paid there.
+        if jump_debug_logging_enabled() {
+            self.perf_metrics.transport_snapshot_bytes = to_vec(&snapshot)
+                .map(|bytes| bytes.len())
+                .unwrap_or_default();
+        }
         snapshot
     }
 
@@ -3587,6 +3731,10 @@ pub(super) fn strip_song_to_template(mut song: Song) -> Song {
         // Auto-created tracks vanish once empty; a template has no clips, so
         // pin every track as explicit to preserve the whole layout.
         track.auto_created = false;
+        // A template has no songs, so a track can't belong to one. The match
+        // aliases stay: they are layout, and the reason a template is useful
+        // when stems are dropped.
+        track.song_region_id = None;
     }
 
     song
@@ -3905,6 +4053,7 @@ pub(super) fn set_song_tempo_at_source_position(song: &mut Song, start_seconds: 
             id: format!("tempo_marker_{}", timestamp_suffix()),
             start_seconds,
             bpm,
+            ramp: false,
         });
         song.tempo_markers.sort_by(|left, right| {
             left.start_seconds
@@ -4431,4 +4580,10 @@ mod tests;
 #[cfg(test)]
 mod video_tests;
 #[cfg(test)]
+mod charts_tests;
+#[cfg(test)]
 mod midi_song_ops_tests;
+#[cfg(test)]
+mod song_template_tests;
+#[cfg(test)]
+mod ruler_markers_tests;

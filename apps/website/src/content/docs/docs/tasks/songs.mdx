@@ -5,6 +5,7 @@ sidebar:
   order: 2
 ---
 
+import Legend from "../../../../components/guide/Legend.astro";
 import Clip from "../../../../components/guide/Clip.astro";
 
 A LibreTracks session is a **setlist**: several songs one after another on the
@@ -92,6 +93,8 @@ its menu (right-click):
 - **Song key**: its key. It shows next to the name, in Live View and on the
   Remote, and **transposes by itself** when you change the pitch: a song in
   *D* raised 2 semitones shows as *E*.
+- **Key change at cursor ▸**: the song changes key halfway. See
+  [Key changes](#key-changes).
 - **Master**: the volume of the whole song. It does not affect the metronome
   or the voice guide.
 - **Transposition** and **warp**: see
@@ -99,6 +102,107 @@ its menu (right-click):
   transposing changes the speed, so the song gets longer or shorter, and the
   following ones shift so they don't overlap.
 - **Change Original BPM**: the tempo the audio was recorded at, used by warp.
+- **Song Fades ▸**: fade in and fade out. See
+  [below](#fade-in-and-fade-out).
+- **Arrangement**: repeat, remove or reorder the song's sections without
+  touching the audio. See [Song arrangements](/docs/arrangements/).
+- **Voice Guide Count-in ▸**: how the voice guide counts this song in. See
+  [Voice guide](/docs/voice-guide/#turning-it-on-and-setting-it-up).
+- **Analyze song (tempo, key and sections)…**: LibreTracks suggests the tempo,
+  the key and the markers. See [Analyze song](/docs/song-analysis/).
+
+## Key changes
+
+A song can **change key halfway**, like a last chorus that goes up a step. The
+**Song key** is the key it starts in, and each change is a lilac notch on the
+song's band, with the new key:
+
+![A key change to E on the song band](/guide/desktop-en/key-change-notch.png)
+
+- **Create**: put the cursor where it changes, right-click the song ›
+  **Key change at cursor ▸** and pick the key.
+- **Edit or remove**: click the notch to change the key or
+  **Remove key change**; drag it to move it.
+- The changes go with the song: moving it, splitting it, building an
+  arrangement or exporting it does not misplace them.
+
+The **Live View** shows the key playing and a **→ E** warning before the
+change comes; the Compact View and the Remote show the sequence **D → E**. If
+the [ambient pad](/docs/ambient-pads/) follows the song's key, it changes with
+it. And [lyrics and chords](/docs/live-view/#lyrics-and-chords) spell the
+chords in the key playing in each part.
+
+[Analyze song](/docs/song-analysis/) also detects modulations and suggests them
+as key changes.
+
+## Fade in and fade out
+
+Each song can **come in and go out with a fade** without putting one on every
+clip. It only affects the tracks: the click and the voice guide play at their
+level from the first bar.
+
+![A song's fade corners in the ruler](/guide/desktop-en/song-fade-handles.png)
+
+<Legend>
+
+1. **Fade in**: drag the top-left corner of the song to the right. The ramp is
+   drawn over the song's bar.
+2. **Fade out**: drag the top-right corner to the left.
+
+</Legend>
+
+The corners show when you hover over the song, when it is selected or when it
+already has a fade. If you'd rather type the seconds, right-click the song ›
+**Song Fades**:
+
+![The "Song Fades" menu](/guide/desktop-en/menu-song-fades.png)
+
+- The fade goes **by position**, like a clip's: if you jump into the middle of
+  the song it plays at full level; if you start from its beginning, it comes in
+  with the fade.
+- **0** removes the fade. Neither can be longer than the song.
+- It travels with the song when you export it (`.ltpkg`) and sounds the same
+  when you [render](#exporting-rendering-and-deleting).
+- To end a song **live** at any moment, use
+  [Fade out and stop](/docs/interface/main-screen/#fade-out-and-stop).
+
+## Levelling the songs' volume
+
+Every multitrack comes mixed its own way, and live you can tell: one song
+reaches the desk louder than the one before. **Level song volumes…** measures
+how loud each song is in its loud parts (the chorus, not the quiet bridge) and
+suggests a **master** for each one so they all arrive at the same level. It is
+in the **File** menu (on mobile, in the side bar's file menu), because it
+affects the whole setlist.
+
+![Level songs: the tracks that count and the Measure button](/guide/desktop-en/level-songs-setup.png)
+
+<Legend>
+
+1. **Tracks that count**: only what goes to the PA, grouped by song.
+   LibreTracks leaves out the click, the cues, whatever goes to the in-ears
+   and muted tracks, and tells you why; you can change the selection.
+2. **Measure**: measures every song. It takes a few seconds per song.
+
+</Legend>
+
+![Measurement result with the suggested master for each song](/guide/desktop-en/level-songs-result.png)
+
+<Legend>
+
+1. **Target level**: *Without clipping (recommended)* brings every song to the
+   highest level they can all reach without clipping. You can also match them
+   to the setlist median or to a specific song.
+2. **The proposal**: each song's measured loudness, current master, suggested
+   master and change.
+3. **Apply**: sets the songs' masters in one go. Undo it with
+   <kbd>Ctrl</kbd>+<kbd>Z</kbd> (on mobile, with the Undo button).
+
+</Legend>
+
+The proposal usually turns songs down rather than up: that is expected, and
+you make up for it once with the desk's gain. The master does not affect the
+metronome or the voice guide.
 
 ## Reordering the setlist
 
@@ -106,7 +210,9 @@ its menu (right-click):
 - In **Compact View** and **Live View**, drag the song by its **handle** (the
   six dots on its left) to its new place. While you drag you see where it will
   land. With the handle selected, the arrow keys move it one place at a time.
-  The song moves whole, with its audio, markers and tempo, and the gaps
+  On a phone, **hold your finger** on the handle for a moment before dragging
+  (you'll feel a vibration where the phone has one): that way a quick swipe
+  doesn't reorder by mistake. The song moves whole, with its audio, markers and tempo, and the gaps
   between songs are kept.
 
 ## Going from one song to the next live
@@ -115,6 +221,24 @@ By default, when a song ends playback carries on with the next one. If you
 would rather stop between songs (to speak, for example), turn on **Pause at
 the end of each song** in Settings › General: playback stops right on the last
 frame of each song, and *Play* starts the next one.
+
+If you would rather the band not be left without a reference between songs,
+turn on **Vamp between songs**: when each song ends playback waits just like
+with the pause, but the **click keeps going at the tempo of the song that
+ended** and the **pad keeps sounding** for as long as needed. *Play* starts
+the next one; *Stop* stops the click. Turn it on with the **Between songs**
+button in the [Live View](/docs/live-view/), in the Vamp panel of the toolbar,
+or in Settings › General › **Vamp between songs (click and pad)**.
+
+![Between songs button next to VAMP in the Live View](/guide/desktop-en/live-vamp-between-songs.png)
+
+<Legend>
+
+1. **Between songs**: turns on vamp between songs. While it is holding, the
+   button pulses so you know why the next song has not started.
+2. **VAMP**: the usual vamp, inside a song.
+
+</Legend>
 
 To jump to another song: the **Previous** and **Next** buttons,
 <kbd>Shift</kbd>+number (<kbd>Shift</kbd>+<kbd>0</kbd> is the first song),

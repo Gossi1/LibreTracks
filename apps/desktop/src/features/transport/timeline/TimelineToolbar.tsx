@@ -3,15 +3,6 @@ import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 
 import {
-  meterDbToDisplayScale,
-  peakToMeterDb,
-  stepMeterDb,
-  DEFAULT_METER_FALLOFF_DB_PER_SECOND,
-  METER_ACTIVE_EPSILON_DB,
-  METER_MIN_DB,
-} from "@libretracks/shared/meterBallistics";
-
-import {
   formatBpm,
   formatTransposeSemitones,
   type SongRegionSummary,
@@ -25,8 +16,11 @@ import type {
   ViewMode,
 } from "../uiStore";
 import { ViewModeSwitcher } from "./ViewModeSwitcher";
+import { SongMasterMeter } from "../tracks/TrackMeter";
 import { isMobileApp } from "../desktopApi";
 import { TOUR_TARGETS } from "../../tutorial/tourTargets";
+import { SongGapVampToggle } from "../live/SongGapVampToggle";
+import { RegionTempoControl } from "./RegionTempoControl";
 
 type RegionMasterFaderProps = {
   regionId: string;
@@ -56,7 +50,6 @@ function RegionMasterFaderComponent({
   onChange,
   onCommit,
 }: RegionMasterFaderProps) {
-  const meterFillRef = useRef<HTMLDivElement | null>(null);
   const shiftPressedRef = useRef(false);
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -72,97 +65,12 @@ function RegionMasterFaderComponent({
       window.removeEventListener("keyup", onKeyUp);
     };
   }, []);
-  const animationStateRef = useRef({
-    frameId: null as number | null,
-    lastFrameAt: 0,
-    currentDb: METER_MIN_DB,
-    targetDb: METER_MIN_DB,
-  });
-
-  useEffect(() => {
-    const animationState = animationStateRef.current;
-
-    const applyFill = () => {
-      const element = meterFillRef.current;
-      if (!element) return;
-      const scale = meterDbToDisplayScale(animationState.currentDb);
-      element.style.width = `${(scale * 100).toFixed(2)}%`;
-      element.style.opacity = scale > 0 ? "1" : "0";
-    };
-
-    const stopAnimation = () => {
-      if (animationState.frameId !== null) {
-        cancelAnimationFrame(animationState.frameId);
-        animationState.frameId = null;
-      }
-      animationState.lastFrameAt = 0;
-    };
-
-    const step = (now: number) => {
-      const elapsed =
-        animationState.lastFrameAt > 0 ? now - animationState.lastFrameAt : 16.67;
-      animationState.lastFrameAt = now;
-      animationState.currentDb = stepMeterDb(
-        animationState.currentDb,
-        animationState.targetDb,
-        elapsed,
-        DEFAULT_METER_FALLOFF_DB_PER_SECOND,
-      );
-      applyFill();
-      const settled =
-        Math.abs(animationState.currentDb - animationState.targetDb) <
-        METER_ACTIVE_EPSILON_DB;
-      if (settled) {
-        animationState.currentDb = animationState.targetDb;
-        applyFill();
-        stopAnimation();
-        return;
-      }
-      animationState.frameId = requestAnimationFrame(step);
-    };
-
-    const scheduleAnimation = () => {
-      if (animationState.frameId !== null) return;
-      animationState.frameId = requestAnimationFrame(step);
-    };
-
-    const updateTarget = (rawPeak: number) => {
-      animationState.targetDb = peakToMeterDb(rawPeak);
-      scheduleAnimation();
-    };
-
-    const initialPeak = useTransportStore.getState().regionMeters[regionId] ?? 0;
-    animationState.currentDb = peakToMeterDb(initialPeak);
-    animationState.targetDb = animationState.currentDb;
-    applyFill();
-
-    const unsubscribe = useTransportStore.subscribe(
-      (state) => state.regionMeters[regionId] ?? 0,
-      (peak) => {
-        updateTarget(peak);
-      },
-    );
-
-    return () => {
-      unsubscribe();
-      stopAnimation();
-      animationState.currentDb = METER_MIN_DB;
-      animationState.targetDb = METER_MIN_DB;
-      const element = meterFillRef.current;
-      if (element) {
-        element.style.width = "0%";
-        element.style.opacity = "0";
-      }
-    };
-  }, [regionId]);
 
   return (
     <div className="lt-region-master-fader">
-      <div className="lt-region-master-fader-meter" aria-hidden="true">
-        <div className="lt-region-master-fader-meter-fill" ref={meterFillRef} />
-      </div>
+      <SongMasterMeter regionId={regionId} className="lt-region-master-fader-meter" />
       <input
-        className="lt-region-master-fader-slider"
+        className="lt-region-master-fader-slider lt-fader is-master"
         aria-label="Region master gain"
         type="range"
         min={0}
@@ -230,12 +138,19 @@ type TimelineToolbarProps = {
   onSongTransitionModeChange: (mode: SongTransitionMode) => void;
   onVampModeChange: (mode: VampMode) => void;
   onVampBarsChange: (bars: number) => void;
+  /** Optional: the vamp between songs toggle in the vamp popover. */
+  vampBetweenSongs?: boolean;
+  onVampBetweenSongsChange?: (enabled: boolean) => void;
   onToggleVamp: () => void;
   onCancelPendingJump: () => void;
   onSelectedRegionTransposeChange: (nextTransposeSemitones: number) => void;
   /** Effective timeline BPM at the start of the selected region. */
   selectedRegionEffectiveBpm: number;
   onSelectedRegionWarpToggle: (nextEnabled: boolean) => void;
+  onSelectedRegionTempoChange: (
+    region: SongRegionSummary,
+    nextBpm: number,
+  ) => void;
   onSelectedRegionMasterGainChange: (nextMasterGain: number) => void;
   onSelectedRegionMasterGainCommit: () => void;
   viewMode: ViewMode;
@@ -368,11 +283,14 @@ export function TimelineToolbar({
   onSongTransitionModeChange,
   onVampModeChange,
   onVampBarsChange,
+  vampBetweenSongs = false,
+  onVampBetweenSongsChange,
   onToggleVamp,
   onCancelPendingJump,
   onSelectedRegionTransposeChange,
   selectedRegionEffectiveBpm,
   onSelectedRegionWarpToggle,
+  onSelectedRegionTempoChange,
   onSelectedRegionMasterGainChange,
   onSelectedRegionMasterGainCommit,
   viewMode,
@@ -677,6 +595,13 @@ export function TimelineToolbar({
                     </div>
                   </label>
                 ) : null}
+                {onVampBetweenSongsChange ? (
+                  <SongGapVampToggle
+                    enabled={vampBetweenSongs}
+                    onChange={onVampBetweenSongsChange}
+                    disabled={controlsDisabled}
+                  />
+                ) : null}
               </>
             }
           >
@@ -968,10 +893,10 @@ export function TimelineToolbar({
                 {t("transport.jumpMode.nextMarker")}
               </button>
             </div>
-            <div className="lt-song-transition-row">
+            <div className="lt-segmented-control lt-song-transition-row">
               <button
                 type="button"
-                className={`lt-vamp-button ${songTransitionMode === "instant" ? "is-active" : ""}`}
+                className={songTransitionMode === "instant" ? "is-active" : ""}
                 disabled={controlsDisabled}
                 onClick={() =>
                   handleModeButtonClick(
@@ -984,7 +909,7 @@ export function TimelineToolbar({
               </button>
               <button
                 type="button"
-                className={`lt-vamp-button ${songTransitionMode === "fade_out" ? "is-active" : ""}`}
+                className={songTransitionMode === "fade_out" ? "is-active" : ""}
                 disabled={controlsDisabled}
                 onClick={() =>
                   handleModeButtonClick(
@@ -1114,25 +1039,43 @@ export function TimelineToolbar({
             data-lt-tour={TOUR_TARGETS.toolbarWarp}
             details={
               selectedRegion ? (
-                <>
-                  <button
-                    type="button"
-                    className={`lt-vamp-button ${warpEnabled ? "is-active" : ""}`}
-                    aria-label={t("timelineToolbar.regionWarpToggleAria")}
-                    aria-pressed={warpEnabled}
+                <div className="lt-warp-panel">
+                  <div className="lt-warp-panel-section">
+                    <span className="lt-warp-panel-label">Warp</span>
+                    <div className="lt-warp-panel-row">
+                      <button
+                        type="button"
+                        className={`lt-warp-toggle ${warpEnabled ? "is-active" : ""}`}
+                        aria-label={t("timelineToolbar.regionWarpToggleAria")}
+                        aria-pressed={warpEnabled}
+                        disabled={warpControlsDisabled}
+                        onClick={() => onSelectedRegionWarpToggle(!warpEnabled)}
+                      >
+                        {warpEnabled
+                          ? t("timelineToolbar.regionWarpToggleOn")
+                          : t("timelineToolbar.regionWarpToggleOff")}
+                      </button>
+                      <small className="lt-warp-semantics-hint">
+                        {warpEnabled
+                          ? t("timelineToolbar.regionWarpSemanticsOn")
+                          : t("timelineToolbar.regionWarpSemanticsOff")}
+                      </small>
+                    </div>
+                  </div>
+                  <RegionTempoControl
+                    key={selectedRegion.id}
+                    currentBpm={selectedRegionEffectiveBpm}
+                    originalBpm={
+                      warpEnabled && warpSourceBpm
+                        ? warpSourceBpm
+                        : selectedRegionEffectiveBpm
+                    }
                     disabled={warpControlsDisabled}
-                    onClick={() => onSelectedRegionWarpToggle(!warpEnabled)}
-                  >
-                    {warpEnabled
-                      ? t("timelineToolbar.regionWarpToggleOn")
-                      : t("timelineToolbar.regionWarpToggleOff")}
-                  </button>
-                  <small className="lt-warp-semantics-hint">
-                    {warpEnabled
-                      ? t("timelineToolbar.regionWarpSemanticsOn")
-                      : t("timelineToolbar.regionWarpSemanticsOff")}
-                  </small>
-                </>
+                    onChange={(bpm) =>
+                      onSelectedRegionTempoChange(selectedRegion, bpm)
+                    }
+                  />
+                </div>
               ) : (
                 <span>{t("timelineToolbar.regionWarpNoSelection")}</span>
               )

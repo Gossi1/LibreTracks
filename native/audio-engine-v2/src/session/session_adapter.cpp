@@ -1,6 +1,7 @@
 #include <lt_engine/session/session_adapter.h>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 #include <unordered_set>
@@ -74,6 +75,15 @@ static std::vector<json> collect_song_json(const json& root) {
         return { root };
     }
     return {};
+}
+
+// SongRegion.voiceGuideCountStyle token -> VoiceGuideCountStyle value
+// (render/voice_guide_renderer.h). Unknown or empty = -1, follow the global.
+static int voice_guide_count_style_token(const std::string& token) {
+    if (token == "full") return 0;
+    if (token == "halfThenFull" || token == "half_then_full") return 1;
+    if (token == "halfTime" || token == "half_time") return 2;
+    return -1;
 }
 
 Result<Session> session_from_project_json(const std::string& project_json,
@@ -259,6 +269,7 @@ Result<Session> session_from_project_json(const std::string& project_json,
                             engine_sample_rate);
                     }
                     marker.bpm = value_any<double>(jt, "bpm", "bpm", song.bpm);
+                    marker.ramp = jt.value("ramp", false);
                     if (marker.bpm > 0.0)
                         song.tempo_markers.push_back(std::move(marker));
                 }
@@ -334,7 +345,20 @@ Result<Session> session_from_project_json(const std::string& project_json,
                     if (jr.contains("master") && jr.at("master").is_object()) {
                         const auto& master = jr.at("master");
                         region.master_gain = master.value("gain", 1.0f);
+                        // Song fades live next to the gain (SongMaster). Absent
+                        // in projects that predate them: no fade.
+                        region.fade_in_frames = seconds_to_frames(
+                            std::max(0.0, value_any<double>(master, "fade_in_seconds", "fadeInSeconds", 0.0)),
+                            engine_sample_rate);
+                        region.fade_out_frames = seconds_to_frames(
+                            std::max(0.0, value_any<double>(master, "fade_out_seconds", "fadeOutSeconds", 0.0)),
+                            engine_sample_rate);
                     }
+                    // Per-song voice-guide count style (SongRegion.voiceGuideCountStyle,
+                    // a camelCase token). Absent = follow the global setting.
+                    region.voice_guide_count_style = voice_guide_count_style_token(
+                        value_any<std::string>(jr, "voice_guide_count_style",
+                                               "voiceGuideCountStyle", std::string{}));
                     // Only add the region if end_frame > start_frame (otherwise it is malformed
                     // and would never match in resolve_region_transpose).
                     if (region.end_frame > region.start_frame)

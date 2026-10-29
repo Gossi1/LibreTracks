@@ -27,12 +27,16 @@
 #    define NOMINMAX
 #  endif
 #  include <windows.h>
+#  include <winioctl.h>
 #  include <shlobj.h>
 #else
 #  include <dirent.h>
 #  include <sys/statvfs.h>
 #  include <sys/time.h>
 #  include <unistd.h>
+#  if defined(__linux__)
+#    include <sys/sysmacros.h>
+#  endif
 #endif
 
 #if defined(_WIN32)
@@ -567,6 +571,113 @@ std::string cache_identity_path(const std::string& path) {
 #endif
 }
 
+namespace {
+
+#if defined(_WIN32)
+// The volume `path` lives on ("D:\", or the mount folder), or empty.
+std::wstring volume_root_for(const std::string& path) {
+    std::string normalized = path;
+    std::replace(normalized.begin(), normalized.end(), '/', '\\');
+    // "\\?\D:\x" → "D:\x". UNC long paths keep their prefix: the volume calls
+    // below fail on them, which is the "unknown" answer we want for a share.
+    if (normalized.rfind("\\\\?\\", 0) == 0 && normalized.rfind("\\\\?\\UNC\\", 0) != 0)
+        normalized.erase(0, 4);
+    const std::wstring wide = to_wide(normalized);
+    if (wide.empty())
+        return {};
+    wchar_t root[MAX_PATH + 1] = {};
+    if (!GetVolumePathNameW(wide.c_str(), root, MAX_PATH))
+        return {};
+    return root;
+}
+
+bool query_volume_seek_penalty(const std::wstring& root) {
+    wchar_t volume_name[MAX_PATH + 1] = {};
+    if (!GetVolumeNameForVolumeMountPointW(root.c_str(), volume_name, MAX_PATH))
+        return false;  // network share, subst drive...: unknown
+    std::wstring device = volume_name;
+    if (!device.empty() && device.back() == L'\\')
+        device.pop_back();  // "\\?\Volume{...}" opens the volume, with the slash its root dir
+    // Zero access rights: a property query needs no read permission, so this
+    // works without elevation.
+    HANDLE handle = CreateFileW(device.c_str(), 0,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                OPEN_EXISTING, 0, nullptr);
+    if (handle == INVALID_HANDLE_VALUE)
+        return false;
+    STORAGE_PROPERTY_QUERY query{};
+    query.PropertyId = StorageDeviceSeekPenaltyProperty;
+    query.QueryType = PropertyStandardQuery;
+    DEVICE_SEEK_PENALTY_DESCRIPTOR descriptor{};
+    DWORD returned = 0;
+    const BOOL ok = DeviceIoControl(handle, IOCTL_STORAGE_QUERY_PROPERTY,
+                                    &query, sizeof(query),
+                                    &descriptor, sizeof(descriptor),
+                                    &returned, nullptr);
+    CloseHandle(handle);
+    return ok && returned >= sizeof(descriptor) && descriptor.IncursSeekPenalty;
+}
+#elif defined(__linux__)
+bool query_device_rotational(unsigned major_id, unsigned minor_id) {
+    const std::string base = "/sys/dev/block/" + std::to_string(major_id) + ":" +
+                             std::to_string(minor_id);
+    // A partition has no queue/ of its own; its parent disk does.
+    for (const char* suffix : {"/queue/rotational", "/../queue/rotational"}) {
+        std::ifstream in(base + suffix);
+        int value = 0;
+        if (in >> value)
+            return value == 1;
+    }
+    return false;
+}
+#endif
+
+} // namespace
+
+bool path_has_seek_penalty(const std::string& path) {
+    if (path.empty())
+        return false;
+#if defined(_WIN32)
+    const std::wstring root = volume_root_for(path);
+    if (root.empty())
+        return false;
+    static std::mutex mtx;
+    static std::unordered_map<std::wstring, bool> by_volume;
+    {
+        std::lock_guard lock(mtx);
+        if (auto it = by_volume.find(root); it != by_volume.end())
+            return it->second;
+    }
+    const bool penalty = query_volume_seek_penalty(root);
+    std::lock_guard lock(mtx);
+    by_volume.emplace(root, penalty);
+    return penalty;
+#elif defined(__linux__)
+    struct stat st{};
+    if (::stat(path.c_str(), &st) != 0)
+        return false;
+    static std::mutex mtx;
+    static std::unordered_map<unsigned long long, bool> by_device;
+    const auto device = static_cast<unsigned long long>(st.st_dev);
+    {
+        std::lock_guard lock(mtx);
+        if (auto it = by_device.find(device); it != by_device.end())
+            return it->second;
+    }
+    const bool penalty = query_device_rotational(major(st.st_dev), minor(st.st_dev));
+    std::lock_guard lock(mtx);
+    by_device.emplace(device, penalty);
+    return penalty;
+#else
+    return false;
+#endif
+}
+
+bool native_stream_in_place_allowed(bool source_has_seek_penalty,
+                                    bool cache_has_seek_penalty) {
+    return !source_has_seek_penalty || cache_has_seek_penalty;
+}
+
 // Total size in bytes of every .rf64 PCM cache file currently on disk.
 unsigned long long source_cache_dir_size_bytes() {
     const std::string dir = source_cache_dir();
@@ -803,6 +914,12 @@ SourceManager::~SourceManager() {
 void SourceManager::set_source_ready_callback(SourceReadyCallback callback) {
     std::lock_guard lock(write_mutex_);
     source_ready_callback_ = std::move(callback);
+}
+
+void SourceManager::set_seek_penalty_probe(
+    std::function<bool(const std::string&)> probe) {
+    std::lock_guard lock(write_mutex_);
+    seek_penalty_probe_ = std::move(probe);
 }
 
 void SourceManager::publish_locked(EntryMap entries) {
@@ -1472,8 +1589,14 @@ void SourceManager::request_range(const Id& source_id,
     const Frame end = std::min<Frame>(
         source->duration_frames() - 1,
         start + static_cast<Frame>(frame_count) - 1);
-    const int first = block_cache_.block_index_for(start);
-    const int last = block_cache_.block_index_for(end);
+    // Callers speak engine frames; the cache holds the file's own frames, which
+    // differ for a source resampled on the fly (identity otherwise).
+    Frame native_first = 0, native_last = 0;
+    source->native_span(start, end - start + 1, native_first, native_last);
+    if (native_last <= native_first)
+        return;
+    const int first = block_cache_.block_index_for(native_first);
+    const int last = block_cache_.block_index_for(native_last - 1);
 
     std::vector<int> missing_blocks;
     missing_blocks.reserve(static_cast<std::size_t>(last - first + 1));
@@ -1560,7 +1683,9 @@ void SourceManager::preload_clip_heads(
             continue;  // a fully-resident source needs no preload
         if (start_frame < 0 || start_frame >= source->duration_frames())
             continue;
-        const int block = block_cache_.block_index_for(start_frame);
+        Frame native_first = 0, native_last = 0;
+        source->native_span(start_frame, 1, native_first, native_last);
+        const int block = block_cache_.block_index_for(native_first);
         block_cache_.pin(source_id, block);
         // Pinning only records intent; the block still has to be fetched. Mark
         // it urgent so it lands before any read-ahead already in flight.
@@ -1731,6 +1856,16 @@ SourcePeakWindow SourceManager::source_peaks_window(const Id& source_id,
     if (!entry.source || !entry.source->is_loaded() || entry.channel_count <= 0
         || entry.duration_frames <= 0 || entry.status == "streaming") {
         return window;
+    }
+
+    // The caller asks in engine frames; a source resampled on the fly keeps its
+    // file's own rate in the entry, and the window is answered in that rate
+    // (window.sample_rate says which, so seconds come out right either way).
+    if (entry.source->is_resampled()) {
+        const double to_native = static_cast<double>(entry.sample_rate)
+                               / static_cast<double>(entry.source->sample_rate());
+        start_frame = static_cast<Frame>(std::floor(static_cast<double>(start_frame) * to_native));
+        end_frame = static_cast<Frame>(std::ceil(static_cast<double>(end_frame) * to_native));
     }
 
     const Frame clamped_start = std::clamp<Frame>(start_frame, 0, entry.duration_frames);
@@ -2338,6 +2473,10 @@ void SourceManager::fill_blocks_from_disk(const Id& source_id,
         reader.close();
 }
 
+bool realtime_resample_enabled() {
+    return lt_env_flag_enabled("LIBRETRACKS_REALTIME_RESAMPLE");
+}
+
 std::string pcm_cache_file_for(const Id& source_id,
                                const std::string& file_path,
                                int sample_rate) {
@@ -2408,8 +2547,14 @@ bool SourceManager::try_install_native_file(const Id& source_id,
     // start-to-finish (some compressed payloads inside WAV) would play the
     // head and then stutter. Those keep the decode route, which turns them
     // into a cache file that IS seekable.
+    //
+    // LIBRETRACKS_REALTIME_RESAMPLE=1 (plan realtime-resample) lifts the rate
+    // condition: the DecodedSource resamples while it reads, so a 44.1k WAV on
+    // a 48k engine streams in place instead of being copied to the cache.
+    const bool rate_ok = info.samplerate == engine_sample_rate ||
+        (info.samplerate > 0 && realtime_resample_enabled());
     const bool eligible =
-        info.samplerate == engine_sample_rate &&
+        rate_ok &&
         info.frames > 0 &&
         info.seekable != 0 &&
         (info.channels == 1 || info.channels == 2);
@@ -2418,8 +2563,31 @@ bool SourceManager::try_install_native_file(const Id& source_id,
         return false;
     }
     const int channel_count = info.channels;
+    const int native_sample_rate = info.samplerate;
     const Frame duration_frames = static_cast<Frame>(info.frames);
     sf_close(sf);
+
+    // On a spinning disk the in-place stream is the slow path, not the free
+    // one: send the file through the decode route so it plays from the cache
+    // instead. See path_has_seek_penalty. LIBRETRACKS_STREAM_HDD_IN_PLACE=1
+    // restores streaming for A/B.
+    if (!lt_env_flag_enabled("LIBRETRACKS_STREAM_HDD_IN_PLACE")) {
+        std::function<bool(const std::string&)> probe;
+        {
+            std::lock_guard lock(write_mutex_);
+            probe = seek_penalty_probe_;
+        }
+        if (!probe)
+            probe = path_has_seek_penalty;
+        const bool source_slow = probe(file_path);
+        if (source_slow &&
+            !native_stream_in_place_allowed(source_slow, probe(source_cache_dir()))) {
+            lt_debug_log("[LT_STORAGE] %s is on a disk with seek penalty; "
+                         "converting it to the PCM cache instead of streaming in place\n",
+                         file_path.c_str());
+            return false;
+        }
+    }
 
     SourceReadyCallback ready_callback;
     {
@@ -2435,7 +2603,9 @@ bool SourceManager::try_install_native_file(const Id& source_id,
         // separate code path needed.
         entry.cache_file_path = file_path;
         entry.channel_count = channel_count;
-        entry.sample_rate = engine_sample_rate;
+        // The FILE's rate and length: the fill worker and the waveform read
+        // the file itself. Only the DecodedSource speaks engine frames.
+        entry.sample_rate = native_sample_rate;
         entry.duration_frames = duration_frames;
         // disk_cache_bytes counts bytes the engine has *itself* written to
         // its cache directory. Native files we stream in place don't take any
@@ -2445,8 +2615,9 @@ bool SourceManager::try_install_native_file(const Id& source_id,
         entry.source = std::make_shared<DecodedSource>(
             source_id,
             channel_count,
-            engine_sample_rate,
+            native_sample_rate,
             duration_frames,
+            engine_sample_rate,
             &block_cache_,
             [this](const Id& id, int first_block, int block_count, bool urgent) {
                 request_blocks(id, first_block, block_count, urgent);

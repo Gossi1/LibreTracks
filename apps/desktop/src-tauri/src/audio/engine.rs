@@ -176,6 +176,8 @@ pub struct AudioDeviceStatusEvent {
 pub struct RegionMeterLevel {
     pub region_id: String,
     pub peak: f32,
+    pub left_peak: f32,
+    pub right_peak: f32,
 }
 
 /// What the meter thread reads from one engine snapshot.
@@ -1012,6 +1014,19 @@ impl AudioController {
                     warp_enabled: region.0.warp_enabled,
                     warp_source_bpm: region.0.warp_source_bpm.unwrap_or(0.0),
                     master_gain: region.0.master.gain as f32,
+                    fade_in_frames: region_fade_frames(
+                        engine,
+                        region.0,
+                        region.1,
+                        region.0.master.fade_in_seconds,
+                    ),
+                    fade_out_frames: region_fade_frames(
+                        engine,
+                        region.0,
+                        region.1,
+                        region.0.master.fade_out_seconds,
+                    ),
+                    voice_guide_count_style: region_voice_guide_count_style(region.0),
                 })
                 .collect();
             engine.send_command(&EngineCommand::SetSongRegions {
@@ -1111,6 +1126,19 @@ impl AudioController {
                     warp_enabled: region.0.warp_enabled,
                     warp_source_bpm: region.0.warp_source_bpm.unwrap_or(0.0),
                     master_gain: region.0.master.gain as f32,
+                    fade_in_frames: region_fade_frames(
+                        engine,
+                        region.0,
+                        region.1,
+                        region.0.master.fade_in_seconds,
+                    ),
+                    fade_out_frames: region_fade_frames(
+                        engine,
+                        region.0,
+                        region.1,
+                        region.0.master.fade_out_seconds,
+                    ),
+                    voice_guide_count_style: region_voice_guide_count_style(region.0),
                 })
                 .collect();
             let markers = song
@@ -1134,6 +1162,7 @@ impl AudioController {
                     id: marker.id.clone(),
                     frame: seconds_to_frame_for_engine(engine, marker.start_seconds),
                     bpm: marker.bpm,
+                    ramp: marker.ramp,
                 })
                 .collect();
             let time_signature_markers = song
@@ -1281,6 +1310,19 @@ impl AudioController {
                     warp_enabled: region.0.warp_enabled,
                     warp_source_bpm: region.0.warp_source_bpm.unwrap_or(0.0),
                     master_gain: region.0.master.gain as f32,
+                    fade_in_frames: region_fade_frames(
+                        engine,
+                        region.0,
+                        region.1,
+                        region.0.master.fade_in_seconds,
+                    ),
+                    fade_out_frames: region_fade_frames(
+                        engine,
+                        region.0,
+                        region.1,
+                        region.0.master.fade_out_seconds,
+                    ),
+                    voice_guide_count_style: region_voice_guide_count_style(region.0),
                 })
                 .collect();
             let markers = song
@@ -1304,6 +1346,7 @@ impl AudioController {
                     id: marker.id.clone(),
                     frame: seconds_to_frame_for_engine(engine, marker.start_seconds),
                     bpm: marker.bpm,
+                    ramp: marker.ramp,
                 })
                 .collect();
             let time_signature_markers = song
@@ -1365,6 +1408,7 @@ impl AudioController {
                     id: marker.id.clone(),
                     frame: seconds_to_frame_for_engine(engine, marker.start_seconds),
                     bpm: marker.bpm,
+                    ramp: marker.ramp,
                 })
                 .collect();
             let time_signature_markers = song
@@ -1546,6 +1590,7 @@ impl AudioController {
                 route: settings.voice_guide_output.clone(),
                 lead_bars: settings.voice_guide_lead_bars,
                 count_in_enabled: settings.voice_guide_count_in_enabled,
+                count_style: settings.voice_guide_count_style.as_engine_value(),
             })?;
             Ok(())
         })
@@ -1563,6 +1608,7 @@ impl AudioController {
                 route: settings.voice_guide_output.clone(),
                 lead_bars: settings.voice_guide_lead_bars,
                 count_in_enabled: settings.voice_guide_count_in_enabled,
+                count_style: settings.voice_guide_count_style.as_engine_value(),
             })?;
             Ok(())
         })
@@ -2044,6 +2090,7 @@ impl AudioController {
                 route: settings.voice_guide_output.clone(),
                 lead_bars: settings.voice_guide_lead_bars,
                 count_in_enabled: settings.voice_guide_count_in_enabled,
+                count_style: settings.voice_guide_count_style.as_engine_value(),
             })?;
             // Ambient-pad config (the key clip is decoded separately via the
             // command layer, which knows the installed-pads path).
@@ -2062,6 +2109,14 @@ impl AudioController {
             engine.send_command(&EngineCommand::SetPauseAtSongEnd {
                 enabled: settings.pause_at_song_end,
             })?;
+            engine.send_command(&EngineCommand::SetSongGapVamp {
+                enabled: settings.vamp_between_songs,
+            })?;
+            // Where the track meters measure: an atomic in the mixer, so it is
+            // a pure flag like the two above.
+            engine.send_command(&EngineCommand::SetTrackMeterMode {
+                mode: settings.track_meter_mode,
+            })?;
             state.settings = settings;
             Ok(())
         })
@@ -2076,6 +2131,14 @@ impl AudioController {
                 elapsed_ms: 0.0,
                 stopped_sinks: 1,
             });
+            Ok(())
+        })
+    }
+
+    /// Silence a holding vamp between songs without playing (user Pause/Stop).
+    pub fn end_song_gap_vamp(&self) -> Result<(), DesktopError> {
+        self.with_engine_state("end_song_gap_vamp", None, |engine, _state| {
+            engine.send_command(&EngineCommand::EndSongGapVamp)?;
             Ok(())
         })
     }
@@ -2558,7 +2621,12 @@ impl AudioController {
             }
             let playing = matches!(snapshot.playback_state, PlaybackState::Playing);
             let suspended = snapshot.device.output_suspended;
-            let idle = !playing && !snapshot.transport_pending_start && !snapshot.pad.enabled;
+            // A vamp between songs is the transport paused on purpose with the
+            // click still going: not idle.
+            let idle = !playing
+                && !snapshot.transport_pending_start
+                && !snapshot.pad.enabled
+                && !snapshot.pitch.mixer_song_gap_vamp_active;
             tick.idle_wake = wake_policy.step(SystemTime::now(), away, idle);
             let request = match idle_policy.step(Instant::now(), backgrounded, idle, suspended) {
                 SuspendAction::None => None,
@@ -2584,9 +2652,16 @@ impl AudioController {
             let regions: Vec<RegionMeterLevel> = snapshot
                 .region_meters
                 .into_iter()
-                .map(|meter| RegionMeterLevel {
-                    region_id: meter.region_id,
-                    peak: meter.peak,
+                .map(|meter| {
+                    // An engine without per-channel region meters leaves both
+                    // at zero: show its mono peak on both sides.
+                    let stereo = meter.left_peak > 0.0 || meter.right_peak > 0.0;
+                    RegionMeterLevel {
+                        region_id: meter.region_id,
+                        peak: meter.peak,
+                        left_peak: if stereo { meter.left_peak } else { meter.peak },
+                        right_peak: if stereo { meter.right_peak } else { meter.peak },
+                    }
                 })
                 .collect();
             tick.frame = Some(MeterFrame {
@@ -3280,15 +3355,21 @@ fn add_varispeed_tempo_boundaries(source_song: &Song, runtime: &mut Song) {
         }
         let view_start = warp_timeline_seconds_at(source_song, region.start_seconds);
         let view_end = warp_timeline_seconds_at(source_song, region.end_seconds).max(view_start);
+        // Same as `timeline_math::add_varispeed_tempo_boundaries`: a
+        // boundary inside a ramp carries it on.
+        let in_ramp =
+            |at: f64| libretracks_core::tempo_ramp::tempo_span_at(source_song, at).is_ramp();
         synthetic_markers.push(TempoMarker {
             id: format!("{}_varispeed_start", region.id),
             start_seconds: view_start,
             bpm: effective_bpm_at(source_song, region.start_seconds) * scale,
+            ramp: in_ramp(region.start_seconds),
         });
         synthetic_markers.push(TempoMarker {
             id: format!("{}_varispeed_end", region.id),
             start_seconds: view_end,
             bpm: effective_bpm_at(source_song, region.end_seconds),
+            ramp: in_ramp(region.end_seconds),
         });
     }
     runtime.tempo_markers.extend(synthetic_markers);
@@ -3414,6 +3495,37 @@ fn marker_category_token(category: MarkerCategory) -> String {
     }
 }
 
+/// The song's own voice-guide count style for the engine, or -1 to follow the
+/// global setting (`SetVoiceGuideConfig::count_style`).
+fn region_voice_guide_count_style(region: &libretracks_core::SongRegion) -> i32 {
+    region
+        .voice_guide_count_style
+        .map(|style| style.as_engine_value())
+        .unwrap_or(-1)
+}
+
+/// A song fade, in engine frames. The fade is set in the song's own seconds;
+/// with warp the runtime region is stretched, so the fade is stretched by the
+/// same ratio to keep covering the same music. Non-finite or negative = none.
+fn region_fade_frames(
+    engine: &Engine,
+    region: &libretracks_core::SongRegion,
+    runtime_region: &libretracks_core::SongRegion,
+    fade_seconds: f64,
+) -> i64 {
+    if !fade_seconds.is_finite() || fade_seconds <= 0.0 {
+        return 0;
+    }
+    let length = region.end_seconds - region.start_seconds;
+    let runtime_length = runtime_region.end_seconds - runtime_region.start_seconds;
+    let ratio = if length > 0.0 && runtime_length > 0.0 {
+        runtime_length / length
+    } else {
+        1.0
+    };
+    seconds_to_frame_for_engine(engine, fade_seconds.min(length.max(0.0)) * ratio)
+}
+
 fn seconds_to_frame_for_engine(engine: &Engine, seconds: f64) -> i64 {
     let sample_rate = engine
         .get_snapshot()
@@ -3461,6 +3573,8 @@ mod tests {
                 midi_enabled: true,
                 collapsed: false,
                 height_offset: None,
+                match_aliases: Vec::new(),
+                song_region_id: None,
             }],
             clips: vec![Clip {
                 id: "clip".into(),

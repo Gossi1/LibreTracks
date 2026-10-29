@@ -27,6 +27,7 @@ export type WidgetType =
   | "playButton"
   | "pauseButton"
   | "stopButton"
+  | "fadeStopButton"
   | "clickButton"
   | "guideButton"
   | "timeline"
@@ -59,7 +60,8 @@ export type WidgetType =
   | "progressSong"
   | "countdownMarkerBars"
   | "countdownSongTime"
-  | "videoBlackButton";
+  | "videoBlackButton"
+  | "lyrics";
 
 export const ALL_WIDGET_TYPES: readonly WidgetType[] = [
   "readouts",
@@ -73,6 +75,7 @@ export const ALL_WIDGET_TYPES: readonly WidgetType[] = [
   "playButton",
   "pauseButton",
   "stopButton",
+  "fadeStopButton",
   "clickButton",
   "guideButton",
   "timeline",
@@ -106,6 +109,7 @@ export const ALL_WIDGET_TYPES: readonly WidgetType[] = [
   "countdownMarkerBars",
   "countdownSongTime",
   "videoBlackButton",
+  "lyrics",
 ];
 
 /** The layout grid is this many columns wide; widget widths are 1..COLUMNS. */

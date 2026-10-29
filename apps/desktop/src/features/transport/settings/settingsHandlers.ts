@@ -274,6 +274,28 @@ export function createSettingsHandlers(deps: SettingsHandlerDeps) {
       );
     },
 
+    handleVampBetweenSongsChange(nextValue: boolean) {
+      persistAudioPatch(
+        { vampBetweenSongs: nextValue },
+        t("transport.status.vampBetweenSongsUpdated"),
+      );
+    },
+
+    handleTrackMeterModeChange(nextValue: AppSettings["trackMeterMode"]) {
+      persistAudioPatch(
+        { trackMeterMode: nextValue },
+        t("transport.status.trackMeterModeUpdated"),
+      );
+    },
+
+    handleFadeOutStopSecondsChange(nextValue: number) {
+      // normalizeAppSettings clamps to 0.1–30 s, so a cleared input is safe.
+      persistAudioPatch(
+        { fadeOutStopSeconds: nextValue },
+        t("transport.status.fadeOutStopUpdated"),
+      );
+    },
+
     handleVampModeChange(nextValue: AppSettings["vampMode"]) {
       persistAudioPatch({ vampMode: nextValue }, "Vamp settings updated.");
     },
@@ -307,12 +329,19 @@ export function createSettingsHandlers(deps: SettingsHandlerDeps) {
       );
     },
 
-    handleImportMergeMatchingTracksChange(nextValue: boolean) {
+    handleSongTrackLayoutChange(nextValue: AppSettings["songTrackLayout"]) {
       persistAudioPatch(
-        { importMergeMatchingTracks: nextValue },
-        t("transport.status.importMergeMatchingTracksUpdated", {
-          defaultValue: "Import track behaviour updated.",
+        { songTrackLayout: nextValue },
+        t("transport.status.songTrackLayoutUpdated", {
+          defaultValue: "Song track layout updated.",
         }),
+      );
+    },
+
+    handleDefaultSongTemplateChange(nextValue: string | null) {
+      persistAudioPatch(
+        { defaultSongTemplate: nextValue },
+        t("songTemplates.defaultTemplateUpdated"),
       );
     },
 

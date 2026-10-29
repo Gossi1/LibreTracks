@@ -152,6 +152,7 @@ EngineCommand command_from_json(const std::string& raw) {
         c.route = j.value("route", std::string{"monitor"});
         c.lead_bars = j.value("lead_bars", 1);
         c.count_in_enabled = j.value("count_in_enabled", true);
+        c.count_style = j.value("count_style", 0);
         return c;
     }
 
@@ -218,6 +219,9 @@ EngineCommand command_from_json(const std::string& raw) {
             region.warp_enabled = item.value("warp_enabled", false);
             region.warp_source_bpm = item.value("warp_source_bpm", 0.0);
             region.master_gain = item.value("master_gain", 1.0f);
+            region.fade_in_frames = item.value("fade_in_frames", static_cast<Frame>(0));
+            region.fade_out_frames = item.value("fade_out_frames", static_cast<Frame>(0));
+            region.voice_guide_count_style = item.value("voice_guide_count_style", -1);
             cmd.regions.push_back(std::move(region));
         }
         return cmd;
@@ -270,6 +274,7 @@ EngineCommand command_from_json(const std::string& raw) {
             marker.id = item.at("id").get<Id>();
             marker.frame = item.at("frame").get<Frame>();
             marker.bpm = item.at("bpm").get<double>();
+            marker.ramp = item.value("ramp", false);
             cmd.tempo_markers.push_back(std::move(marker));
         }
         for (const auto& item : j.at("time_signature_markers")) {
@@ -315,6 +320,9 @@ EngineCommand command_from_json(const std::string& raw) {
             region.warp_enabled = item.value("warp_enabled", false);
             region.warp_source_bpm = item.value("warp_source_bpm", 0.0);
             region.master_gain = item.value("master_gain", 1.0f);
+            region.fade_in_frames = item.value("fade_in_frames", static_cast<Frame>(0));
+            region.fade_out_frames = item.value("fade_out_frames", static_cast<Frame>(0));
+            region.voice_guide_count_style = item.value("voice_guide_count_style", -1);
             cmd.regions.push_back(std::move(region));
         }
         for (const auto& item : j.at("markers")) {
@@ -332,6 +340,7 @@ EngineCommand command_from_json(const std::string& raw) {
             marker.id = item.at("id").get<Id>();
             marker.frame = item.at("frame").get<Frame>();
             marker.bpm = item.at("bpm").get<double>();
+            marker.ramp = item.value("ramp", false);
             cmd.tempo_markers.push_back(std::move(marker));
         }
         for (const auto& item : j.at("time_signature_markers")) {
@@ -398,6 +407,9 @@ EngineCommand command_from_json(const std::string& raw) {
                 region.warp_enabled = item.value("warp_enabled", false);
                 region.warp_source_bpm = item.value("warp_source_bpm", 0.0);
                 region.master_gain = item.value("master_gain", 1.0f);
+                region.fade_in_frames = item.value("fade_in_frames", static_cast<Frame>(0));
+                region.fade_out_frames = item.value("fade_out_frames", static_cast<Frame>(0));
+                region.voice_guide_count_style = item.value("voice_guide_count_style", -1);
                 cmd.regions.push_back(std::move(region));
             }
         }
@@ -427,6 +439,7 @@ EngineCommand command_from_json(const std::string& raw) {
                 marker.id = item.at("id").get<Id>();
                 marker.frame = item.at("frame").get<Frame>();
                 marker.bpm = item.at("bpm").get<double>();
+                marker.ramp = item.value("ramp", false);
                 cmd.tempo_markers.push_back(std::move(marker));
             }
         }
@@ -475,6 +488,19 @@ EngineCommand command_from_json(const std::string& raw) {
 
     if (type == "SetPauseAtSongEnd")
         return CmdSetPauseAtSongEnd{ j.at("enabled").get<bool>() };
+
+    if (type == "SetSongGapVamp")
+        return CmdSetSongGapVamp{ j.at("enabled").get<bool>() };
+
+    if (type == "EndSongGapVamp")
+        return CmdEndSongGapVamp{};
+
+    if (type == "SetTrackMeterMode") {
+        const std::string mode = j.value("mode", std::string{"postFader"});
+        CmdSetTrackMeterMode c;
+        c.mode = mode == "postPan" ? 1 : mode == "preFader" ? 2 : 0;
+        return c;
+    }
 
     if (type == "SetLowLatency")
         return CmdSetLowLatency{ j.at("enabled").get<bool>() };
@@ -541,6 +567,7 @@ std::string command_to_json(const EngineCommand& cmd) {
             j["route"] = c.route;
             j["lead_bars"] = c.lead_bars;
             j["count_in_enabled"] = c.count_in_enabled;
+            j["count_style"] = c.count_style;
         }
         else if constexpr (std::is_same_v<T, CmdLoadVoiceGuideBank>) {
             j["type"] = "LoadVoiceGuideBank";
@@ -561,6 +588,17 @@ std::string command_to_json(const EngineCommand& cmd) {
         else if constexpr (std::is_same_v<T, CmdSetPauseAtSongEnd>) {
             j["type"] = "SetPauseAtSongEnd";
             j["enabled"] = c.enabled;
+        }
+        else if constexpr (std::is_same_v<T, CmdSetSongGapVamp>) {
+            j["type"] = "SetSongGapVamp";
+            j["enabled"] = c.enabled;
+        }
+        else if constexpr (std::is_same_v<T, CmdEndSongGapVamp>) {
+            j["type"] = "EndSongGapVamp";
+        }
+        else if constexpr (std::is_same_v<T, CmdSetTrackMeterMode>) {
+            j["type"] = "SetTrackMeterMode";
+            j["mode"] = c.mode == 1 ? "postPan" : c.mode == 2 ? "preFader" : "postFader";
         }
         else if constexpr (std::is_same_v<T, CmdLoadPadClip>) {
             j["type"] = "LoadPadClip";

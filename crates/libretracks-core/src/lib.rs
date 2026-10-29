@@ -1,9 +1,13 @@
 pub mod automation;
+pub mod key_changes;
 pub mod midi_port_names;
 pub mod midi_schedule;
 pub mod midi_wire;
 pub mod model;
+pub mod net_clock;
 pub mod song_structure;
+pub mod tempo_ramp;
+pub mod track_matching;
 pub mod validation;
 pub mod video_schedule;
 pub mod warp;
@@ -14,10 +18,10 @@ pub use automation::{
 };
 pub use model::{
     default_audio_to, implicit_start_section_id, Arrangement, ArrangementBlock, OriginalSection,
-    OriginalSnapshot, SongStructure, parse_audio_output_route, Clip, Marker, MarkerCategory, MarkerKind, MidiClip,
-    MidiEvent, MidiEventKind, Project, Song, SongMaster, SongRegion, TempoMarker, TempoMetadata,
+    OriginalSnapshot, SongStructure, SongChart, ChartLink, chart_link_marker_id, parse_audio_output_route, Clip, Marker, MarkerCategory, MarkerKind, MidiClip,
+    KeyChange, KeyMap, MidiEvent, MidiEventKind, Project, Song, SongMaster, SongRegion, TempoMarker, TempoMetadata,
     is_video_file_path, TempoSource, TimeSignatureMarker, Track, TrackKind, VideoAssetInfo, VideoClip,
-    VideoFit, MAX_MIDI_CHANNEL, MAX_MIDI_DATA_VALUE, MIN_MIDI_CHANNEL,
+    VideoFit, VoiceGuideCountStyle, MAX_MIDI_CHANNEL, MAX_MIDI_DATA_VALUE, MIN_MIDI_CHANNEL,
     SLOW_SEEK_KEYFRAME_INTERVAL_SECONDS, VIDEO_FILE_EXTENSIONS,
 };
 pub use validation::{
@@ -50,6 +54,7 @@ mod tests {
             tempo_markers: vec![],
             time_signature_markers: vec![],
             regions: vec![SongRegion {
+                key_changes: Vec::new(),
                 id: "region_intro".into(),
                 name: "Cancion".into(),
                 start_seconds: 0.0,
@@ -60,6 +65,8 @@ mod tests {
                 key: None,
                 master: SongMaster::default(),
                 compact_column_width_rem: None,
+                chart: None,
+                voice_guide_count_style: None,
                 structure: None,
             }],
             tracks: vec![
@@ -82,6 +89,8 @@ mod tests {
                     midi_enabled: true,
                     collapsed: false,
                     height_offset: None,
+                    match_aliases: Vec::new(),
+                    song_region_id: None,
                 },
                 Track {
                     id: "track_click".into(),
@@ -102,6 +111,8 @@ mod tests {
                     midi_enabled: true,
                     collapsed: false,
                     height_offset: None,
+                    match_aliases: Vec::new(),
+                    song_region_id: None,
                 },
             ],
             clips: vec![Clip {
@@ -141,6 +152,7 @@ mod tests {
     fn allows_regions_beyond_song_duration() {
         let mut song = valid_song();
         song.regions.push(SongRegion {
+            key_changes: Vec::new(),
             id: "region_outro".into(),
             name: "Outro".into(),
             start_seconds: 240.0,
@@ -151,6 +163,8 @@ mod tests {
             key: None,
             master: SongMaster::default(),
             compact_column_width_rem: None,
+            chart: None,
+            voice_guide_count_style: None,
             structure: None,
         });
 
@@ -196,6 +210,7 @@ mod tests {
         // so the boundary is real, then make the clip extend across it.
         let mut song = valid_song();
         song.regions.push(SongRegion {
+            key_changes: Vec::new(),
             id: "region_outro".into(),
             name: "Outro".into(),
             start_seconds: 240.0,
@@ -206,6 +221,8 @@ mod tests {
             key: None,
             master: SongMaster::default(),
             compact_column_width_rem: None,
+            chart: None,
+            voice_guide_count_style: None,
             structure: None,
         });
         // Clip starts inside region_intro [0, 240) but extends past 240.
@@ -224,6 +241,7 @@ mod tests {
         let mut song = valid_song();
         song.regions[0].end_seconds = 10.0;
         song.regions.push(SongRegion {
+            key_changes: Vec::new(),
             id: "region_outro".into(),
             name: "Outro".into(),
             start_seconds: 10.5,
@@ -234,6 +252,8 @@ mod tests {
             key: None,
             master: SongMaster::default(),
             compact_column_width_rem: None,
+            chart: None,
+            voice_guide_count_style: None,
             structure: None,
         });
         song.clips[0].timeline_start_seconds = 0.0;
@@ -519,3 +539,7 @@ mod tests {
 #[cfg(test)]
 #[path = "structure_model_tests.rs"]
 mod structure_model_tests;
+
+#[cfg(test)]
+#[path = "chart_tests.rs"]
+mod chart_tests;

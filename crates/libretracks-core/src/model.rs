@@ -64,6 +64,12 @@ pub struct TempoMarker {
     pub id: String,
     pub start_seconds: f64,
     pub bpm: f64,
+    /// The tempo glides from `bpm` here to the next tempo marker's, which it
+    /// reaches exactly there (a ramp, as a sloped segment of Ableton's tempo
+    /// automation). Linear in time. Without a next marker it holds `bpm`.
+    /// Older sessions have no field: a step, as before.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ramp: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -108,6 +114,147 @@ pub struct SongRegion {
     /// versión vieja lo ignora y ve el timeline lineal que el arreglo escribió.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structure: Option<SongStructure>,
+    /// Letra y acordes de la canción (ChordPro) y cómo se sincronizan con sus
+    /// marcas. `None` —y lo que deserializan las sesiones de antes— es una
+    /// canción sin letra. Se omite al guardar, así que una versión vieja abre
+    /// la sesión igual.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chart: Option<SongChart>,
+    /// Cómo cuenta la voz guía la entrada de las secciones de ESTA canción.
+    /// `None` —y lo que deserializan las sesiones de antes— sigue el ajuste
+    /// global (`AppSettings.voice_guide_count_style`). Se omite al guardar, así
+    /// que una canción sin preferencia se escribe igual que antes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_guide_count_style: Option<VoiceGuideCountStyle>,
+    /// Cambios de nota (modulaciones) dentro de la canción, ordenados. `key`
+    /// es la nota con la que ARRANCA; cada cambio rige desde su posición hasta
+    /// el siguiente. Posiciones relativas al inicio de la región y en tiempo de
+    /// fuente, así que mover o reordenar la canción y el warp no las tocan.
+    /// Se omite si está vacío: una versión vieja ve la nota inicial.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_changes: Vec<KeyChange>,
+}
+
+/// Un cambio de nota dentro de una canción. Igual que `SongRegion.key`, es la
+/// nota ORIGINAL (sin la transposición de la región) en la forma canónica en
+/// sostenidos (`"E"`, `"F#m"`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyChange {
+    pub id: String,
+    /// Segundos desde el inicio de la región, en tiempo de fuente.
+    pub offset_seconds: f64,
+    pub key: String,
+}
+
+/// La nota de una canción a lo largo del tiempo: la inicial y sus cambios,
+/// relativos al inicio de lo que describa (región, original de un arreglo).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyMap {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changes: Vec<KeyChange>,
+}
+
+/// Cómo se reparte el conteo hablado de la voz guía en los compases previos a
+/// una sección. A tempos rápidos las bandas no cuentan "1 2 3 4" en negras: o
+/// marcan primero un compás a medio tiempo ("1 · 2 · | 1 2 3 4") o cuentan todo
+/// a medio tiempo. El motor lo recibe como entero (`as_engine_value`): ese
+/// orden es ABI, sólo se añade al final.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum VoiceGuideCountStyle {
+    /// "1 2 3 4": una cifra por pulso (el comportamiento de siempre).
+    #[default]
+    Full,
+    /// "1 · 2 · | 1 2 3 4": un compás en blancas y luego el conteo normal.
+    HalfThenFull,
+    /// "1 · 2 · | 3 · 4 ·": todo el conteo a medio tiempo (dura el doble).
+    HalfTime,
+}
+
+impl VoiceGuideCountStyle {
+    /// Valor de `lt::VoiceGuideCountStyle` en el motor C++.
+    pub fn as_engine_value(self) -> i32 {
+        match self {
+            Self::Full => 0,
+            Self::HalfThenFull => 1,
+            Self::HalfTime => 2,
+        }
+    }
+}
+
+/// Letra y acordes de una canción, y su sincronía con la secuencia.
+///
+/// El texto es ChordPro (`{section: Coro}`, `[C]letra`): pocos KB que viajan
+/// dentro de la sesión. Del PDF del que salió no se guarda nada.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SongChart {
+    pub text: String,
+    /// Qué sección del texto se muestra en cada marca. Anclados a la MARCA, no
+    /// a un tiempo: sobreviven a mover la marca y a los arreglos (una
+    /// repetición `"{id}~{n}"` usa el enlace de `id`).
+    #[serde(default)]
+    pub links: Vec<ChartLink>,
+}
+
+/// Una marca y la sección del texto que suena desde ella.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ChartLink {
+    pub marker_id: String,
+    /// Índice de la sección en el texto, empezando en 0.
+    pub section: u32,
+    /// Cuándo empieza cada línea de la sección, en pulsos desde la marca.
+    /// Vacío = repartidas a partes iguales hasta la marca siguiente. En
+    /// pulsos y no en segundos para que un cambio de tempo no las descuadre.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub line_beats: Vec<f64>,
+}
+
+impl SongChart {
+    /// Mayor texto aceptado. Una canción ronda los 2-4 KB; el tope sólo evita
+    /// que un import descontrolado engorde la sesión.
+    pub const MAX_TEXT_BYTES: usize = 256 * 1024;
+
+    pub fn link_for(&self, marker_id: &str) -> Option<&ChartLink> {
+        let base = chart_link_marker_id(marker_id);
+        self.links.iter().find(|link| link.marker_id == base)
+    }
+
+    /// Deja el gráfico en un estado válido: enlaces a marcas que existen, uno
+    /// por marca (el último gana), con ids de marca original y pulsos finitos,
+    /// no negativos y en orden.
+    pub fn normalize(&mut self, marker_exists: impl Fn(&str) -> bool) {
+        let mut normalized: Vec<ChartLink> = Vec::new();
+        for mut link in std::mem::take(&mut self.links) {
+            link.marker_id = chart_link_marker_id(&link.marker_id).to_string();
+            if !marker_exists(&link.marker_id) {
+                continue;
+            }
+            let mut beats: Vec<f64> = link
+                .line_beats
+                .iter()
+                .copied()
+                .filter(|beat| beat.is_finite())
+                .map(|beat| beat.max(0.0))
+                .collect();
+            beats.sort_by(|left, right| left.total_cmp(right));
+            link.line_beats = beats;
+            normalized.retain(|existing| existing.marker_id != link.marker_id);
+            normalized.push(link);
+        }
+        self.links = normalized;
+    }
+}
+
+/// El id de marca con el que se guarda un enlace: sin el sufijo `~n` que los
+/// arreglos ponen a las repeticiones.
+pub fn chart_link_marker_id(marker_id: &str) -> &str {
+    marker_id.split('~').next().unwrap_or(marker_id)
 }
 
 /// Original de una canción y los arreglos construidos a partir de él.
@@ -178,6 +325,11 @@ pub struct OriginalSnapshot {
     /// de sus saltos están en las mismas coordenadas que el resto.
     #[serde(default)]
     pub automation_cues: Vec<crate::automation::AutomationCue>,
+    /// La nota de la región al capturar (inicial y cambios, relativos a
+    /// `origin_seconds`). `None` en los originales capturados antes de los
+    /// cambios de nota: aplicar un arreglo entonces no toca la nota.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keys: Option<KeyMap>,
 }
 
 /// Una sección del original: desde una marca de categoría Section hasta la
@@ -236,11 +388,28 @@ impl SongStructure {
 #[serde(rename_all = "camelCase")]
 pub struct SongMaster {
     pub gain: f64,
+    /// Song fade in from the region's start, in seconds. 0 = none. Like the
+    /// gain, it shapes the tracks only, never the click or the voice guide.
+    /// Left out of the file when 0, so a session without fades is written
+    /// exactly as before.
+    #[serde(default, skip_serializing_if = "is_zero_seconds")]
+    pub fade_in_seconds: f64,
+    /// Song fade out up to the region's end, in seconds. 0 = none.
+    #[serde(default, skip_serializing_if = "is_zero_seconds")]
+    pub fade_out_seconds: f64,
+}
+
+fn is_zero_seconds(value: &f64) -> bool {
+    *value == 0.0
 }
 
 impl Default for SongMaster {
     fn default() -> Self {
-        Self { gain: 1.0 }
+        Self {
+            gain: 1.0,
+            fade_in_seconds: 0.0,
+            fade_out_seconds: 0.0,
+        }
     }
 }
 
@@ -336,6 +505,22 @@ pub struct Track {
     /// the session and travels with the .ltpkg/template.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub height_offset: Option<i32>,
+    /// Words that make a dropped stem land on this track (or, on a folder,
+    /// inside it) when a template organises a drop: "EG", "Guitarra"… Matched
+    /// against the file name, see `track_matching`. Empty — the default, and
+    /// what sessions saved before this field deserialize to — means the track
+    /// never receives stems by name. Left out on save when empty, so a session
+    /// without aliases writes exactly as before and older versions, which
+    /// ignore unknown fields, open the ones that have them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub match_aliases: Vec<String>,
+    /// The song (region) this track was created for, when a template laid out
+    /// per-song tracks ("folder per song" / "separate" modes). `None` — the
+    /// default — is a track shared by every song. It is what lets a drop into a
+    /// song find that song's own tracks while they are still empty, which
+    /// deducing ownership from the clips could not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub song_region_id: Option<String>,
 }
 
 pub fn default_audio_to() -> String {
@@ -667,6 +852,19 @@ pub enum MarkerKind {
     EaseDown,
     GetReady,
     NextSong,
+    // Instrument solos: sections (count-in like any other), appended per the
+    // ABI rule. Their clips are the pack's own "Solo" + instrument cue joined
+    // (scripts/voice-guide/make-instrument-solo-clips.mjs).
+    DrumSolo,
+    BassSolo,
+    GuitarSolo,
+    // Tempo cues: one-shot spoken warnings that the tempo goes up or down. The
+    // tempo itself does not change. Appended per the ABI rule.
+    TempoUp,
+    TempoDown,
+    // Spoken count: a cue whose `variant` is the number ("one", "two"...). A
+    // guide's bare count-in is one of these per number, each on its beat.
+    Count,
     /// User-defined section with no pre-recorded voice clip; the announcement
     /// falls back to silence (or TTS, if added later).
     #[default]
@@ -732,6 +930,12 @@ impl MarkerKind {
             MarkerKind::EaseDown => "ease_down",
             MarkerKind::GetReady => "get_ready",
             MarkerKind::NextSong => "next_song",
+            MarkerKind::DrumSolo => "drum_solo",
+            MarkerKind::BassSolo => "bass_solo",
+            MarkerKind::GuitarSolo => "guitar_solo",
+            MarkerKind::TempoUp => "tempo_up",
+            MarkerKind::TempoDown => "tempo_down",
+            MarkerKind::Count => "count",
             MarkerKind::Custom => "custom",
         }
     }
@@ -761,7 +965,10 @@ impl MarkerKind {
             | MarkerKind::Swell
             | MarkerKind::WorshipFreely
             | MarkerKind::EaseDown
-            | MarkerKind::GetReady => MarkerCategory::Cue,
+            | MarkerKind::GetReady
+            | MarkerKind::TempoUp
+            | MarkerKind::TempoDown
+            | MarkerKind::Count => MarkerCategory::Cue,
             // NextSong falls through: it is announced with a count-in like a
             // section, not fired as a one-shot.
             _ => MarkerCategory::Section,
@@ -990,6 +1197,61 @@ impl Song {
 mod tests {
     use super::*;
 
+    // A session without song fades must be written exactly as before, so the
+    // file does not change and an older app reads it untouched; one saved
+    // before the fades existed must load with none.
+    // Una canción sin estilo de conteo propio se escribe igual que antes (sin
+    // el campo) y una sesión vieja carga con `None` = sigue el ajuste global.
+    // Los valores viajan en camelCase, como el resto de la sesión.
+    #[test]
+    fn region_voice_guide_count_style_is_optional_and_camel_case() {
+        let style = serde_json::to_value(VoiceGuideCountStyle::HalfThenFull).unwrap();
+        assert_eq!(style, serde_json::json!("halfThenFull"));
+        assert_eq!(
+            serde_json::to_value(VoiceGuideCountStyle::HalfTime).unwrap(),
+            serde_json::json!("halfTime")
+        );
+
+        let legacy: SongRegion = serde_json::from_value(serde_json::json!({
+            "id": "r1", "name": "A", "startSeconds": 0.0, "endSeconds": 10.0
+        }))
+        .unwrap();
+        assert_eq!(legacy.voice_guide_count_style, None);
+        let written = serde_json::to_value(&legacy).unwrap();
+        assert!(written.get("voiceGuideCountStyle").is_none());
+
+        let with_style = SongRegion {
+            voice_guide_count_style: Some(VoiceGuideCountStyle::HalfTime),
+            ..legacy
+        };
+        let json = serde_json::to_value(&with_style).unwrap();
+        assert_eq!(json["voiceGuideCountStyle"], "halfTime");
+        let back: SongRegion = serde_json::from_value(json).unwrap();
+        assert_eq!(back.voice_guide_count_style, Some(VoiceGuideCountStyle::HalfTime));
+
+        assert_eq!(VoiceGuideCountStyle::Full.as_engine_value(), 0);
+        assert_eq!(VoiceGuideCountStyle::HalfThenFull.as_engine_value(), 1);
+        assert_eq!(VoiceGuideCountStyle::HalfTime.as_engine_value(), 2);
+    }
+
+    #[test]
+    fn song_master_fades_are_omitted_when_zero_and_default_when_absent() {
+        let plain = serde_json::to_value(SongMaster::default()).unwrap();
+        assert_eq!(plain, serde_json::json!({ "gain": 1.0 }));
+
+        let faded = SongMaster {
+            fade_in_seconds: 2.0,
+            ..SongMaster::default()
+        };
+        let json = serde_json::to_value(&faded).unwrap();
+        assert_eq!(json["fadeInSeconds"], 2.0);
+        assert!(json.get("fadeOutSeconds").is_none());
+
+        let legacy: SongMaster = serde_json::from_str(r#"{ "gain": 0.5 }"#).unwrap();
+        assert_eq!(legacy.fade_in_seconds, 0.0);
+        assert_eq!(legacy.fade_out_seconds, 0.0);
+    }
+
     fn marker(id: &str, start_seconds: f64, digit: Option<u8>) -> Marker {
         Marker {
             id: id.into(),
@@ -1171,6 +1433,12 @@ mod tests {
 
         marker.kind = MarkerKind::Build;
         assert_eq!(marker.category(), MarkerCategory::Cue);
+
+        // A spoken count is a one-shot on its beat, and its token is what the
+        // engine's marker_kind_from_string expects.
+        marker.kind = MarkerKind::Count;
+        assert_eq!(marker.category(), MarkerCategory::Cue);
+        assert_eq!(MarkerKind::Count.as_token(), "count");
     }
 
     #[test]

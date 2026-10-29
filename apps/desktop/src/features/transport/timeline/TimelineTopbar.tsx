@@ -22,8 +22,11 @@ import {
 } from "../tempo/tempoFieldInput";
 import { AudioDeviceStatusBadge } from "../AudioDeviceStatusBadge";
 import { MidiDeviceStatusBadge } from "../MidiDeviceStatusBadge";
+import { NetworkSessionBadge } from "../../network/NetworkSessionBadge";
 import { requestAppClose } from "../../appClose/appCloseService";
 import { useWorshipToolsStore } from "../../worshiptools/worshipToolsStore";
+import { FadeStopButton } from "./FadeStopButton";
+import { openLevelSongs } from "../levelSongs/levelSongsStore";
 
 type TimelineTopbarProps = {
   openTopMenu: "file" | null;
@@ -420,6 +423,17 @@ export function TimelineTopbar({
                   <span>{t("timelineTopbar.importExternalProject")}</span>
                 </button>
                 <div className="lt-top-menu-separator" aria-hidden="true" />
+                {/* Whole-setlist action, so it lives here and not only in each
+                    song's menu, where it read as "this song". */}
+                <button
+                  type="button"
+                  role="menuitem"
+                  disabled={!canPersistProject}
+                  onClick={() => onTopMenuAction(openLevelSongs)}
+                >
+                  <span>{t("transport.menu.levelSongs")}</span>
+                </button>
+                <div className="lt-top-menu-separator" aria-hidden="true" />
                 <button
                   type="button"
                   role="menuitem"
@@ -660,6 +674,11 @@ export function TimelineTopbar({
             >
               <span className="material-symbols-outlined">stop</span>
             </button>
+            <FadeStopButton
+              className="lt-fade-stop"
+              learnModeActive={learnModeActive}
+              onMidiLearnTarget={onMidiLearnTarget}
+            />
             <button
               type="button"
               aria-label={t("timelineTopbar.play")}
@@ -863,6 +882,7 @@ export function TimelineTopbar({
           <div className="lt-device-status-slot">
             <AudioDeviceStatusBadge />
             <MidiDeviceStatusBadge />
+            <NetworkSessionBadge />
             {isMobileApp ? null : <VideoOutputBadge />}
           </div>
         </div>

@@ -299,6 +299,7 @@ fn migrate_v2_song(document: LegacySongDocumentV2) -> Result<Song, ProjectError>
         tempo_markers: vec![],
         time_signature_markers: vec![],
         regions: vec![SongRegion {
+            key_changes: Vec::new(),
             id: "region_1".into(),
             name: "Song 1".into(),
             start_seconds: 0.0,
@@ -309,6 +310,8 @@ fn migrate_v2_song(document: LegacySongDocumentV2) -> Result<Song, ProjectError>
             warp_source_bpm: None,
             master: libretracks_core::SongMaster::default(),
             compact_column_width_rem: None,
+            chart: None,
+            voice_guide_count_style: None,
             structure: None,
         }],
         tracks: document.tracks,
@@ -335,6 +338,7 @@ fn migrate_v3_song(document: LegacySongDocumentV3) -> Result<Song, ProjectError>
         tempo_markers: vec![],
         time_signature_markers: vec![],
         regions: vec![SongRegion {
+            key_changes: Vec::new(),
             id: "region_1".into(),
             name: region_name,
             start_seconds: 0.0,
@@ -345,6 +349,8 @@ fn migrate_v3_song(document: LegacySongDocumentV3) -> Result<Song, ProjectError>
             warp_source_bpm: None,
             master: libretracks_core::SongMaster::default(),
             compact_column_width_rem: None,
+            chart: None,
+            voice_guide_count_style: None,
             structure: None,
         }],
         tracks: document.tracks,
@@ -496,6 +502,7 @@ fn fit_regions_to_clips(song: &mut Song) {
             }
             (None, None) => {
                 song.regions.push(SongRegion {
+                    key_changes: Vec::new(),
                     id: format!("region_v5_migrated_{}", song.regions.len()),
                     name: "Cancion".into(),
                     start_seconds: clip_start,
@@ -506,6 +513,8 @@ fn fit_regions_to_clips(song: &mut Song) {
                     warp_source_bpm: None,
                     master: libretracks_core::SongMaster::default(),
                     compact_column_width_rem: None,
+                    chart: None,
+                    voice_guide_count_style: None,
                     structure: None,
                 });
             }
@@ -540,6 +549,7 @@ fn fit_regions_to_clips(song: &mut Song) {
         }
         if max_end > min_start {
             song.regions.push(SongRegion {
+                key_changes: Vec::new(),
                 id: "region_v5_migrated_default".into(),
                 name: "Cancion".into(),
                 start_seconds: min_start,
@@ -550,6 +560,8 @@ fn fit_regions_to_clips(song: &mut Song) {
                 warp_source_bpm: None,
                 master: libretracks_core::SongMaster::default(),
                 compact_column_width_rem: None,
+                chart: None,
+                voice_guide_count_style: None,
                 structure: None,
             });
         }
@@ -632,6 +644,8 @@ mod tests {
                 midi_enabled: true,
                 collapsed: false,
                 height_offset: None,
+                match_aliases: Vec::new(),
+                song_region_id: None,
             }],
             clips: vec![],
             midi_clips: vec![],
@@ -657,6 +671,7 @@ mod tests {
 
     fn region(id: &str, start: f64, end: f64) -> SongRegion {
         SongRegion {
+            key_changes: Vec::new(),
             id: id.into(),
             name: id.into(),
             start_seconds: start,
@@ -667,6 +682,8 @@ mod tests {
             warp_source_bpm: None,
             master: SongMaster::default(),
             compact_column_width_rem: None,
+            chart: None,
+            voice_guide_count_style: None,
             structure: None,
         }
     }
@@ -937,6 +954,8 @@ mod tests {
             midi_enabled: true,
             collapsed: true,
             height_offset: None,
+            match_aliases: Vec::new(),
+            song_region_id: None,
         });
 
         let dir = tempfile::tempdir().expect("temp dir");
@@ -971,6 +990,42 @@ mod tests {
         let loaded = load_song(dir.path()).expect("reload song");
 
         assert_eq!(loaded.tracks[0].height_offset, Some(140));
+    }
+
+    /// The aliases a template matches dropped stems against, and the song a
+    /// per-song track belongs to, are layout: they must survive save and load
+    /// or a session made from a template forgets how to organise its drops.
+    #[test]
+    fn track_match_aliases_and_song_region_round_trip_through_save_and_load() {
+        let mut song = base_song();
+        song.tracks[0].match_aliases = vec!["EG".into(), "Guitarra".into()];
+        song.tracks[0].song_region_id = Some("region_1".into());
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        save_song(dir.path(), &song).expect("save song with aliases");
+        let loaded = load_song(dir.path()).expect("reload song");
+
+        assert_eq!(loaded.tracks[0].match_aliases, vec!["EG", "Guitarra"]);
+        assert_eq!(loaded.tracks[0].song_region_id.as_deref(), Some("region_1"));
+    }
+
+    /// A track without aliases or song must not write either field, so a
+    /// session that never used templates is byte-for-byte what it was before
+    /// the fields existed — and sessions written before them load as empty.
+    #[test]
+    fn tracks_without_aliases_or_song_leave_the_fields_out() {
+        let song = base_song();
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        save_song(dir.path(), &song).expect("save song");
+        let raw = std::fs::read_to_string(dir.path().join("song.ltsession"))
+            .expect("read back the saved session");
+        assert!(!raw.contains("matchAliases"), "{raw}");
+        assert!(!raw.contains("songRegionId"), "{raw}");
+
+        let loaded = load_song(dir.path()).expect("reload song");
+        assert!(loaded.tracks[0].match_aliases.is_empty());
+        assert_eq!(loaded.tracks[0].song_region_id, None);
     }
 
     /// Sessions written before the field existed must still load, with every
@@ -1045,6 +1100,8 @@ mod tests {
             midi_enabled: true,
             collapsed: false,
             height_offset: None,
+            match_aliases: Vec::new(),
+            song_region_id: None,
         });
         song.midi_clips.push(libretracks_core::MidiClip {
             id: "mc1".into(),
@@ -1121,6 +1178,8 @@ mod tests {
             midi_enabled: true,
             collapsed: false,
             height_offset: None,
+            match_aliases: Vec::new(),
+            song_region_id: None,
         }
     }
 

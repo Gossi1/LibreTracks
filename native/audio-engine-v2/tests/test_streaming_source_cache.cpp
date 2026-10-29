@@ -187,6 +187,54 @@ TEST_CASE("Streaming source reads match legacy in-memory source across block bou
     }
 }
 
+// Una fuente mono pedida en estereo sale por los dos canales, en memoria y en
+// streaming, y una pista que la reproduce tambien. Antes DecodedSource::read
+// duplicaba el mono y acto seguido ponia el segundo canal a cero: los mono
+// sonaban solo por la izquierda, y el mezclador lo tapaba con una heuristica
+// ("fuente de un solo lado") que tambien centraba estereos de un solo lado.
+TEST_CASE("a mono source fills both channels of a stereo read") {
+    constexpr int kSampleRate = 48000;
+    constexpr Frame kFrames = kDefaultBlockFrames * 2 + 333;
+    const auto samples = make_reference_audio(kFrames, 1);
+
+    SourceManager memory_manager;
+    SourceManager streaming_manager;
+    memory_manager.register_source("mono", "");
+    streaming_manager.register_source("mono", "streaming-mono.wav");
+    REQUIRE(memory_manager.store_decoded_source(
+        "mono", samples, 1, kSampleRate, kFrames).is_ok());
+    REQUIRE(streaming_manager.store_decoded_source(
+        "mono", samples, 1, kSampleRate, kFrames).is_ok());
+    const auto memory_source = memory_manager.get_shared("mono");
+    const auto streaming_source = streaming_manager.get_shared("mono");
+    REQUIRE(streaming_source->is_streaming());
+
+    constexpr Frame kStart = kDefaultBlockFrames - 100;
+    constexpr int kRead = 512;
+    require_ready_range(streaming_manager, "mono", kStart, kRead);
+    for (const auto& planar : {read_planar(*memory_source, kStart, kRead),
+                               read_planar(*streaming_source, kStart, kRead)}) {
+        float peak_l = 0.0f;
+        for (int f = 0; f < kRead; ++f) {
+            peak_l = std::max(peak_l, std::abs(planar[static_cast<std::size_t>(f * 2)]));
+            CHECK(planar[static_cast<std::size_t>(f * 2 + 1)]
+                  == planar[static_cast<std::size_t>(f * 2)]);
+        }
+        CHECK(peak_l > 0.1f);
+    }
+
+    for (const auto* manager : {&memory_manager, &streaming_manager}) {
+        const auto block = render_track_block(*manager, "mono", kStart, kRead);
+        float peak_r = 0.0f;
+        for (int f = 0; f < kRead; ++f) {
+            peak_r = std::max(peak_r, std::abs(block[static_cast<std::size_t>(f * 2 + 1)]));
+            CHECK(block[static_cast<std::size_t>(f * 2 + 1)]
+                  == block[static_cast<std::size_t>(f * 2)]);
+        }
+        CHECK(peak_r > 0.05f);
+    }
+}
+
 TEST_CASE("try_install_from_cache_file reuses a previously written PCM cache") {
     constexpr int kChannels = 2;
     constexpr int kSampleRate = 48000;
@@ -670,19 +718,36 @@ TEST_CASE("a missing streaming file backs off instead of retrying every batch") 
     REQUIRE(manager.try_install_native_file(source_id, kSampleRate));
     REQUIRE(std::remove(wav_path.c_str()) == 0);
 
+    constexpr int kBatches = 40;
     uint64_t actual_open_attempts = 0;
     uint64_t actual_open_failures = 0;
-    for (int attempt = 0; attempt < 40; ++attempt) {
+    const auto started = std::chrono::steady_clock::now();
+    for (int attempt = 0; attempt < kBatches; ++attempt) {
         manager.request_block(source_id, 1, /*urgent=*/true);
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
         const auto io = manager.take_fill_io_stats();
         actual_open_attempts += io.open_count;
         actual_open_failures += io.open_failures;
     }
+    const auto elapsed_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started).count());
 
-    // Forty queue batches span ~200 ms. Exponential 20/40/80/160 ms backoff
-    // should turn them into only a handful of real sf_open calls, not forty.
-    CHECK(actual_open_attempts <= 6);
+    // The bound follows the real elapsed time, not the nominal 40 x 5 ms: a
+    // CI runner oversleeps (1.28 s instead of ~200 ms on macOS), and the
+    // 20/40/80/160/320/500 ms schedule legitimately fits more opens in that.
+    // Count what the schedule allows in `elapsed_ms`, plus one for the
+    // millisecond rounding at each edge.
+    uint64_t allowed_opens = 0;
+    uint64_t next_open_ms = 0;
+    for (unsigned failures = 0; next_open_ms <= elapsed_ms; ++failures) {
+        ++allowed_opens;
+        next_open_ms += std::min<uint64_t>(500, 20ull << std::min(failures, 5u));
+    }
+    INFO("elapsed_ms=" << elapsed_ms << " allowed_opens=" << allowed_opens);
+    CHECK(actual_open_attempts <= allowed_opens + 1);
+    // Without the backoff every batch would open the file again.
+    CHECK(actual_open_attempts < static_cast<uint64_t>(kBatches) / 2);
     CHECK(actual_open_failures == actual_open_attempts);
 }
 
@@ -1044,6 +1109,8 @@ TEST_CASE("con el presupuesto rebasado, el audio del usuario sobrevive") {
     REQUIRE(write_wav_pcm_float(user_wav, samples, kChannels, kSampleRate));
 
     SourceManager manager;
+    // In place regardless of the runner's disk (see path_has_seek_penalty).
+    manager.set_seek_penalty_probe([](const std::string&) { return false; });
     manager.register_source("del-usuario", user_wav);
     REQUIRE(manager.try_install_native_file("del-usuario", kSampleRate));
 
@@ -1819,4 +1886,66 @@ TEST_CASE("dropping read-ahead spares the lane a jump is blocking on") {
     manager.request_range(source_id, 0, kDefaultBlockFrames * 2);
     const auto requeued = manager.take_fill_io_stats();
     CHECK(requeued.queue_normal == 2);
+}
+
+TEST_CASE("native_stream_in_place_allowed converts only when the cache is the faster disk") {
+    CHECK(native_stream_in_place_allowed(false, false));
+    CHECK(native_stream_in_place_allowed(false, true));
+    CHECK_FALSE(native_stream_in_place_allowed(true, false));
+    // Both on spinning disks: a conversion only moves the seeks around.
+    CHECK(native_stream_in_place_allowed(true, true));
+}
+
+TEST_CASE("a native WAV on a seek-penalty disk goes to the PCM cache instead of streaming in place") {
+    ScopedCacheDir scope("hdd_native");
+    constexpr int kChannels = 2;
+    constexpr int kSampleRate = 44100;
+    constexpr Frame kFrames = kDefaultBlockFrames * 3 + 257;
+    const auto wav_path = make_temp_wav_path("hdd_native");
+    REQUIRE(write_wav_pcm_float(wav_path, make_reference_audio(kFrames, kChannels),
+                                kChannels, kSampleRate));
+
+    SourceManager manager;
+    const Id source_id = "hdd-native-source";
+    manager.register_source(source_id, wav_path);
+    // Only the original sits on the "HDD"; the cache directory is fast.
+    manager.set_seek_penalty_probe(
+        [&](const std::string& path) { return path == wav_path; });
+    CHECK_FALSE(manager.try_install_native_file(source_id, kSampleRate));
+
+    // The caller's fallback — the decode route — then serves it from the cache.
+    REQUIRE(manager.decode_and_store_streaming(source_id, wav_path, kSampleRate).is_ok());
+    const auto stats = stat_cache_dir(
+        scope.path() + std::string(1, kTestPathSep) + "source-cache");
+    CHECK(stats.file_count == 1);
+    const auto diags = manager.diagnostics();
+    REQUIRE(diags.size() == 1);
+    CHECK(diags[0].disk_cache_bytes > 0);
+
+    std::remove(wav_path.c_str());
+}
+
+TEST_CASE("a native WAV keeps streaming in place when the cache is on a slow disk too, or when forced") {
+    constexpr int kChannels = 2;
+    constexpr int kSampleRate = 44100;
+    const auto wav_path = make_temp_wav_path("hdd_native_both_slow");
+    REQUIRE(write_wav_pcm_float(wav_path, make_reference_audio(1024, kChannels),
+                                kChannels, kSampleRate));
+
+    {
+        SourceManager manager;
+        manager.register_source("both-slow", wav_path);
+        manager.set_seek_penalty_probe([](const std::string&) { return true; });
+        CHECK(manager.try_install_native_file("both-slow", kSampleRate));
+    }
+    {
+        ScopedEnv force("LIBRETRACKS_STREAM_HDD_IN_PLACE", "1");
+        SourceManager manager;
+        manager.register_source("forced", wav_path);
+        manager.set_seek_penalty_probe(
+            [&](const std::string& path) { return path == wav_path; });
+        CHECK(manager.try_install_native_file("forced", kSampleRate));
+    }
+
+    std::remove(wav_path.c_str());
 }

@@ -1,6 +1,8 @@
 import { AUX_FADER_SCALE, positionToGain } from "./faderScale";
 import {
   getCumulativeMusicalPosition,
+  rampBpmAt,
+  type TempoRamp,
   type TimelineRegion,
 } from "./timelineMath";
 
@@ -66,6 +68,13 @@ export type MarkerKind =
   | "ease_down"
   | "get_ready"
   | "next_song"
+  | "drum_solo"
+  | "bass_solo"
+  | "guitar_solo"
+  | "tempo_up"
+  | "tempo_down"
+  // Spoken count: a cue whose variant is the number ("one", "two"...).
+  | "count"
   | "custom";
 
 /** Whether a marker behaves as a song section (Verse, Chorus — name + count-in)
@@ -93,12 +102,15 @@ export const CUE_KINDS: readonly MarkerKind[] = [
   "big_ending",
   "key_change_up",
   "key_change_down",
+  "tempo_up",
+  "tempo_down",
   "drums",
   "bass",
   "guitar",
   "keys",
   "ad_lib",
   "worship_freely",
+  "count",
 ] as const;
 
 const CUE_KIND_SET: ReadonlySet<MarkerKind> = new Set(CUE_KINDS);
@@ -175,6 +187,17 @@ const MARKER_KIND_COLORS: Record<MarkerKind, string> = {
   get_ready: "#d9a05c",
   ease_down: "#8fb0a8",
   next_song: "#7f9fd0",
+  // Instrument solos: variations of Solo's yellow, so they read as solos but
+  // can still be told apart from it and from each other.
+  drum_solo: "#e8b04f",
+  bass_solo: "#c8d65a",
+  guitar_solo: "#f0915a",
+  // Tempo cues next to the key-change greens, in a cooler teal: both say
+  // "something about the song changes here".
+  tempo_up: "#5cc6c0",
+  tempo_down: "#4f9fb8",
+  // Counts are timing, not dynamics: the neutral grey of the click family.
+  count: "#a7b4bd",
 };
 
 /** Resting-state colour for a kind. Falls back to the custom grey for unknown
@@ -216,6 +239,11 @@ export type SongMasterSummary = {
   /** Linear gain multiplier applied by the mixer to the post-mix bus while the
    * playhead lies inside this region. 1.0 means unity. */
   gain: number;
+  /** Song fade in from the region's start / fade out up to its end, in
+   * seconds. 0 = none. Like the gain, they shape the tracks only. Optional for
+   * snapshots from before song fades existed. */
+  fadeInSeconds?: number;
+  fadeOutSeconds?: number;
 };
 
 /** Fallback width (rem) for a compact-view song column, used only when the
@@ -236,6 +264,14 @@ export const COMPACT_COLUMN_DEFAULT_WIDTH_REM = 14;
 export const COMPACT_COLUMN_MIN_WIDTH_REM = 5;
 export const COMPACT_COLUMN_MAX_WIDTH_REM = 48;
 
+/** A key change inside a song: the ORIGINAL key (before the song's transpose)
+ * that rules from `startSeconds` on. Mirrors Rust `KeyChangeSummary`. */
+export type KeyChangeSummary = {
+  id: string;
+  startSeconds: number;
+  key: string;
+};
+
 export type SongRegionSummary = {
   id: string;
   name: string;
@@ -246,6 +282,11 @@ export type SongRegionSummary = {
    * `"F#"`), or `null` when unset. The key shown on the region is this value
    * transposed by `transposeSemitones` — see `regionEffectiveKey`. */
   key: string | null;
+  /** Key changes (modulations) inside the song, in timeline order. `key` is
+   * the key it STARTS in; each change rules from its `startSeconds` (timeline
+   * view seconds, like every other position here) until the next. Absent from
+   * hosts that predate the feature. See `regionKeyAt`. */
+  keyChanges?: KeyChangeSummary[];
   /** When true, the region's audio is time-stretched so its `warpSourceBpm`
    * aligns with the effective timeline tempo. Applies to ALL tracks in the
    * region, independent of `transposeSemitones`. */
@@ -260,10 +301,81 @@ export type SongRegionSummary = {
    * use the view's default. Pure view state persisted with the project so a
    * layout the user arranged survives reopening the session. */
   compactColumnWidthRem: number | null;
+  /** Lyrics and chords of the song, synced to its markers. Absent or `null` =
+   * none. */
+  chart?: SongChart | null;
   /** Original captured and arrangements of the song (reorder, repeat and drop
    * sections). Absent when no original has been captured. Mirrors Rust
    * `SongStructureSummary`; the original snapshot itself never reaches the UI. */
   structure?: SongStructureSummary;
+  /** How the voice guide counts into this song's sections, or `null`/absent
+   * to follow the global `AppSettings.voiceGuideCountStyle`. */
+  voiceGuideCountStyle?: VoiceGuideCountStyle | null;
+};
+
+/**
+ * How the voice guide lays out the spoken count-in before a section. Mirrors
+ * Rust `VoiceGuideCountStyle` (camelCase on the wire):
+ * - `full`: "1 2 3 4", one number per beat (the original).
+ * - `halfThenFull`: "1 · 2 · | 1 2 3 4", a bar in half notes first, then the
+ *   normal count. What bands do at fast tempos.
+ * - `halfTime`: "1 · 2 · | 3 · 4 ·", the whole count at half speed.
+ * The half styles only apply in even simple meters (2/4, 4/4); in 3/4 or 6/8
+ * the engine falls back to `full`.
+ */
+export type VoiceGuideCountStyle = "full" | "halfThenFull" | "halfTime";
+
+export const VOICE_GUIDE_COUNT_STYLES: readonly VoiceGuideCountStyle[] = [
+  "full",
+  "halfThenFull",
+  "halfTime",
+];
+
+export function isVoiceGuideCountStyle(
+  value: unknown,
+): value is VoiceGuideCountStyle {
+  return (
+    typeof value === "string" &&
+    (VOICE_GUIDE_COUNT_STYLES as readonly string[]).includes(value)
+  );
+}
+
+/**
+ * Where the track and folder meters measure (`lt::TrackMeterMode` in the
+ * engine). Mirrors Rust `lt_audio_engine_v2::TrackMeterMode` (camelCase).
+ */
+export type TrackMeterMode = "postFader" | "postPan" | "preFader";
+
+export const TRACK_METER_MODES: readonly TrackMeterMode[] = [
+  "postFader",
+  "postPan",
+  "preFader",
+];
+
+export function isTrackMeterMode(value: unknown): value is TrackMeterMode {
+  return (
+    typeof value === "string" &&
+    (TRACK_METER_MODES as readonly string[]).includes(value)
+  );
+}
+
+/** Which section of the chart plays from a marker. Anchored to the ORIGINAL
+ * marker id: a repeat `"{id}~{n}"` created by an arrangement uses the link of
+ * `id`. Mirrors Rust `ChartLink`. */
+export type ChartLink = {
+  markerId: string;
+  /** Index of the section in the chart text, from 0. */
+  section: number;
+  /** When each line starts, in beats from the marker. Absent or empty = the
+   * lines are spread evenly until the next marker. */
+  lineBeats?: number[];
+};
+
+/** A song's lyrics and chords (ChordPro text) and how they follow its markers.
+ * Mirrors Rust `SongChart`. */
+export type SongChart = {
+  text: string;
+  links: ChartLink[];
 };
 
 /** One section of a song's captured original, as the arrangement editor
@@ -311,6 +423,9 @@ export type TempoMarkerSummary = {
   startSeconds: number;
   sourceStartSeconds?: number;
   bpm: number;
+  /** The tempo glides from `bpm` to the next tempo marker's, reached there
+   * (a ramp, as a sloped segment of Ableton's tempo automation). */
+  ramp?: boolean;
 };
 
 export type TimeSignatureMarkerSummary = {
@@ -475,6 +590,13 @@ export type TrackSummary = {
    * shifts every row by the same amount and keeps the differences the user
    * set. Absent/null = the track just follows the global height. */
   heightOffset?: number | null;
+  /** Words a dropped stem's file name is matched against so a template drops
+   * it here ("EG", "Guitarra"…). On a folder, a match creates a child inside
+   * it. Absent/empty = the track never receives stems by name. */
+  matchAliases?: string[];
+  /** The song (region id) this track was created for when a template lays
+   * out per-song tracks. Absent/null = shared by every song. */
+  songRegionId?: string | null;
 };
 
 export function formatTransposeSemitones(value: number): string {
@@ -932,6 +1054,16 @@ export type TransportSnapshot = {
   sources?: SourceReadinessSummary;
   lastDriftSample?: TransportDriftSample | null;
   projectRevision: number;
+  /** Bumps when automation changes a track's mute/solo/volume/pan. Not a
+   * `projectRevision`: automation is playback state, not an edit, but the UI
+   * must refetch the mix or it keeps showing the buttons from before the cue.
+   * Optional for snapshots from older backends and the browser demo. */
+  mixRevision?: number;
+  /** A «Fade out y parar» is running. Optional for older backends. */
+  fadingToStop?: boolean;
+  /** The vamp between songs is holding: paused on a song end with the click
+   * still going until Play. Optional for older backends. */
+  songGapVamp?: boolean;
   songDir?: string | null;
   songFilePath?: string | null;
   isNativeRuntime: boolean;
@@ -1027,6 +1159,10 @@ export type RegionMeterLevel = {
   /** Linear peak amplitude (max(|L|, |R|)) of the post-region-master signal,
    * smoothed by a 200ms release in the engine. 0 means silence or inactive. */
   peak: number;
+  /** Per channel, same ballistics. Missing from a host older than stereo
+   * region meters (a network session can mix versions): fall back to `peak`. */
+  leftPeak?: number;
+  rightPeak?: number;
 };
 
 export type MidiBinding = {
@@ -1251,6 +1387,8 @@ export type AppSettings = {
   voiceGuideVolume: number;
   voiceGuideLeadBars: number;
   voiceGuideCountInEnabled: boolean;
+  /** Default count-in layout; each song may override it. */
+  voiceGuideCountStyle: VoiceGuideCountStyle;
   voiceGuideLanguage: string;
   padEnabled: boolean;
   /** Installed pad folder id currently selected ("" = none). */
@@ -1280,6 +1418,13 @@ export type AppSettings = {
   songJumpTrigger: "immediate" | "region_end" | "after_bars" | "next_marker";
   songJumpBars: number;
   songTransitionMode: "instant" | "fade_out";
+  /** Length of the «Fade out y parar» live action, in seconds (0.1–30). */
+  fadeOutStopSeconds: number;
+  /** Sidebar library: browse folders of the disk ("folders", default) or the
+   * session's imported assets with virtual folders ("classic", as before). */
+  libraryMode: "folders" | "classic";
+  /** Disk folders added to the folder library. Global, not per session. */
+  libraryPlaces: string[];
   vampMode: "section" | "bars";
   vampBars: number;
   /**
@@ -1288,6 +1433,20 @@ export type AppSettings = {
    * queued for that boundary still happens.
    */
   pauseAtSongEnd: boolean;
+  /**
+   * "Vamp between songs": at the end of each song the transport waits as with
+   * `pauseAtSongEnd`, but the click keeps going at that song's tempo and the
+   * pad keeps sounding until Play starts the next song. Off by default.
+   */
+  vampBetweenSongs: boolean;
+  /**
+   * Where the track and folder meters measure. `postFader` (default, as in
+   * Ableton): after the track's own pan, volume, mute and solo; parent folder
+   * faders show on the folder meter, not on the track's. `postPan`: after the
+   * pan, before the volume. `preFader`: the raw track input. Global; the
+   * master meter is not affected.
+   */
+  trackMeterMode: TrackMeterMode;
   timelineNavigationScheme: "ableton" | "libretracks";
   timelinePlayheadFollowMode: "ahead" | "center";
   /**
@@ -1295,8 +1454,24 @@ export type AppSettings = {
    * already exist in the session appends its clips onto that existing track,
    * keeping one lane per instrument across every song. When false each imported
    * song brings its own tracks, even if two songs both name a track "Batería".
+   *
+   * Superseded by {@link AppSettings.songTrackLayout}; the backend keeps it in
+   * step on save for older versions. Read the layout, not this.
    */
   importMergeMatchingTracks: boolean;
+  /**
+   * Where each song's tracks go when a song is imported or laid out from a
+   * template: one lane per instrument shared by every song, a folder per
+   * song, or per-song tracks at the root. Absent in settings files written
+   * before it existed, where it is read from `importMergeMatchingTracks`.
+   */
+  songTrackLayout: SongTrackLayout;
+  /**
+   * The song template new songs are laid out from, and that organises the
+   * stems dropped into a song: {@link BUILTIN_BAND_TEMPLATE} or the path of a
+   * `.lttemplate`. `null` = none, and songs and drops behave as they always did.
+   */
+  defaultSongTemplate: string | null;
   /**
    * When true (default) a track created without an explicit colour gets one
    * from the timeline palette, cycling through it so two tracks made in a row
@@ -1390,6 +1565,7 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   voiceGuideVolume: 1.0,
   voiceGuideLeadBars: 1,
   voiceGuideCountInEnabled: true,
+  voiceGuideCountStyle: "full",
   voiceGuideLanguage: "es",
   padEnabled: false,
   padId: "",
@@ -1405,12 +1581,19 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   songJumpTrigger: "immediate",
   songJumpBars: 4,
   songTransitionMode: "instant",
+  fadeOutStopSeconds: 5,
+  libraryMode: "folders",
+  libraryPlaces: [],
   vampMode: "section",
   vampBars: 4,
   pauseAtSongEnd: false,
+  vampBetweenSongs: false,
+  trackMeterMode: "postFader",
   timelineNavigationScheme: "ableton",
   timelinePlayheadFollowMode: "ahead",
   importMergeMatchingTracks: true,
+  songTrackLayout: "shared",
+  defaultSongTemplate: null,
   autoColorNewTracks: true,
   sessionStorageVolume: null,
   referenceImportedAudio: true,
@@ -1429,6 +1612,25 @@ function normalizeMidiBinding(binding: MidiBinding): MidiBinding {
     data1: Math.max(0, Math.min(255, Math.floor(binding.data1) || 0)),
     isCc: Boolean(binding.isCc),
   };
+}
+
+/** The built-in song template's reference (the backend's `builtin:band`). */
+export const BUILTIN_BAND_TEMPLATE = "builtin:band";
+
+/** An explicit "no template" for one new song, even with a default set. */
+export const NO_SONG_TEMPLATE = "none";
+
+/** Where each song's tracks go; see {@link AppSettings.songTrackLayout}. */
+export type SongTrackLayout = "shared" | "songFolder" | "separate";
+
+export const SONG_TRACK_LAYOUTS: readonly SongTrackLayout[] = [
+  "shared",
+  "songFolder",
+  "separate",
+] as const;
+
+export function isSongTrackLayout(value: unknown): value is SongTrackLayout {
+  return SONG_TRACK_LAYOUTS.includes(value as SongTrackLayout);
 }
 
 export function normalizeAppSettings(settings: AppSettings): AppSettings {
@@ -1613,6 +1815,11 @@ export function normalizeAppSettings(settings: AppSettings): AppSettings {
       ? Math.min(4, Math.max(1, Math.round(settings.voiceGuideLeadBars)))
       : DEFAULT_APP_SETTINGS.voiceGuideLeadBars,
     voiceGuideCountInEnabled: settings.voiceGuideCountInEnabled ?? true,
+    // Settings saved before the count styles existed (or by a newer version
+    // with a style this one does not know) count "1 2 3 4" as always.
+    voiceGuideCountStyle: isVoiceGuideCountStyle(settings.voiceGuideCountStyle)
+      ? settings.voiceGuideCountStyle
+      : DEFAULT_APP_SETTINGS.voiceGuideCountStyle,
     voiceGuideLanguage:
       settings.voiceGuideLanguage ?? DEFAULT_APP_SETTINGS.voiceGuideLanguage,
     padEnabled: Boolean(settings.padEnabled),
@@ -1643,17 +1850,40 @@ export function normalizeAppSettings(settings: AppSettings): AppSettings {
       DEFAULT_APP_SETTINGS.songJumpBars,
     ),
     songTransitionMode,
+    fadeOutStopSeconds: Number.isFinite(settings.fadeOutStopSeconds)
+      ? Math.min(30, Math.max(0.1, settings.fadeOutStopSeconds))
+      : DEFAULT_APP_SETTINGS.fadeOutStopSeconds,
+    libraryMode: settings.libraryMode === "classic" ? "classic" : "folders",
+    libraryPlaces: Array.isArray(settings.libraryPlaces)
+      ? settings.libraryPlaces.filter(
+          (place): place is string => typeof place === "string" && place.length > 0,
+        )
+      : [],
     vampMode,
     vampBars: normalizeJumpBars(
       settings.vampBars,
       DEFAULT_APP_SETTINGS.vampBars,
     ),
     pauseAtSongEnd: Boolean(settings.pauseAtSongEnd),
+    vampBetweenSongs: Boolean(settings.vampBetweenSongs),
+    // Absent in settings written before the meter point was configurable, or
+    // unknown: post-fader, matching the engine and the Rust default.
+    trackMeterMode: isTrackMeterMode(settings.trackMeterMode)
+      ? settings.trackMeterMode
+      : DEFAULT_APP_SETTINGS.trackMeterMode,
     timelineNavigationScheme,
     timelinePlayheadFollowMode,
     // Defaults to true when absent (older settings files) so existing users
     // keep the historical merge-on-import behaviour.
     importMergeMatchingTracks: settings.importMergeMatchingTracks ?? true,
+    // Until the user picks a layout it is whatever the old merge switch said.
+    // An unknown value (a newer version's) reads the same way, as in Rust.
+    songTrackLayout: isSongTrackLayout(settings.songTrackLayout)
+      ? settings.songTrackLayout
+      : (settings.importMergeMatchingTracks ?? true)
+        ? "shared"
+        : "separate",
+    defaultSongTemplate: settings.defaultSongTemplate?.trim() || null,
     // Absent in settings files written before automatic track colours shipped:
     // default to on, matching DEFAULT_APP_SETTINGS and the Rust side.
     autoColorNewTracks: settings.autoColorNewTracks ?? true,
@@ -1917,6 +2147,34 @@ export type CreateClipArgs = {
   timelineStartSeconds: number;
 };
 
+/**
+ * The tempo ramp in force at `seconds`: from a ramp marker at or before it to
+ * the next tempo marker. Null on a steady tempo. View seconds and bpms, before
+ * varispeed.
+ */
+export function tempoRampAt(
+  song: SongView | null | undefined,
+  seconds: number,
+): TempoRamp | null {
+  if (!song || song.tempoMarkers.length === 0) return null;
+  const sorted = [...song.tempoMarkers].sort((a, b) => a.startSeconds - b.startSeconds);
+  let index = -1;
+  for (let i = 0; i < sorted.length; i += 1) {
+    if (sorted[i].startSeconds <= seconds + 1e-9) index = i;
+    else break;
+  }
+  const marker = sorted[index];
+  const next = sorted[index + 1];
+  if (!marker?.ramp || !next || next.startSeconds <= marker.startSeconds) return null;
+  if (next.bpm === marker.bpm) return null;
+  return {
+    startSeconds: marker.startSeconds,
+    endSeconds: next.startSeconds,
+    startBpm: marker.bpm,
+    endBpm: next.bpm,
+  };
+}
+
 export function buildSongTempoRegions(
   song: SongView | null | undefined,
 ): SongTempoRegionSummary[] {
@@ -1968,22 +2226,38 @@ export function buildSongTempoRegions(
   let startSeconds = 0;
   let bpm = getSongBaseBpm(song);
   let timeSignature = getSongBaseTimeSignature(song);
+  // A time signature marker at the current start: the grid starts a bar there.
+  let startsBar = false;
 
   for (const marker of boundaries) {
     if (marker.startSeconds <= startSeconds) {
       bpm = marker.bpm ?? bpm;
       timeSignature = marker.timeSignature ?? timeSignature;
+      startsBar ||= marker.timeSignature !== null && startSeconds > 0;
       continue;
     }
 
-    const displayBpm = applyVarispeedBpmAt(song, startSeconds, bpm);
+    const ramp = tempoRampAt(song, startSeconds);
+    const displayBpm = applyVarispeedBpmAt(
+      song,
+      startSeconds,
+      ramp ? rampBpmAt(ramp, startSeconds) : bpm,
+    );
     regions.push({
       id: `tempo-region-${startSeconds.toFixed(4)}`,
       name: `Tempo ${displayBpm.toFixed(2)} ${timeSignature}`,
       startSeconds,
       endSeconds: marker.startSeconds,
       bpm: displayBpm,
+      // A boundary inside a ramp (a meter marker, a varispeed song) splits
+      // it: each part keeps the ramp's line.
+      ...(ramp
+        ? {
+            endBpm: applyVarispeedBpmAt(song, startSeconds, rampBpmAt(ramp, marker.startSeconds)),
+          }
+        : {}),
       timeSignature,
+      startsBar,
       transposeSemitones: 0,
       key: null,
       warpEnabled: false,
@@ -1994,6 +2268,7 @@ export function buildSongTempoRegions(
     startSeconds = marker.startSeconds;
     bpm = marker.bpm ?? bpm;
     timeSignature = marker.timeSignature ?? timeSignature;
+    startsBar = marker.timeSignature !== null;
   }
 
   const displayBpm = applyVarispeedBpmAt(song, startSeconds, bpm);
@@ -2004,6 +2279,7 @@ export function buildSongTempoRegions(
     endSeconds: Math.max(startSeconds, SONG_TEMPO_REGION_VISUAL_END_SECONDS),
     bpm: displayBpm,
     timeSignature,
+    startsBar,
     transposeSemitones: 0,
     key: null,
     warpEnabled: false,
@@ -2158,6 +2434,77 @@ export function regionEffectiveKey(
   return transposeKey(region.key, region.transposeSemitones);
 }
 
+type KeyedRegion = Pick<SongRegionSummary, "key" | "transposeSemitones" | "startSeconds"> & {
+  keyChanges?: KeyChangeSummary[];
+};
+
+/** A key that rules from `startSeconds` on, already transposed. */
+export type SoundingKey = { startSeconds: number; key: string };
+
+/**
+ * The sounding keys of a song in order: the one it starts in (at the region's
+ * start) and one entry per key change, each transposed by the song's
+ * `transposeSemitones`. Empty when the song has no key at all. Unparseable
+ * keys are skipped, like `regionEffectiveKey` hides them.
+ */
+export function regionKeySequence(
+  region: KeyedRegion | null | undefined,
+): SoundingKey[] {
+  if (!region) return [];
+  const sequence: SoundingKey[] = [];
+  const initial = transposeKey(region.key, region.transposeSemitones);
+  if (initial) sequence.push({ startSeconds: region.startSeconds, key: initial });
+  for (const change of region.keyChanges ?? []) {
+    const key = transposeKey(change.key, region.transposeSemitones);
+    if (key) sequence.push({ startSeconds: change.startSeconds, key });
+  }
+  return sequence;
+}
+
+/** Tolerance when comparing a position with a key change (same as Rust's). */
+const KEY_CHANGE_EPS_SECONDS = 1e-6;
+
+/**
+ * The sounding key of a song at `seconds` (timeline view seconds): the last
+ * key change at or before it, or the key the song starts in. Before the song
+ * starts it is the starting key, so a playhead parked on the previous song's
+ * tail still reads the next song's opening key.
+ */
+export function regionEffectiveKeyAt(
+  region: KeyedRegion | null | undefined,
+  seconds: number,
+): string | null {
+  const sequence = regionKeySequence(region);
+  let current: string | null = null;
+  for (const entry of sequence) {
+    if (current !== null && entry.startSeconds > seconds + KEY_CHANGE_EPS_SECONDS) break;
+    current = entry.key;
+  }
+  return current;
+}
+
+/** The first key change strictly after `seconds`, transposed; `null` if none. */
+export function regionNextKeyChange(
+  region: KeyedRegion | null | undefined,
+  seconds: number,
+): SoundingKey | null {
+  return (
+    regionKeySequence(region)
+      .slice(1)
+      .find((entry) => entry.startSeconds > seconds + KEY_CHANGE_EPS_SECONDS) ?? null
+  );
+}
+
+/**
+ * Compact label for every key the song goes through: `"D → E"`. Equal to
+ * `regionEffectiveKey` for a song that never modulates.
+ */
+export function regionKeySummary(region: KeyedRegion | null | undefined): string | null {
+  const sequence = regionKeySequence(region);
+  if (sequence.length === 0) return null;
+  return sequence.map((entry) => entry.key).join(" → ");
+}
+
 /**
  * The pad key (0..11, C..B) that matches a region's tonic, for the pad's
  * "follow song key" mode. A pad is a tonal drone — a sustained fundamental — so
@@ -2211,6 +2558,11 @@ export function getEffectiveBpmAt(
 ): number {
   const base = getSongBaseBpm(song);
   if (!song || song.tempoMarkers.length === 0) return base;
+  // Inside a ramp, the tempo it has reached there.
+  const ramp = tempoRampAt(song, positionSeconds + 0.001);
+  if (ramp) {
+    return applyVarispeedBpmAt(song, positionSeconds, rampBpmAt(ramp, positionSeconds));
+  }
   let bestBpm = base;
   let bestStart = -Infinity;
   for (const marker of song.tempoMarkers) {

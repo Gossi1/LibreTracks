@@ -18,6 +18,7 @@ use super::DesktopSession;
 
 fn region(id: &str, start: f64, end: f64) -> SongRegion {
     SongRegion {
+        key_changes: Vec::new(),
         id: id.into(),
         name: id.into(),
         start_seconds: start,
@@ -28,6 +29,8 @@ fn region(id: &str, start: f64, end: f64) -> SongRegion {
         warp_source_bpm: None,
         master: SongMaster::default(),
         compact_column_width_rem: None,
+        chart: None,
+        voice_guide_count_style: None,
         structure: None,
     }
 }
@@ -52,6 +55,8 @@ fn track(id: &str, kind: TrackKind) -> Track {
         midi_enabled: true,
         collapsed: false,
         height_offset: None,
+        match_aliases: Vec::new(),
+        song_region_id: None,
     }
 }
 
