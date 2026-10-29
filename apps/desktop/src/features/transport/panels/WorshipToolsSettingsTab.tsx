@@ -18,6 +18,7 @@ import {
   fetchRehearseSong,
   getRehearseStatus,
   listenRehearseToken,
+  listenWorshipToolsCredentials,
   openRehearseWindow,
   saveRehearseToken,
   type RehearseStatus,
@@ -215,6 +216,29 @@ export function WorshipToolsSettingsTab() {
             defaultValue: "Live Rehearse token captured from webview!",
           }),
         });
+      });
+    });
+    return () => {
+      void unlistenPromise.then((unlisten) => unlisten());
+    };
+  }, [t]);
+
+  useEffect(() => {
+    const unlistenPromise = listenWorshipToolsCredentials((captured) => {
+      setCredentials((previous) => {
+        const next = {
+          accountId: captured.accountId?.trim() || previous.accountId,
+          refreshToken: captured.refreshToken?.trim() || previous.refreshToken,
+          apiKey: captured.apiKey?.trim() || previous.apiKey,
+        };
+        storeWtCredentials(next);
+        return next;
+      });
+      setServicesStatus({
+        kind: "info",
+        message: t("transport.settingsModal.wtCredentialsCaptured", {
+          defaultValue: "WorshipTools credentials (Account ID / Token / API Key) captured from webview!",
+        }),
       });
     });
     return () => {
@@ -828,6 +852,33 @@ export function WorshipToolsSettingsTab() {
 
         {connectionMode === "direct" ? (
           <div style={{ display: "flex", flexDirection: "column", gap: "0.5rem" }}>
+            <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap", alignItems: "center", marginBottom: "0.25rem" }}>
+              <div className="lt-wt-status-indicator" style={{ marginRight: "0.5rem" }}>
+                <span className={`lt-wt-status-dot ${credentials.accountId && credentials.refreshToken ? "is-online" : "is-offline"}`} />
+                <span style={{ fontSize: "0.8rem" }}>
+                  {credentials.accountId && credentials.refreshToken
+                    ? t("transport.settingsModal.wtDirectConfigured", { defaultValue: "Configured (Direct)" })
+                    : t("transport.settingsModal.wtDirectMissing", { defaultValue: "Credentials Required" })}
+                </span>
+              </div>
+              <button
+                type="button"
+                className="lt-secondary-button"
+                onClick={() => void handleOpenRehearse("https://planning.worshiptools.com")}
+              >
+                <span className="material-symbols-outlined">auto_fix_high</span>
+                {t("transport.settingsModal.wtAutoCapture", { defaultValue: "Open planning.worshiptools.com (Auto-Capture)" })}
+              </button>
+              <button
+                type="button"
+                className="lt-secondary-button"
+                style={{ opacity: 0.8 }}
+                onClick={() => void handleOpenRehearse("https://accounts.worshiptools.com")}
+              >
+                <span className="material-symbols-outlined">open_in_new</span>
+                {t("transport.settingsModal.wtAccountsWebview", { defaultValue: "WT Accounts" })}
+              </button>
+            </div>
             <div className="lt-inline-actions">
               <span style={{ minWidth: "7.5rem", fontSize: "0.75rem", opacity: 0.8 }}>
                 {t("transport.settingsModal.wtAccountId", { defaultValue: "Account ID" })}:

@@ -587,10 +587,11 @@ pub fn run() {
             commands::engine_v2::engine_v2_list_devices,
             commands::engine_v2::engine_v2_get_diagnostics,
             commands::engine_v2::engine_v2_load_session,
-            // ── CCLI Rehearse Commands ──
+            // ── CCLI Rehearse & WorshipTools Commands ──
             commands::rehearse::save_rehearse_token,
             commands::rehearse::set_last_rehearse_track_id,
             commands::rehearse::get_rehearse_status,
+            commands::rehearse::save_worshiptools_credentials,
             commands::rehearse::open_rehearse_window,
             commands::rehearse::fetch_rehearse_song,
             commands::rehearse::export_song_markers,

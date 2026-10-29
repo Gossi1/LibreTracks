@@ -15,6 +15,14 @@ pub struct RehearseStatus {
     pub last_track_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WorshipToolsCapturedCredentials {
+    pub account_id: Option<String>,
+    pub refresh_token: Option<String>,
+    pub api_key: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SongResponse {
     pub payload: SongPayload,
@@ -233,6 +241,20 @@ pub fn get_rehearse_status(state: State<'_, RehearseState>) -> RehearseStatus {
     }
 }
 
+#[tauri::command(async)]
+pub fn save_worshiptools_credentials(
+    credentials: WorshipToolsCapturedCredentials,
+    app: AppHandle,
+) {
+    println!(
+        "[WorshipTools] Captured credentials manually/via IPC: account_id={:?}, api_key={:?}, refresh_token_len={:?}",
+        credentials.account_id,
+        credentials.api_key,
+        credentials.refresh_token.as_ref().map(|s| s.len())
+    );
+    let _ = app.emit("worshiptools-credentials-captured", credentials);
+}
+
 #[tauri::command]
 pub async fn open_rehearse_window(
     app: AppHandle,
@@ -265,6 +287,12 @@ pub async fn open_rehearse_window(
                         window.__TAURI_INTERNALS__.invoke('save_rehearse_token', { token: value });
                     } else if (key === 'track_id') {
                         window.__TAURI_INTERNALS__.invoke('set_last_rehearse_track_id', { trackId: value });
+                    } else if (key === 'wt_account_id') {
+                        window.__TAURI_INTERNALS__.invoke('save_worshiptools_credentials', { credentials: { accountId: value } });
+                    } else if (key === 'wt_refresh_token') {
+                        window.__TAURI_INTERNALS__.invoke('save_worshiptools_credentials', { credentials: { refreshToken: value } });
+                    } else if (key === 'wt_api_key') {
+                        window.__TAURI_INTERNALS__.invoke('save_worshiptools_credentials', { credentials: { apiKey: value } });
                     }
                 }
             } catch (_) {}
@@ -279,28 +307,208 @@ pub async fn open_rehearse_window(
             } catch (_) {}
         };
 
+        const capturedState = {
+            rehearseToken: false,
+            rehearseTrackId: null,
+            wtAccountId: null,
+            wtRefreshToken: null,
+            wtApiKey: null
+        };
+
         const updateToolbar = (text, isSuccess) => {
             try {
                 const dot = document.getElementById('__lt_dot__');
                 const msg = document.getElementById('__lt_msg__');
-                if (dot && isSuccess) {
-                    dot.style.background = '#34d399';
-                    dot.style.boxShadow = '0 0 6px #34d399';
+                if (dot) {
+                    dot.style.background = isSuccess ? '#34d399' : '#f59e0b';
+                    dot.style.boxShadow = isSuccess ? '0 0 6px #34d399' : '0 0 6px #f59e0b';
                 }
                 if (msg && text) msg.textContent = text;
             } catch (_) {}
         };
 
+        const updateWtStatusDisplay = () => {
+            const parts = [];
+            if (capturedState.wtAccountId) parts.push('Account ✓');
+            else parts.push('Account: waiting…');
+            if (capturedState.wtRefreshToken) parts.push('Refresh Token ✓');
+            else parts.push('Refresh Token: waiting…');
+            if (capturedState.wtApiKey) parts.push('API Key ✓');
+            const isFullyReady = Boolean(capturedState.wtAccountId && capturedState.wtRefreshToken);
+            const prefix = isFullyReady ? 'All credentials captured! ' : 'WorshipTools: ';
+            updateToolbar(prefix + parts.join(' | '), isFullyReady);
+        };
+
         const notifyToken = (token) => {
             if (!token) return;
+            capturedState.rehearseToken = true;
             sendPayload('token', token);
-            updateToolbar('Live Token Captured! You can now close this window.', true);
+            updateToolbar('CCLI Token Captured! You can close this window.', true);
         };
 
         const notifyTrackId = (trackId) => {
             if (!trackId) return;
+            capturedState.rehearseTrackId = trackId;
             sendPayload('track_id', trackId);
             updateToolbar('Captured Song ID: ' + trackId, true);
+        };
+
+        const reservedAccounts = new Set([
+            'login', 'logout', 'auth', 'users', 'default', 'documents', 'projects',
+            'v1', 'api', 'databases', 'static', 'assets', 'home', 'planning',
+            'dashboard', 'undefined', 'null', 'settings', 'account'
+        ]);
+
+        const notifyWt = (creds) => {
+            if (!creds) return;
+            let changed = false;
+            if (creds.accountId && creds.accountId !== capturedState.wtAccountId) {
+                const aid = String(creds.accountId).trim();
+                if (aid.length >= 8 && !reservedAccounts.has(aid.toLowerCase())) {
+                    capturedState.wtAccountId = aid;
+                    sendPayload('wt_account_id', aid);
+                    changed = true;
+                }
+            }
+            if (creds.refreshToken && creds.refreshToken !== capturedState.wtRefreshToken) {
+                const rt = String(creds.refreshToken).trim();
+                if (rt.length >= 20) {
+                    capturedState.wtRefreshToken = rt;
+                    sendPayload('wt_refresh_token', rt);
+                    changed = true;
+                }
+            }
+            if (creds.apiKey && creds.apiKey !== capturedState.wtApiKey) {
+                const key = String(creds.apiKey).trim();
+                if (key.startsWith('AIza') && key.length >= 30) {
+                    capturedState.wtApiKey = key;
+                    sendPayload('wt_api_key', key);
+                    changed = true;
+                }
+            }
+            if (changed || capturedState.wtAccountId || capturedState.wtRefreshToken) {
+                updateWtStatusDisplay();
+            }
+        };
+
+        const scanObjForTokens = (obj, depth = 0) => {
+            if (!obj || depth > 8) return;
+            try {
+                if (typeof obj === 'string') {
+                    const s = obj.trim();
+                    if (!s) return;
+                    if (s.startsWith('{') || s.startsWith('[')) {
+                        try {
+                            const parsed = JSON.parse(s);
+                            scanObjForTokens(parsed, depth + 1);
+                        } catch (_) {}
+                    }
+                    const mRefresh = s.match(/(AMf-v[A-Za-z0-9_\-]{30,})/);
+                    if (mRefresh && mRefresh[1]) {
+                        notifyWt({ refreshToken: mRefresh[1] });
+                    }
+                    const mApi = s.match(/(AIza[0-9A-Za-z_\-]{35})/);
+                    if (mApi && mApi[1]) {
+                        notifyWt({ apiKey: mApi[1] });
+                    }
+                    const mAcc = s.match(/"accountId"\s*:\s*"([a-zA-Z0-9_\-]{8,50})"/i) ||
+                                 s.match(/"currentAccountId"\s*:\s*"([a-zA-Z0-9_\-]{8,50})"/i);
+                    if (mAcc && mAcc[1] && !reservedAccounts.has(mAcc[1].toLowerCase())) {
+                        notifyWt({ accountId: mAcc[1] });
+                    }
+                    if (s.startsWith('AMf-v') && s.length > 50) {
+                        notifyWt({ refreshToken: s });
+                    }
+                    return;
+                }
+
+                if (typeof obj !== 'object') return;
+
+                if (obj.apiKey && typeof obj.apiKey === 'string') notifyWt({ apiKey: obj.apiKey });
+                if (obj.refreshToken && typeof obj.refreshToken === 'string') notifyWt({ refreshToken: obj.refreshToken });
+                if (obj.refresh_token && typeof obj.refresh_token === 'string') notifyWt({ refreshToken: obj.refresh_token });
+                if (obj.accountId && typeof obj.accountId === 'string') notifyWt({ accountId: obj.accountId });
+                if (obj.currentAccountId && typeof obj.currentAccountId === 'string') notifyWt({ accountId: obj.currentAccountId });
+                if (obj.selectedAccountId && typeof obj.selectedAccountId === 'string') notifyWt({ accountId: obj.selectedAccountId });
+
+                if (obj.stsTokenManager && typeof obj.stsTokenManager === 'object') {
+                    if (obj.stsTokenManager.refreshToken) notifyWt({ refreshToken: obj.stsTokenManager.refreshToken });
+                    if (obj.stsTokenManager.apiKey) notifyWt({ apiKey: obj.stsTokenManager.apiKey });
+                }
+
+                if (obj.value) {
+                    scanObjForTokens(obj.value, depth + 1);
+                }
+
+                const keys = Object.keys(obj);
+                for (let i = 0; i < keys.length; i++) {
+                    const k = keys[i];
+                    const val = obj[k];
+                    if (val && (typeof val === 'object' || typeof val === 'string')) {
+                        scanObjForTokens(val, depth + 1);
+                    }
+                }
+            } catch (_) {}
+        };
+
+        const scanIndexedDB = () => {
+            try {
+                if (!window.indexedDB) return;
+
+                const openAndScan = (dbName) => {
+                    try {
+                        const req = indexedDB.open(dbName);
+                        req.onerror = () => {};
+                        req.onsuccess = (e) => {
+                            const db = e.target.result;
+                            if (!db) return;
+                            const storeNames = Array.from(db.objectStoreNames || []);
+                            for (const storeName of storeNames) {
+                                try {
+                                    const tx = db.transaction(storeName, 'readonly');
+                                    const store = tx.objectStore(storeName);
+                                    if (typeof store.getAll === 'function') {
+                                        const allReq = store.getAll();
+                                        allReq.onsuccess = () => {
+                                            if (Array.isArray(allReq.result)) {
+                                                for (const item of allReq.result) {
+                                                    scanObjForTokens(item);
+                                                }
+                                            }
+                                        };
+                                    }
+                                    const curReq = store.openCursor();
+                                    curReq.onsuccess = (ev) => {
+                                        const cursor = ev.target.result;
+                                        if (cursor) {
+                                            if (cursor.key) scanObjForTokens(cursor.key);
+                                            if (cursor.value) scanObjForTokens(cursor.value);
+                                            cursor.continue();
+                                        }
+                                    };
+                                } catch (_) {}
+                            }
+                        };
+                    } catch (_) {}
+                };
+
+                openAndScan('firebaseLocalStorageDb');
+                openAndScan('worshiptools');
+                openAndScan('planning');
+                openAndScan('worshiptools_planning');
+
+                if (typeof indexedDB.databases === 'function') {
+                    indexedDB.databases().then(dbs => {
+                        if (Array.isArray(dbs)) {
+                            for (const d of dbs) {
+                                if (d && d.name && d.name !== 'firebaseLocalStorageDb') {
+                                    openAndScan(d.name);
+                                }
+                            }
+                        }
+                    }).catch(() => {});
+                }
+            } catch (_) {}
         };
 
         const extractBearer = (val) => {
@@ -342,6 +550,23 @@ pub async fn open_rehearse_window(
                    (rawUrl.includes('ccli.com') && (rawUrl.includes('/api/') || rawUrl.includes('/songs')));
         };
 
+        const inspectUrlForWt = (url) => {
+            if (!url || typeof url !== 'string') return;
+            try {
+                const mKey = url.match(/[?&](?:key|apiKey)=(AIza[0-9A-Za-z_\-]+)/i);
+                if (mKey && mKey[1]) {
+                    notifyWt({ apiKey: mKey[1] });
+                }
+
+                const mAcc = url.match(/\/accounts\/([a-zA-Z0-9_\-]{8,50})/i) ||
+                             url.match(/\/account\/([a-zA-Z0-9_\-]{8,50})/i) ||
+                             url.match(/[?&]account(?:_?id)?=([a-zA-Z0-9_\-]{8,50})/i);
+                if (mAcc && mAcc[1] && !reservedAccounts.has(mAcc[1].toLowerCase())) {
+                    notifyWt({ accountId: mAcc[1] });
+                }
+            } catch (_) {}
+        };
+
         // Hook window.fetch
         const origFetch = window.fetch;
         window.fetch = async function(...args) {
@@ -349,7 +574,13 @@ pub async fn open_rehearse_window(
                 const resource = args[0];
                 const config = args[1];
                 const url = typeof resource === 'string' ? resource : (resource && resource.url ? resource.url : '');
-                
+
+                inspectUrlForWt(url);
+
+                if (config && config.body) {
+                    scanObjForTokens(config.body);
+                }
+
                 if (isCcliRehearseUrl(url)) {
                     if (config && config.headers) scanHeaders(config.headers);
                     if (resource instanceof Request && resource.headers) scanHeaders(resource.headers);
@@ -364,17 +595,33 @@ pub async fn open_rehearse_window(
                     } catch (_) {}
                 }
             } catch (e) {
-                console.error('[Rehearse Interceptor Error]', e);
+                console.error('[Capture Interceptor Error]', e);
             }
-            return origFetch.apply(this, args);
+
+            const res = await origFetch.apply(this, args);
+
+            try {
+                const resource = args[0];
+                const url = typeof resource === 'string' ? resource : (resource && resource.url ? resource.url : '');
+                if (url && (url.includes('securetoken.googleapis.com') || url.includes('identitytoolkit.googleapis.com') || url.includes('worshiptools.com') || url.includes('token'))) {
+                    res.clone().text().then(text => {
+                        scanObjForTokens(text);
+                    }).catch(() => {});
+                }
+            } catch (_) {}
+
+            return res;
         };
 
         // Hook XMLHttpRequest
         const origOpen = XMLHttpRequest.prototype.open;
         const origSetHeader = XMLHttpRequest.prototype.setRequestHeader;
+        const origSend = XMLHttpRequest.prototype.send;
+
         XMLHttpRequest.prototype.open = function(method, url) {
             this._reqUrl = url;
             try {
+                inspectUrlForWt(String(url));
                 if (isCcliRehearseUrl(url)) {
                     const m = String(url).match(/\/api\/songs\/([^/?#]+)/i) || String(url).match(/\/songs\/([^/?#]+)/i);
                     if (m && m[1]) notifyTrackId(m[1]);
@@ -382,6 +629,7 @@ pub async fn open_rehearse_window(
             } catch (_) {}
             return origOpen.apply(this, arguments);
         };
+
         XMLHttpRequest.prototype.setRequestHeader = function(header, value) {
             try {
                 if (isCcliRehearseUrl(this._reqUrl) && header && header.toLowerCase() === 'authorization') {
@@ -392,9 +640,30 @@ pub async fn open_rehearse_window(
             return origSetHeader.apply(this, arguments);
         };
 
-        // Scan localStorage / sessionStorage for CCLI / Rehearse keys only
+        XMLHttpRequest.prototype.send = function(body) {
+            try {
+                if (body) {
+                    scanObjForTokens(body);
+                }
+                const url = String(this._reqUrl || '');
+                if (url.includes('securetoken.googleapis.com') || url.includes('identitytoolkit.googleapis.com') || url.includes('worshiptools.com') || url.includes('token')) {
+                    this.addEventListener('load', function() {
+                        try {
+                            if (this.responseText) {
+                                scanObjForTokens(this.responseText);
+                            }
+                        } catch (_) {}
+                    });
+                }
+            } catch (_) {}
+            return origSend.apply(this, arguments);
+        };
+
+        // Scan localStorage, sessionStorage, cookies & global objects
         const scanStorage = () => {
             try {
+                inspectUrlForWt(window.location.href);
+
                 for (const storage of [window.localStorage, window.sessionStorage]) {
                     if (!storage) continue;
                     for (let i = 0; i < storage.length; i++) {
@@ -402,6 +671,8 @@ pub async fn open_rehearse_window(
                         if (!k) continue;
                         const v = storage.getItem(k);
                         if (!v) continue;
+
+                        // 1. CCLI Rehearse
                         if (k.toLowerCase().includes('rehearse') || (k.toLowerCase().includes('ccli') && !k.includes('cookie'))) {
                             const t = extractBearer(v);
                             if (t) notifyToken(t);
@@ -412,41 +683,87 @@ pub async fn open_rehearse_window(
                                 if (obj.access_token) notifyToken(obj.access_token);
                             } catch (_) {}
                         }
+
+                        // 2. WorshipTools & Firebase
+                        scanObjForTokens(v);
+                        if (k.startsWith('firebase:authUser:')) {
+                            const mKey = k.match(/firebase:authUser:(AIza[0-9A-Za-z_\-]+):/);
+                            if (mKey && mKey[1]) notifyWt({ apiKey: mKey[1] });
+                        }
+
+                        // 3. WorshipTools Account ID
+                        if (/^(?:account[-_]?id|current[-_]?account|selected[-_]?account|wt[-_]?account)/i.test(k)) {
+                            if (typeof v === 'string' && v.length >= 8 && !reservedAccounts.has(v.toLowerCase())) {
+                                notifyWt({ accountId: v.trim() });
+                            }
+                        }
                     }
                 }
+
+                if (document.cookie) {
+                    const mCook = document.cookie.match(/(?:account[-_]?id|wt[-_]?account)=([a-zA-Z0-9_\-]{8,50})/i);
+                    if (mCook && mCook[1] && !reservedAccounts.has(mCook[1].toLowerCase())) {
+                        notifyWt({ accountId: mCook[1] });
+                    }
+                }
+
+                // Global variables inspection
+                if (window.firebase) scanObjForTokens(window.firebase);
+                if (window.__WT_USER__) scanObjForTokens(window.__WT_USER__);
             } catch (_) {}
         };
-        setInterval(scanStorage, 3000);
-        setTimeout(scanStorage, 1200);
+
+        const runFullScan = () => {
+            scanStorage();
+            scanIndexedDB();
+        };
+
+        setInterval(runFullScan, 2000);
+        setTimeout(runFullScan, 300);
+        setTimeout(runFullScan, 1000);
+        setTimeout(runFullScan, 2500);
+        setTimeout(runFullScan, 5000);
 
         // Inject navigation / status bar
         const injectBar = () => {
             if (document.getElementById('__lt_rehearse_toolbar__')) return;
             const bar = document.createElement('div');
             bar.id = '__lt_rehearse_toolbar__';
-            bar.style.cssText = 'position:fixed;top:0;left:0;right:0;height:38px;background:#0f172a;color:#f8fafc;display:flex;align-items:center;justify-content:space-between;padding:0 14px;font-family:system-ui,-apple-system,sans-serif;font-size:12px;z-index:2147483647;border-bottom:1px solid #334155;box-shadow:0 2px 10px rgba(0,0,0,0.5);';
+            bar.style.cssText = 'position:fixed;top:0;left:0;right:0;height:40px;background:#0f172a;color:#f8fafc;display:flex;align-items:center;justify-content:space-between;padding:0 14px;font-family:system-ui,-apple-system,sans-serif;font-size:12px;z-index:2147483647;border-bottom:1px solid #334155;box-shadow:0 2px 10px rgba(0,0,0,0.5);';
             bar.innerHTML = `
                 <div style="display:flex;align-items:center;gap:10px;">
                     <strong style="color:#57f1db;font-weight:700;letter-spacing:0.02em;">LibreTracks Capture</strong>
                     <span id="__lt_status_indicator__" style="display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:999px;background:#1e293b;border:1px solid #334155;font-size:11px;">
-                        <span id="__lt_dot__" style="width:7px;height:7px;border-radius:50%;background:#94a3b8;transition:background 0.3s;"></span>
-                        <span id="__lt_msg__">Ready. Open a song to capture Rehearse token.</span>
+                        <span id="__lt_dot__" style="width:7px;height:7px;border-radius:50%;background:#f59e0b;transition:background 0.3s;"></span>
+                        <span id="__lt_msg__">Scanning credentials… Sign in or browse planning.worshiptools.com.</span>
                     </span>
+                    <button id="__lt_btn_capture_now__" style="background:#10b981;color:#fff;border:none;border-radius:4px;padding:3px 8px;font-size:11px;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:3px;" title="Scan storage & IndexedDB immediately">⚡ Capture Now</button>
                 </div>
                 <div style="display:flex;align-items:center;gap:6px;">
-                    <button id="__lt_btn_songselect__" style="background:#0891b2;color:#fff;border:none;border-radius:4px;padding:4px 8px;font-size:11px;font-weight:600;cursor:pointer;">SongSelect (CCLI)</button>
-                    <button id="__lt_btn_planning__" style="background:#2563eb;color:#fff;border:none;border-radius:4px;padding:4px 8px;font-size:11px;font-weight:600;cursor:pointer;">Planning</button>
+                    <button id="__lt_btn_planning__" style="background:#2563eb;color:#fff;border:none;border-radius:4px;padding:4px 8px;font-size:11px;font-weight:600;cursor:pointer;">WT Planning</button>
+                    <button id="__lt_btn_wt_accounts__" style="background:#4f46e5;color:#fff;border:none;border-radius:4px;padding:4px 8px;font-size:11px;font-weight:600;cursor:pointer;">WT Accounts</button>
+                    <button id="__lt_btn_songselect__" style="background:#0891b2;color:#fff;border:none;border-radius:4px;padding:4px 8px;font-size:11px;font-weight:600;cursor:pointer;">SongSelect</button>
                     <button id="__lt_btn_rehearse__" style="background:#334155;color:#cbd5e1;border:none;border-radius:4px;padding:4px 8px;font-size:11px;cursor:pointer;">CCLI Rehearse</button>
                 </div>
             `;
             if (document.body) {
                 document.body.prepend(bar);
-                document.body.style.paddingTop = '38px';
+                document.body.style.paddingTop = '40px';
             }
-            const bSong = document.getElementById('__lt_btn_songselect__');
-            if (bSong) bSong.onclick = () => { window.location.href = 'https://songselect.ccli.com'; };
+            const bCap = document.getElementById('__lt_btn_capture_now__');
+            if (bCap) {
+                bCap.onclick = () => {
+                    runFullScan();
+                    updateToolbar('Manual scan triggered…', Boolean(capturedState.wtAccountId && capturedState.wtRefreshToken));
+                    setTimeout(updateWtStatusDisplay, 500);
+                };
+            }
             const bPlan = document.getElementById('__lt_btn_planning__');
             if (bPlan) bPlan.onclick = () => { window.location.href = 'https://planning.worshiptools.com'; };
+            const bWtAcc = document.getElementById('__lt_btn_wt_accounts__');
+            if (bWtAcc) bWtAcc.onclick = () => { window.location.href = 'https://accounts.worshiptools.com'; };
+            const bSong = document.getElementById('__lt_btn_songselect__');
+            if (bSong) bSong.onclick = () => { window.location.href = 'https://songselect.ccli.com'; };
             const bReh = document.getElementById('__lt_btn_rehearse__');
             if (bReh) bReh.onclick = () => { window.location.href = 'https://rehearse.ccli.com'; };
         };
@@ -461,27 +778,50 @@ pub async fn open_rehearse_window(
 
     let app_handle_for_nav = app.clone();
     let _window = WebviewWindowBuilder::new(&app, "rehearse", WebviewUrl::External(parsed_url))
-        .title("CCLI Rehearse & Planning — LibreTracks")
+        .title("WorshipTools & CCLI Rehearse — LibreTracks Capture")
         .inner_size(1150.0, 780.0)
         .initialization_script(init_script)
         .on_navigation(move |nav_url| {
             if nav_url.host_str() == Some("libretracks-capture.local") {
                 let state = app_handle_for_nav.state::<RehearseState>();
+                let mut wt_creds = WorshipToolsCapturedCredentials::default();
+                let mut has_wt_cred = false;
+
                 for (key, val) in nav_url.query_pairs() {
-                    if key == "token" && !val.trim().is_empty() {
-                        let token_str = val.trim().to_string();
+                    let val_trim = val.trim().to_string();
+                    if val_trim.is_empty() {
+                        continue;
+                    }
+                    if key == "token" {
                         let mut current = state.token.lock().unwrap();
-                        *current = Some(token_str.clone());
-                        println!("[Rehearse] Captured token via navigation (len {})", token_str.len());
-                        let _ = app_handle_for_nav.emit("rehearse-token-captured", token_str);
-                    } else if key == "track_id" && !val.trim().is_empty() {
-                        let track_clean = clean_track_id(&val);
+                        *current = Some(val_trim.clone());
+                        println!("[Rehearse] Captured token via navigation (len {})", val_trim.len());
+                        let _ = app_handle_for_nav.emit("rehearse-token-captured", val_trim);
+                    } else if key == "track_id" {
+                        let track_clean = clean_track_id(&val_trim);
                         let mut current = state.last_track_id.lock().unwrap();
                         *current = Some(track_clean.clone());
                         println!("[Rehearse] Captured track_id via navigation: {}", track_clean);
                         let _ = app_handle_for_nav.emit("rehearse-track-captured", track_clean);
+                    } else if key == "wt_account_id" {
+                        println!("[WorshipTools] Captured account_id via navigation: {}", val_trim);
+                        wt_creds.account_id = Some(val_trim);
+                        has_wt_cred = true;
+                    } else if key == "wt_refresh_token" {
+                        println!("[WorshipTools] Captured refresh_token via navigation (len {})", val_trim.len());
+                        wt_creds.refresh_token = Some(val_trim);
+                        has_wt_cred = true;
+                    } else if key == "wt_api_key" {
+                        println!("[WorshipTools] Captured api_key via navigation: {}", val_trim);
+                        wt_creds.api_key = Some(val_trim);
+                        has_wt_cred = true;
                     }
                 }
+
+                if has_wt_cred {
+                    let _ = app_handle_for_nav.emit("worshiptools-credentials-captured", wt_creds);
+                }
+
                 return false;
             }
             true

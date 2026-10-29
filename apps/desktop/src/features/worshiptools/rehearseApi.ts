@@ -6,6 +6,12 @@ export interface RehearseStatus {
   lastTrackId: string | null;
 }
 
+export interface WorshipToolsCapturedCredentials {
+  accountId?: string | null;
+  refreshToken?: string | null;
+  apiKey?: string | null;
+}
+
 export interface RehearseParsedMarker {
   name: string;
   kind: string;
@@ -113,6 +119,24 @@ export async function listenRehearseTrack(
     const unlisten = await listen<string>("rehearse-track-captured", (event) => {
       callback(event.payload);
     });
+    return unlisten;
+  } catch {
+    return () => {};
+  }
+}
+
+/** Listen for captured WorshipTools credentials (accountId, refreshToken, apiKey) emitted from the webview. */
+export async function listenWorshipToolsCredentials(
+  callback: (creds: WorshipToolsCapturedCredentials) => void,
+): Promise<() => void> {
+  try {
+    const { listen } = await import("@tauri-apps/api/event");
+    const unlisten = await listen<WorshipToolsCapturedCredentials>(
+      "worshiptools-credentials-captured",
+      (event) => {
+        callback(event.payload);
+      },
+    );
     return unlisten;
   } catch {
     return () => {};
