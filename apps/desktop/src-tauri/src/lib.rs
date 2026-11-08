@@ -594,6 +594,8 @@ pub fn run() {
             commands::engine_v2::engine_v2_load_session,
             // ── CCLI Rehearse & WorshipTools Commands ──
             commands::rehearse::save_rehearse_token,
+            commands::rehearse::clear_rehearse_token,
+            commands::rehearse::get_rehearse_token,
             commands::rehearse::set_last_rehearse_track_id,
             commands::rehearse::get_rehearse_status,
             commands::rehearse::save_worshiptools_credentials,

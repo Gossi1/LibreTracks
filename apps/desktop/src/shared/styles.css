@@ -14713,3 +14713,213 @@ body.lt-song-reordering .lt-compact-column-resize-slot {
 }
 
 
+
+
+/* ── WorshipTools Setlist Cloud Drive Integration ── */
+.lt-wt-cloud-card {
+  background: rgb(255 255 255 / 0.04);
+  border: 1px solid rgb(255 255 255 / 0.08);
+  border-radius: 8px;
+  padding: 0.6rem 0.8rem;
+  margin: 0.5rem 0 0.8rem 0;
+}
+
+.lt-wt-cloud-card.is-disconnected {
+  border-left: 3px solid rgb(255 170 80);
+}
+
+.lt-wt-cloud-card.is-connected {
+  border-left: 3px solid rgb(87 241 219);
+}
+
+.lt-wt-cloud-card-header,
+.lt-wt-cloud-card-info {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.lt-wt-cloud-status-text {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.lt-wt-cloud-icon {
+  font-size: 22px;
+  color: rgb(255 170 80);
+  flex-shrink: 0;
+}
+
+.lt-wt-cloud-icon.is-connected {
+  color: rgb(87 241 219);
+}
+
+.lt-wt-cloud-title {
+  display: block;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: #fff;
+}
+
+.lt-wt-cloud-counter {
+  font-size: 0.72rem;
+  color: rgb(200 200 200);
+}
+
+.lt-wt-cloud-connect-btn,
+.lt-wt-cloud-refresh-btn {
+  font-size: 0.72rem;
+  padding: 0.25rem 0.6rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  flex-shrink: 0;
+}
+
+.lt-wt-cloud-filter-pills {
+  display: flex;
+  gap: 0.35rem;
+  margin-top: 0.6rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid rgb(255 255 255 / 0.06);
+}
+
+.lt-wt-cloud-filter-pill {
+  font-size: 0.7rem;
+  padding: 0.2rem 0.55rem;
+  border-radius: 9999px;
+  border: 1px solid rgb(255 255 255 / 0.12);
+  background: rgb(0 0 0 / 0.25);
+  color: rgb(200 200 200);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  transition: all 0.15s ease;
+}
+
+.lt-wt-cloud-filter-pill .material-symbols-outlined {
+  font-size: 14px;
+}
+
+.lt-wt-cloud-filter-pill:hover {
+  background: rgb(255 255 255 / 0.1);
+  color: #fff;
+}
+
+.lt-wt-cloud-filter-pill.is-active {
+  background: rgb(87 241 219 / 0.2);
+  border-color: rgb(87 241 219 / 0.6);
+  color: #fff;
+  font-weight: 600;
+}
+
+.lt-wt-cloud-filter-pill.is-matched.is-active {
+  background: rgb(34 197 94 / 0.2);
+  border-color: rgb(34 197 94 / 0.6);
+  color: #86efac;
+}
+
+.lt-wt-cloud-filter-pill.is-missing.is-active {
+  background: rgb(239 68 68 / 0.2);
+  border-color: rgb(239 68 68 / 0.6);
+  color: #fca5a5;
+}
+
+.lt-wt-song-cloud-status {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-top: 0.35rem;
+}
+
+.lt-wt-cloud-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-size: 0.68rem;
+  font-weight: 600;
+  padding: 0.12rem 0.45rem;
+  border-radius: 4px;
+  line-height: 1.3;
+}
+
+.lt-wt-cloud-badge .material-symbols-outlined {
+  font-size: 14px;
+}
+
+.lt-wt-cloud-badge.is-found {
+  background: rgb(34 197 94 / 0.15);
+  color: rgb(74 222 128);
+  border: 1px solid rgb(34 197 94 / 0.3);
+}
+
+.lt-wt-cloud-badge.is-missing {
+  background: rgb(239 68 68 / 0.15);
+  color: rgb(252 165 165);
+  border: 1px solid rgb(239 68 68 / 0.3);
+}
+
+.lt-wt-cloud-badge.is-loading,
+.lt-wt-cloud-badge.is-unknown {
+  background: rgb(255 255 255 / 0.08);
+  color: rgb(180 180 180);
+  border: 1px solid rgb(255 255 255 / 0.15);
+}
+
+.lt-wt-cloud-versions-tag {
+  font-size: 0.62rem;
+  background: rgb(0 0 0 / 0.3);
+  padding: 0.05rem 0.3rem;
+  border-radius: 3px;
+  margin-left: 0.15rem;
+  opacity: 0.9;
+}
+
+.lt-wt-cloud-file-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.2rem;
+  font-size: 0.68rem;
+  color: rgb(170 170 170);
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lt-wt-cloud-file-name .material-symbols-outlined {
+  font-size: 14px;
+  color: rgb(87 241 219 / 0.8);
+}
+
+.lt-wt-song-cloud-import-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.2rem;
+  font-size: 0.68rem;
+  padding: 0.12rem 0.45rem;
+  border-radius: 4px;
+  background: rgb(87 241 219 / 0.15);
+  color: rgb(87 241 219);
+  border: 1px solid rgb(87 241 219 / 0.4);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.lt-wt-song-cloud-import-btn:hover:not(:disabled) {
+  background: rgb(87 241 219 / 0.25);
+  border-color: rgb(87 241 219 / 0.7);
+}
+
+.lt-wt-song-cloud-import-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.lt-wt-song-cloud-import-btn .material-symbols-outlined {
+  font-size: 14px;
+}

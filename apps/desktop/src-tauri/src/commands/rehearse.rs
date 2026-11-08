@@ -2,6 +2,37 @@ use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
+const REHEARSE_SESSION_FILE: &str = "rehearse-session.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RehearseStoredSession {
+    pub token: Option<String>,
+    pub last_track_id: Option<String>,
+}
+
+fn session_file_path(app: &AppHandle) -> Option<std::path::PathBuf> {
+    app.path().app_data_dir().ok().map(|dir| dir.join(REHEARSE_SESSION_FILE))
+}
+
+pub fn load_stored_rehearse_session(app: &AppHandle) -> RehearseStoredSession {
+    session_file_path(app)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_stored_rehearse_session(app: &AppHandle, session: &RehearseStoredSession) {
+    if let Some(path) = session_file_path(app) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(data) = serde_json::to_string_pretty(session) {
+            let _ = std::fs::write(path, data);
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct RehearseState {
     pub token: Mutex<Option<String>>,
@@ -209,10 +240,56 @@ pub fn save_rehearse_token(
     if clean.is_empty() {
         return;
     }
-    let mut current_token = state.token.lock().unwrap();
-    *current_token = Some(clean.clone());
-    println!("[Rehearse] Captured token (length: {})", clean.len());
+    {
+        let mut current_token = state.token.lock().unwrap();
+        *current_token = Some(clean.clone());
+    }
+    let last_track = state.last_track_id.lock().unwrap().clone();
+    save_stored_rehearse_session(
+        &app,
+        &RehearseStoredSession {
+            token: Some(clean.clone()),
+            last_track_id: last_track,
+        },
+    );
+    println!("[Rehearse] Captured & saved token (length: {})", clean.len());
     let _ = app.emit("rehearse-token-captured", clean);
+}
+
+#[tauri::command(async)]
+pub fn clear_rehearse_token(
+    state: State<'_, RehearseState>,
+    app: AppHandle,
+) {
+    {
+        let mut current_token = state.token.lock().unwrap();
+        *current_token = None;
+    }
+    let last_track = state.last_track_id.lock().unwrap().clone();
+    save_stored_rehearse_session(
+        &app,
+        &RehearseStoredSession {
+            token: None,
+            last_track_id: last_track,
+        },
+    );
+    println!("[Rehearse] Token cleared");
+    let _ = app.emit("rehearse-token-cleared", ());
+}
+
+#[tauri::command(async)]
+pub fn get_rehearse_token(
+    state: State<'_, RehearseState>,
+    app: AppHandle,
+) -> Option<String> {
+    let mut token = state.token.lock().unwrap();
+    if token.is_none() {
+        let stored = load_stored_rehearse_session(&app);
+        if stored.token.is_some() {
+            *token = stored.token;
+        }
+    }
+    token.clone()
 }
 
 #[tauri::command(async)]
@@ -225,16 +302,38 @@ pub fn set_last_rehearse_track_id(
     if clean.is_empty() {
         return;
     }
-    let mut current = state.last_track_id.lock().unwrap();
-    *current = Some(clean.clone());
+    {
+        let mut current = state.last_track_id.lock().unwrap();
+        *current = Some(clean.clone());
+    }
+    let tok = state.token.lock().unwrap().clone();
+    save_stored_rehearse_session(
+        &app,
+        &RehearseStoredSession {
+            token: tok,
+            last_track_id: Some(clean.clone()),
+        },
+    );
     println!("[Rehearse] Captured track_id: {}", clean);
     let _ = app.emit("rehearse-track-captured", clean);
 }
 
 #[tauri::command(async)]
-pub fn get_rehearse_status(state: State<'_, RehearseState>) -> RehearseStatus {
-    let token = state.token.lock().unwrap();
-    let track_id = state.last_track_id.lock().unwrap();
+pub fn get_rehearse_status(
+    state: State<'_, RehearseState>,
+    app: AppHandle,
+) -> RehearseStatus {
+    let mut token = state.token.lock().unwrap();
+    let mut track_id = state.last_track_id.lock().unwrap();
+    if token.is_none() || track_id.is_none() {
+        let stored = load_stored_rehearse_session(&app);
+        if token.is_none() && stored.token.is_some() {
+            *token = stored.token;
+        }
+        if track_id.is_none() && stored.last_track_id.is_some() {
+            *track_id = stored.last_track_id;
+        }
+    }
     RehearseStatus {
         has_token: token.is_some(),
         last_track_id: track_id.clone(),
@@ -260,7 +359,7 @@ pub async fn open_rehearse_window(
     app: AppHandle,
     url: Option<String>,
 ) -> Result<(), String> {
-    let default_url = "https://planning.worshiptools.com";
+    let default_url = "https://songselect.ccli.com";
     let start_url = url
         .as_deref()
         .map(|s| s.trim())
@@ -279,31 +378,35 @@ pub async fn open_rehearse_window(
 
     let init_script = r#"
     (() => {
+        let lastCapturedToken = '';
+        const sentCache = new Set();
         const sendPayload = (key, value) => {
             if (!value) return;
+            const strVal = String(value).trim();
+            if (!strVal) return;
+            const cacheKey = key + '::' + strVal;
+            if (sentCache.has(cacheKey)) return;
+            sentCache.add(cacheKey);
+
             try {
                 if (window.__TAURI_INTERNALS__) {
                     if (key === 'token') {
-                        window.__TAURI_INTERNALS__.invoke('save_rehearse_token', { token: value });
+                        window.__TAURI_INTERNALS__.invoke('save_rehearse_token', { token: strVal });
                     } else if (key === 'track_id') {
-                        window.__TAURI_INTERNALS__.invoke('set_last_rehearse_track_id', { trackId: value });
+                        window.__TAURI_INTERNALS__.invoke('set_last_rehearse_track_id', { trackId: strVal });
                     } else if (key === 'wt_account_id') {
-                        window.__TAURI_INTERNALS__.invoke('save_worshiptools_credentials', { credentials: { accountId: value } });
+                        window.__TAURI_INTERNALS__.invoke('save_worshiptools_credentials', { credentials: { accountId: strVal } });
                     } else if (key === 'wt_refresh_token') {
-                        window.__TAURI_INTERNALS__.invoke('save_worshiptools_credentials', { credentials: { refreshToken: value } });
+                        window.__TAURI_INTERNALS__.invoke('save_worshiptools_credentials', { credentials: { refreshToken: strVal } });
                     } else if (key === 'wt_api_key') {
-                        window.__TAURI_INTERNALS__.invoke('save_worshiptools_credentials', { credentials: { apiKey: value } });
+                        window.__TAURI_INTERNALS__.invoke('save_worshiptools_credentials', { credentials: { apiKey: strVal } });
                     }
                 }
             } catch (_) {}
+
             try {
-                const iframe = document.createElement('iframe');
-                iframe.style.display = 'none';
-                iframe.src = 'https://libretracks-capture.local/?' + encodeURIComponent(key) + '=' + encodeURIComponent(value);
-                (document.body || document.documentElement).appendChild(iframe);
-                setTimeout(() => {
-                    try { iframe.remove(); } catch (_) {}
-                }, 1000);
+                // Top-level navigation: intercepted by Tauri's on_navigation handler (which returns false to cancel)
+                window.location.assign('https://libretracks-capture.local/?' + encodeURIComponent(key) + '=' + encodeURIComponent(strVal));
             } catch (_) {}
         };
 
@@ -342,8 +445,13 @@ pub async fn open_rehearse_window(
         const notifyToken = (token) => {
             if (!token) return;
             capturedState.rehearseToken = true;
+            lastCapturedToken = token;
             sendPayload('token', token);
-            updateToolbar('CCLI Token Captured! You can close this window.', true);
+            updateToolbar('CCLI Token Captured! ✓ You can close this window.', true);
+            try {
+                const copyBtn = document.getElementById('__lt_btn_copy_token__');
+                if (copyBtn) copyBtn.style.display = 'inline-flex';
+            } catch (_) {}
         };
 
         const notifyTrackId = (trackId) => {
@@ -514,7 +622,12 @@ pub async fn open_rehearse_window(
         const extractBearer = (val) => {
             if (!val || typeof val !== 'string') return null;
             const m = val.match(/Bearer\s+([A-Za-z0-9_\-\.]+)/i);
-            return m ? m[1].trim() : null;
+            if (m) return m[1].trim();
+            const trimmed = val.trim();
+            if (trimmed.startsWith('eyJ') && trimmed.length > 50 && trimmed.includes('.')) {
+                return trimmed;
+            }
+            return null;
         };
 
         const scanHeaders = (headersObj) => {
@@ -545,8 +658,8 @@ pub async fn open_rehearse_window(
         const isCcliRehearseUrl = (rawUrl) => {
             if (!rawUrl || typeof rawUrl !== 'string') return false;
             return rawUrl.includes('rehearse-api.ccli.com') ||
-                   rawUrl.includes('rehearse.ccli.com') ||
                    rawUrl.includes('songselect.ccli.com') ||
+                   rawUrl.includes('profile.ccli.com') ||
                    (rawUrl.includes('ccli.com') && (rawUrl.includes('/api/') || rawUrl.includes('/songs')));
         };
 
@@ -672,15 +785,29 @@ pub async fn open_rehearse_window(
                         const v = storage.getItem(k);
                         if (!v) continue;
 
-                        // 1. CCLI Rehearse
-                        if (k.toLowerCase().includes('rehearse') || (k.toLowerCase().includes('ccli') && !k.includes('cookie'))) {
-                            const t = extractBearer(v);
-                            if (t) notifyToken(t);
+                        // 1. CCLI Rehearse & OAuth tokens
+                        const t = extractBearer(v);
+                        if (t) notifyToken(t);
+
+                        if (v.startsWith('{') || v.startsWith('[')) {
                             try {
                                 const obj = JSON.parse(v);
-                                if (obj.token) notifyToken(obj.token);
-                                if (obj.accessToken) notifyToken(obj.accessToken);
-                                if (obj.access_token) notifyToken(obj.access_token);
+                                if (obj.token && typeof obj.token === 'string') {
+                                    const bt = extractBearer(obj.token);
+                                    if (bt) notifyToken(bt);
+                                }
+                                if (obj.accessToken && typeof obj.accessToken === 'string') {
+                                    const bt = extractBearer(obj.accessToken);
+                                    if (bt) notifyToken(bt);
+                                }
+                                if (obj.access_token && typeof obj.access_token === 'string') {
+                                    const bt = extractBearer(obj.access_token);
+                                    if (bt) notifyToken(bt);
+                                }
+                                if (obj.id_token && typeof obj.id_token === 'string') {
+                                    const bt = extractBearer(obj.id_token);
+                                    if (bt) notifyToken(bt);
+                                }
                             } catch (_) {}
                         }
 
@@ -735,15 +862,15 @@ pub async fn open_rehearse_window(
                     <strong style="color:#57f1db;font-weight:700;letter-spacing:0.02em;">LibreTracks Capture</strong>
                     <span id="__lt_status_indicator__" style="display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:999px;background:#1e293b;border:1px solid #334155;font-size:11px;">
                         <span id="__lt_dot__" style="width:7px;height:7px;border-radius:50%;background:#f59e0b;transition:background 0.3s;"></span>
-                        <span id="__lt_msg__">Scanning credentials… Sign in or browse planning.worshiptools.com.</span>
+                        <span id="__lt_msg__">Scanning credentials… Sign into SongSelect or Planning.</span>
                     </span>
-                    <button id="__lt_btn_capture_now__" style="background:#10b981;color:#fff;border:none;border-radius:4px;padding:3px 8px;font-size:11px;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:3px;" title="Scan storage & IndexedDB immediately">⚡ Capture Now</button>
+                    <button id="__lt_btn_capture_now__" style="background:#10b981;color:#fff;border:none;border-radius:4px;padding:3px 8px;font-size:11px;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:3px;" title="Scan storage immediately">⚡ Capture Now</button>
+                    <button id="__lt_btn_copy_token__" style="display:none;background:#3b82f6;color:#fff;border:none;border-radius:4px;padding:3px 8px;font-size:11px;font-weight:600;cursor:pointer;">📋 Copy Token</button>
                 </div>
                 <div style="display:flex;align-items:center;gap:6px;">
+                    <button id="__lt_btn_songselect__" style="background:#0891b2;color:#fff;border:none;border-radius:4px;padding:4px 8px;font-size:11px;font-weight:600;cursor:pointer;">SongSelect (CCLI)</button>
                     <button id="__lt_btn_planning__" style="background:#2563eb;color:#fff;border:none;border-radius:4px;padding:4px 8px;font-size:11px;font-weight:600;cursor:pointer;">WT Planning</button>
-                    <button id="__lt_btn_wt_accounts__" style="background:#4f46e5;color:#fff;border:none;border-radius:4px;padding:4px 8px;font-size:11px;font-weight:600;cursor:pointer;">WT Accounts</button>
-                    <button id="__lt_btn_songselect__" style="background:#0891b2;color:#fff;border:none;border-radius:4px;padding:4px 8px;font-size:11px;font-weight:600;cursor:pointer;">SongSelect</button>
-                    <button id="__lt_btn_rehearse__" style="background:#334155;color:#cbd5e1;border:none;border-radius:4px;padding:4px 8px;font-size:11px;cursor:pointer;">CCLI Rehearse</button>
+                    <button id="__lt_btn_ccli_profile__" style="background:#475569;color:#fff;border:none;border-radius:4px;padding:4px 8px;font-size:11px;font-weight:600;cursor:pointer;">CCLI Sign-in</button>
                 </div>
             `;
             if (document.body) {
@@ -754,18 +881,26 @@ pub async fn open_rehearse_window(
             if (bCap) {
                 bCap.onclick = () => {
                     runFullScan();
-                    updateToolbar('Manual scan triggered…', Boolean(capturedState.wtAccountId && capturedState.wtRefreshToken));
+                    updateToolbar('Manual scan triggered…', Boolean(capturedState.rehearseToken || (capturedState.wtAccountId && capturedState.wtRefreshToken)));
                     setTimeout(updateWtStatusDisplay, 500);
+                };
+            }
+            const bCopy = document.getElementById('__lt_btn_copy_token__');
+            if (bCopy) {
+                bCopy.onclick = () => {
+                    if (lastCapturedToken && navigator.clipboard) {
+                        navigator.clipboard.writeText(lastCapturedToken).then(() => {
+                            updateToolbar('Token copied to clipboard!', true);
+                        }).catch(() => {});
+                    }
                 };
             }
             const bPlan = document.getElementById('__lt_btn_planning__');
             if (bPlan) bPlan.onclick = () => { window.location.href = 'https://planning.worshiptools.com'; };
-            const bWtAcc = document.getElementById('__lt_btn_wt_accounts__');
-            if (bWtAcc) bWtAcc.onclick = () => { window.location.href = 'https://accounts.worshiptools.com'; };
             const bSong = document.getElementById('__lt_btn_songselect__');
             if (bSong) bSong.onclick = () => { window.location.href = 'https://songselect.ccli.com'; };
-            const bReh = document.getElementById('__lt_btn_rehearse__');
-            if (bReh) bReh.onclick = () => { window.location.href = 'https://rehearse.ccli.com'; };
+            const bProf = document.getElementById('__lt_btn_ccli_profile__');
+            if (bProf) bProf.onclick = () => { window.location.href = 'https://profile.ccli.com'; };
         };
 
         if (document.readyState === 'loading') {
@@ -778,7 +913,7 @@ pub async fn open_rehearse_window(
 
     let app_handle_for_nav = app.clone();
     let _window = WebviewWindowBuilder::new(&app, "rehearse", WebviewUrl::External(parsed_url))
-        .title("WorshipTools & CCLI Rehearse — LibreTracks Capture")
+        .title("SongSelect & WorshipTools — LibreTracks Capture")
         .inner_size(1150.0, 780.0)
         .initialization_script(init_script)
         .on_navigation(move |nav_url| {
@@ -795,12 +930,28 @@ pub async fn open_rehearse_window(
                     if key == "token" {
                         let mut current = state.token.lock().unwrap();
                         *current = Some(val_trim.clone());
+                        let last_track = state.last_track_id.lock().unwrap().clone();
+                        save_stored_rehearse_session(
+                            &app_handle_for_nav,
+                            &RehearseStoredSession {
+                                token: Some(val_trim.clone()),
+                                last_track_id: last_track,
+                            },
+                        );
                         println!("[Rehearse] Captured token via navigation (len {})", val_trim.len());
                         let _ = app_handle_for_nav.emit("rehearse-token-captured", val_trim);
                     } else if key == "track_id" {
                         let track_clean = clean_track_id(&val_trim);
                         let mut current = state.last_track_id.lock().unwrap();
                         *current = Some(track_clean.clone());
+                        let tok = state.token.lock().unwrap().clone();
+                        save_stored_rehearse_session(
+                            &app_handle_for_nav,
+                            &RehearseStoredSession {
+                                token: tok,
+                                last_track_id: Some(track_clean.clone()),
+                            },
+                        );
                         println!("[Rehearse] Captured track_id via navigation: {}", track_clean);
                         let _ = app_handle_for_nav.emit("rehearse-track-captured", track_clean);
                     } else if key == "wt_account_id" {
@@ -897,6 +1048,7 @@ pub async fn fetch_rehearse_song(
     track_id: String,
     custom_token: Option<String>,
     state: State<'_, RehearseState>,
+    app: AppHandle,
 ) -> Result<RehearseSongResult, String> {
     let mut clean_id = clean_track_id(&track_id);
     if clean_id.is_empty() {
@@ -923,8 +1075,9 @@ pub async fn fetch_rehearse_song(
     let token = custom_token
         .filter(|t| !t.trim().is_empty())
         .or_else(|| state.token.lock().unwrap().clone())
+        .or_else(|| load_stored_rehearse_session(&app).token)
         .ok_or_else(|| {
-            "No active Rehearse token found. Please open Rehearse in LibreTracks or enter your token in settings.".to_string()
+            "No active Rehearse token found. Please open SongSelect in LibreTracks or enter your token.".to_string()
         })?;
 
     let client = reqwest::Client::new();
@@ -942,7 +1095,7 @@ pub async fn fetch_rehearse_song(
 
     let status = res.status();
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        return Err("Rehearse authentication failed (HTTP 401/403). The token may have expired. Please open Rehearse to refresh the token.".to_string());
+        return Err("Rehearse authentication failed (HTTP 401/403). The token may have expired. Please open SongSelect to refresh the token.".to_string());
     }
     if status == reqwest::StatusCode::NOT_FOUND {
         return Err(format!("Rehearse track '{clean_id}' was not found (HTTP 404). Check the Track ID or URL."));
@@ -1014,7 +1167,8 @@ pub async fn fetch_rehearse_song(
 pub async fn export_song_markers(
     track_id: String,
     state: State<'_, RehearseState>,
+    app: AppHandle,
 ) -> Result<String, String> {
-    let result = fetch_rehearse_song(track_id, None, state).await?;
+    let result = fetch_rehearse_song(track_id, None, state, app).await?;
     Ok(result.csv)
 }

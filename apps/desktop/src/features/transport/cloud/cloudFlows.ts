@@ -75,7 +75,7 @@ export function pickCloudFile(folder: CloudFolder): Promise<CloudFile | null> {
  * an implementation detail of an import, not something they keep, and asking
  * for a location would turn one action into two.
  */
-async function stageFromCloud(file: CloudFile): Promise<string> {
+export async function stageFromCloud(file: CloudFile): Promise<string> {
   const store = useCloudStore.getState();
   const stagingDir = await getCloudStagingDir();
   useCloudStore.setState({

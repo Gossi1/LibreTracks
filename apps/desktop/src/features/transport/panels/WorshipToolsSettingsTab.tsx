@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { pickLibraryFiles } from "@libretracks/shared/desktopApi";
@@ -31,6 +31,8 @@ import {
   type StageProgress,
   type StageSongInput,
 } from "../../worshiptools/stageSession";
+import { matchSetlistWithCloud, type SongCloudMatch } from "../../worshiptools/setlistCloudMatcher";
+import { useCloudStore } from "../cloud/cloudStore";
 import {
   DEFAULT_WT_SERVER_URL,
   fetchWtLibrary,
@@ -103,9 +105,10 @@ type SongRowProps = {
   onPick?: () => void;
   onClear?: () => void;
   disabled?: boolean;
+  cloudMatch?: SongCloudMatch;
 };
 
-function SongRow({ song, inSetlist, referencePath, onPick, onClear, disabled }: SongRowProps) {
+function SongRow({ song, inSetlist, referencePath, onPick, onClear, disabled, cloudMatch }: SongRowProps) {
   const { t } = useTranslation();
   const musical = !inSetlist || isMusicalSong(song);
   const details = [
@@ -127,6 +130,24 @@ function SongRow({ song, inSetlist, referencePath, onPick, onClear, disabled }: 
         ) : null}
       </span>
       <span className="lt-wt-song-meta">{details}</span>
+      {inSetlist && musical && cloudMatch ? (
+        <span className="lt-wt-song-cloud-status" style={{ margin: "0 0.5rem" }}>
+          {cloudMatch.hasMatch ? (
+            <span
+              className="lt-wt-cloud-badge is-found"
+              title={cloudMatch.bestMatch?.name}
+            >
+              <span className="material-symbols-outlined">check_circle</span>
+              {t("transport.worshiptools.inCloud", { defaultValue: "In Cloud" })}
+            </span>
+          ) : (
+            <span className="lt-wt-cloud-badge is-missing">
+              <span className="material-symbols-outlined">cancel</span>
+              {t("transport.worshiptools.notInCloud", { defaultValue: "Niet in Cloud" })}
+            </span>
+          )}
+        </span>
+      ) : null}
       {inSetlist && musical ? (
         <span className="lt-wt-reference">
           {referencePath ? (
@@ -184,6 +205,14 @@ export function WorshipToolsSettingsTab() {
   const [openServiceId, setOpenServiceId] = useState<string | null>(null);
   const [setlist, setSetlist] = useState<SetlistEntry | null>(null);
   const [setlistStatus, setSetlistStatus] = useState<SectionStatus | null>(null);
+
+  const cloudFiles = useCloudStore((state) => state.files.songs);
+  const cloudStatus = useCloudStore((state) => state.status);
+
+  const cloudMatchResult = useMemo(() => {
+    if (!setlist) return null;
+    return matchSetlistWithCloud(setlist.songs, cloudFiles, setlist.serviceId);
+  }, [setlist, cloudFiles]);
 
   // Stage-session build state.
   const [references, setReferences] = useState<Record<string, string>>({});
@@ -664,6 +693,7 @@ export function WorshipToolsSettingsTab() {
                                 inSetlist
                                 referencePath={references[row.key]}
                                 disabled={progress !== null}
+                                cloudMatch={cloudMatchResult?.matchedMap.get(row.key)}
                                 onPick={() => handlePickReference(row.key)}
                                 onClear={() => handleClearReference(row.key)}
                               />
@@ -749,6 +779,13 @@ export function WorshipToolsSettingsTab() {
               count: chosenCount,
               defaultValue: "{{count}} reference track(s) chosen",
             })}
+            {cloudMatchResult && (
+              <span className="lt-wt-cloud-counter" style={{ display: "block", marginTop: "0.2rem" }}>
+                {cloudStatus?.connected
+                  ? `${cloudMatchResult.foundCount} / ${cloudMatchResult.totalMusical} liederen beschikbaar in Cloud Drive`
+                  : t("transport.worshiptools.cloudNotConnected", { defaultValue: "Cloud Drive niet verbonden" })}
+              </span>
+            )}
           </span>
         </div>
 
@@ -1013,14 +1050,7 @@ export function WorshipToolsSettingsTab() {
               <span className="material-symbols-outlined">open_in_new</span>
               {t("transport.settingsModal.openPlanningWebview", { defaultValue: "Planning" })}
             </button>
-            <button
-              type="button"
-              className="lt-secondary-button"
-              style={{ opacity: 0.8 }}
-              onClick={() => void handleOpenRehearse("https://rehearse.ccli.com")}
-            >
-              {t("transport.settingsModal.openRehearseWebview", { defaultValue: "CCLI Rehearse" })}
-            </button>
+
           </div>
         </div>
 

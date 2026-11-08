@@ -131,3 +131,11 @@ skills-lock.json
 
 # Generador del borrador de Reddit: herramienta de marketing, no del producto.
 scripts/announce/
+
+# Runtime/local native DLLs
+apps/desktop/src-tauri/avcodec-63.dll
+apps/desktop/src-tauri/avformat-63.dll
+apps/desktop/src-tauri/avutil-61.dll
+apps/desktop/src-tauri/bungee.dll
+apps/desktop/src-tauri/libmpv-2.dll
+apps/desktop/src-tauri/swresample-7.dll

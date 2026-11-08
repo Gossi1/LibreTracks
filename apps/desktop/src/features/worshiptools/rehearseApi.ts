@@ -55,7 +55,32 @@ export async function openRehearseWindow(url?: string): Promise<void> {
 
 /** Save or override the active Rehearse bearer token manually or via interceptor. */
 export async function saveRehearseToken(token: string): Promise<void> {
-  return invokeTauri<void>("save_rehearse_token", { token });
+  const clean = token.trim();
+  try {
+    window.localStorage.setItem("libretracks.rehearse.token", clean);
+  } catch {}
+  return invokeTauri<void>("save_rehearse_token", { token: clean });
+}
+
+/** Clear stored Rehearse token. */
+export async function clearRehearseToken(): Promise<void> {
+  try {
+    window.localStorage.removeItem("libretracks.rehearse.token");
+  } catch {}
+  return invokeTauri<void>("clear_rehearse_token");
+}
+
+/** Get active Rehearse token if present. */
+export async function getRehearseToken(): Promise<string | null> {
+  try {
+    const tok = await invokeTauri<string | null>("get_rehearse_token");
+    if (tok) return tok;
+  } catch {}
+  try {
+    return window.localStorage.getItem("libretracks.rehearse.token");
+  } catch {
+    return null;
+  }
 }
 
 /** Store the last captured or selected Rehearse track ID. */

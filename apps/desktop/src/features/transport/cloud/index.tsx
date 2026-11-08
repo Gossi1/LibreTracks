@@ -11,6 +11,7 @@ export {
   finishExportWithChoice,
   importSessionWithChoice,
   importSongWithChoice,
+  stageFromCloud,
 } from "./cloudFlows";
 export { confirmSessionExport, confirmSongExport } from "./exportWiring";
 export { useCloudStore } from "./cloudStore";

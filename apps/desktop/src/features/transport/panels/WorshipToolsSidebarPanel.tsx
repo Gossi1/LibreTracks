@@ -1,23 +1,35 @@
-import { useEffect, useRef, useState, useTransition } from "react";
+import { useEffect, useMemo, useRef, useState, useTransition } from "react";
 import { useTranslation } from "react-i18next";
 
-import { pickLibraryFiles } from "@libretracks/shared/desktopApi";
-import { createEmptySong, updateSongRegionKey } from "@libretracks/shared/desktopApi";
+import {
+  createEmptySong,
+  discardStagedPackage,
+  importSongPackageFromPathWithProgress,
+  pickLibraryFiles,
+  updateSongRegionKey,
+  type CloudFile,
+} from "@libretracks/shared/desktopApi";
 
 import {
   applyRehearseMarkersToTimeline,
+  clearRehearseToken,
   downloadCsvFile,
   fetchRehearseSong,
   getRehearseStatus,
+  getRehearseToken,
   listenRehearseToken,
   listenRehearseTrack,
   openRehearseWindow,
+  saveRehearseToken,
   type RehearseSongResult,
   type RehearseStatus,
 } from "../../worshiptools/rehearseApi";
 import { useWorshipToolsStore } from "../../worshiptools/worshipToolsStore";
 import { isMusicalSong } from "../../worshiptools/stageSession";
+import { matchSetlistWithCloud, type SetlistCloudMatchResult } from "../../worshiptools/setlistCloudMatcher";
 import type { WTSong } from "../../worshiptools/wtApi";
+import { stageFromCloud } from "../cloud/cloudFlows";
+import { useCloudStore } from "../cloud/cloudStore";
 import { getSong } from "../songStore";
 
 type WorshipToolsSidebarPanelProps = {
@@ -75,6 +87,38 @@ export function WorshipToolsSidebarPanel({
   const [rehearseFeedback, setRehearseFeedback] = useState<string | null>(null);
   const [markerOffsetSeconds, setMarkerOffsetSeconds] = useState(0);
 
+  const [showTokenInput, setShowTokenInput] = useState(false);
+  const [manualTokenInput, setManualTokenInput] = useState("");
+  const [isSavingToken, setIsSavingToken] = useState(false);
+
+  // Cloud Drive store bindings & states
+  const cloudStatus = useCloudStore((state) => state.status);
+  const cloudFiles = useCloudStore((state) => state.files.songs);
+  const isLoadingCloudFiles = useCloudStore((state) => state.loadingFolder === "songs");
+  const isConnectingCloud = useCloudStore((state) => state.connecting);
+  const refreshCloudStatus = useCloudStore((state) => state.refreshStatus);
+  const refreshCloudFiles = useCloudStore((state) => state.refreshFiles);
+  const connectCloud = useCloudStore((state) => state.connect);
+
+  const [cloudFilter, setCloudFilter] = useState<"all" | "found" | "missing">("all");
+  const [importingSongKey, setImportingSongKey] = useState<string | null>(null);
+
+  // Check Cloud connection status on open if not probed yet
+  useEffect(() => {
+    if (!isOpen) return;
+    if (cloudStatus === null) {
+      void refreshCloudStatus();
+    }
+  }, [isOpen, cloudStatus, refreshCloudStatus]);
+
+  // Load cloud songs if cloud is connected and files not yet loaded
+  useEffect(() => {
+    if (!isOpen || !cloudStatus?.connected) return;
+    if (activeTab === "setlist" && cloudFiles.length === 0 && !isLoadingCloudFiles) {
+      void refreshCloudFiles("songs");
+    }
+  }, [isOpen, cloudStatus?.connected, activeTab, cloudFiles.length, isLoadingCloudFiles, refreshCloudFiles]);
+
   const initialLoadAttemptedRef = useRef(false);
 
   useEffect(() => {
@@ -89,11 +133,26 @@ export function WorshipToolsSidebarPanel({
       if (status.lastTrackId) {
         setRehearseTrackInput((prev) => prev || status.lastTrackId || "");
       }
+      if (!status.hasToken) {
+        try {
+          const stored = window.localStorage.getItem("libretracks.rehearse.token");
+          if (stored && stored.trim()) {
+            void saveRehearseToken(stored.trim()).then(() => {
+              if (isMounted) {
+                setRehearseStatus((prev) => ({ ...prev, hasToken: true }));
+              }
+            });
+          }
+        } catch {}
+      }
     });
 
-    void listenRehearseToken(() => {
+    void listenRehearseToken((capturedToken) => {
       if (!isMounted) return;
       setRehearseStatus((prev) => ({ ...prev, hasToken: true }));
+      try {
+        window.localStorage.setItem("libretracks.rehearse.token", capturedToken);
+      } catch {}
       setRehearseFeedback(
         t("transport.worshiptools.tokenCapturedFeedback", {
           defaultValue: "Live Rehearse token captured!",
@@ -126,6 +185,35 @@ export function WorshipToolsSidebarPanel({
   const handleOpenRehearse = async (targetUrl?: string) => {
     try {
       await openRehearseWindow(targetUrl);
+    } catch (err) {
+      setRehearseError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const handleSaveManualToken = async () => {
+    const trimmed = manualTokenInput.trim();
+    if (!trimmed) return;
+    setIsSavingToken(true);
+    try {
+      await saveRehearseToken(trimmed);
+      setRehearseStatus((prev) => ({ ...prev, hasToken: true }));
+      setManualTokenInput("");
+      setShowTokenInput(false);
+      setRehearseFeedback("Token saved & connected!");
+      setTimeout(() => setRehearseFeedback(null), 3500);
+    } catch (err) {
+      setRehearseError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setIsSavingToken(false);
+    }
+  };
+
+  const handleClearToken = async () => {
+    try {
+      await clearRehearseToken();
+      setRehearseStatus((prev) => ({ ...prev, hasToken: false }));
+      setRehearseFeedback("Token cleared");
+      setTimeout(() => setRehearseFeedback(null), 3000);
     } catch (err) {
       setRehearseError(err instanceof Error ? err.message : String(err));
     }
@@ -205,8 +293,6 @@ export function WorshipToolsSidebarPanel({
     }
   }, [isOpen, services.length, isLoadingServices, loadServices]);
 
-  if (!isOpen) return null;
-
   const handleSelectServiceChange = (id: string) => {
     startTransition(() => {
       void selectService(id ? id : null);
@@ -270,6 +356,58 @@ export function WorshipToolsSidebarPanel({
 
   const songs = setlist?.songs ?? [];
   const musicalCount = songs.filter(isMusicalSong).length;
+
+  const cloudMatchResult: SetlistCloudMatchResult = useMemo(() => {
+    return matchSetlistWithCloud(songs, cloudFiles, selectedService?.id ?? "");
+  }, [songs, cloudFiles, selectedService?.id]);
+
+  const filteredSongs = useMemo(() => {
+    if (cloudFilter === "all") return songs;
+    return songs.filter((song, index) => {
+      const rowKey = `${selectedService?.id ?? ""}:${song.cueId ?? song.songId ?? index}`;
+      const match = cloudMatchResult.matchedMap.get(rowKey);
+      const musical = isMusicalSong(song);
+      if (cloudFilter === "found") {
+        return musical && match?.hasMatch;
+      }
+      if (cloudFilter === "missing") {
+        return musical && !match?.hasMatch;
+      }
+      return true;
+    });
+  }, [songs, cloudFilter, cloudMatchResult, selectedService?.id]);
+
+  const handleImportCloudSong = async (song: WTSong, cloudFile: CloudFile, rowKey: string) => {
+    if (importingSongKey) return;
+    setImportingSongKey(rowKey);
+    setTimelineFeedback(null);
+    let localPath: string | null = null;
+    try {
+      localPath = await stageFromCloud(cloudFile);
+      const pos = getSong()?.regions.length ? 999999 : 0;
+      await importSongPackageFromPathWithProgress(localPath, pos);
+      setTimelineFeedback(
+        t("transport.worshiptools.importedCloudSongSuccess", {
+          title: song.title,
+          defaultValue: `"${song.title}" imported from Cloud Drive to timeline!`,
+        }),
+      );
+      setTimeout(() => setTimelineFeedback(null), 4000);
+    } catch (err) {
+      setTimelineFeedback(
+        t("transport.worshiptools.importCloudSongError", {
+          defaultValue: err instanceof Error ? err.message : "Failed to import song from Cloud Drive",
+        }),
+      );
+    } finally {
+      if (localPath) {
+        void discardStagedPackage(localPath).catch(() => {});
+      }
+      setImportingSongKey(null);
+    }
+  };
+
+  if (!isOpen) return null;
 
   return (
     <aside
@@ -482,7 +620,7 @@ export function WorshipToolsSidebarPanel({
                         defaultValue: "Rehearse Connected",
                       })
                     : t("transport.worshiptools.rehearseDisconnected", {
-                        defaultValue: "No Token (Open Rehearse)",
+                        defaultValue: "No Token (Open SongSelect)",
                       })}
                 </span>
               </div>
@@ -509,19 +647,127 @@ export function WorshipToolsSidebarPanel({
                   <span className="material-symbols-outlined">open_in_new</span>
                   {t("transport.worshiptools.openPlanning", { defaultValue: "Planning" })}
                 </button>
-                <button
-                  type="button"
-                  className="lt-secondary-button lt-wt-rehearse-open-btn"
-                  style={{ opacity: 0.8 }}
-                  onClick={() => void handleOpenRehearse("https://rehearse.ccli.com")}
-                  title={t("transport.worshiptools.openRehearseDirectHint", {
-                    defaultValue: "Opens CCLI Rehearse directly (may show maintenance page if CCLI is down)",
-                  })}
-                >
-                  {t("transport.worshiptools.openRehearseDirect", { defaultValue: "CCLI Rehearse" })}
-                </button>
               </div>
             </div>
+
+            {/* Token details and manual paste toggle */}
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                padding: "0.25rem 0.2rem 0.45rem",
+                fontSize: "0.75rem",
+                opacity: 0.9,
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "center", gap: "0.4rem" }}>
+                <span
+                  style={{
+                    color: rehearseStatus.hasToken ? "#34d399" : "#94a3b8",
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: "3px",
+                  }}
+                >
+                  <span className="material-symbols-outlined" style={{ fontSize: "14px" }}>
+                    {rehearseStatus.hasToken ? "check_circle" : "key_off"}
+                  </span>
+                  {rehearseStatus.hasToken ? "Token saved & active" : "Auto-capture or paste token"}
+                </span>
+              </div>
+              <div style={{ display: "flex", gap: "0.5rem" }}>
+                <button
+                  type="button"
+                  className="lt-button-link"
+                  style={{
+                    fontSize: "0.75rem",
+                    cursor: "pointer",
+                    background: "none",
+                    border: "none",
+                    color: "#38bdf8",
+                    padding: 0,
+                    textDecoration: "underline",
+                  }}
+                  onClick={() => setShowTokenInput((prev) => !prev)}
+                >
+                  {showTokenInput
+                    ? "Cancel"
+                    : rehearseStatus.hasToken
+                    ? "Change Token"
+                    : "Paste Token Manually"}
+                </button>
+                {rehearseStatus.hasToken && (
+                  <button
+                    type="button"
+                    className="lt-button-link"
+                    style={{
+                      fontSize: "0.75rem",
+                      cursor: "pointer",
+                      background: "none",
+                      border: "none",
+                      color: "#f87171",
+                      padding: 0,
+                      textDecoration: "underline",
+                    }}
+                    onClick={() => void handleClearToken()}
+                  >
+                    Clear
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {showTokenInput && (
+              <div
+                style={{
+                  display: "flex",
+                  gap: "0.35rem",
+                  background: "rgba(255, 255, 255, 0.04)",
+                  padding: "0.4rem",
+                  borderRadius: "4px",
+                  marginBottom: "0.5rem",
+                }}
+              >
+                <input
+                  type="password"
+                  className="lt-wt-server-input"
+                  style={{ fontSize: "0.75rem", padding: "0.3rem 0.5rem", flex: 1 }}
+                  placeholder="Paste CCLI / Rehearse Bearer token…"
+                  value={manualTokenInput}
+                  onChange={(e) => setManualTokenInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      void handleSaveManualToken();
+                    }
+                  }}
+                />
+                <button
+                  type="button"
+                  className="lt-secondary-button"
+                  style={{ fontSize: "0.75rem", padding: "0.3rem 0.6rem" }}
+                  onClick={async () => {
+                    try {
+                      const text = await navigator.clipboard.readText();
+                      if (text && text.trim()) setManualTokenInput(text.trim());
+                    } catch {}
+                  }}
+                  title="Paste from clipboard"
+                >
+                  Paste
+                </button>
+                <button
+                  type="button"
+                  className="lt-button lt-button--primary"
+                  style={{ fontSize: "0.75rem", padding: "0.3rem 0.7rem" }}
+                  disabled={isSavingToken || !manualTokenInput.trim()}
+                  onClick={() => void handleSaveManualToken()}
+                >
+                  {isSavingToken ? "Saving…" : "Save"}
+                </button>
+              </div>
+            )}
 
             {rehearseFeedback && (
               <div className="lt-wt-feedback" role="status">
@@ -765,96 +1011,267 @@ export function WorshipToolsSidebarPanel({
                   </div>
                 ) : null}
 
-                <ul className="lt-wt-sidebar-song-list">
-                  {songs.map((song, index) => {
-                    const rowKey = `${selectedService.id}:${song.cueId ?? song.songId ?? index}`;
-                    const musical = isMusicalSong(song);
-                    const refPath = references[rowKey];
-
-                    return (
-                      <li
-                        key={rowKey}
-                        className={`lt-wt-sidebar-song-item ${!musical ? "is-nonsong" : ""}`}
-                      >
-                        <div className="lt-wt-song-position">{song.position ?? index + 1}</div>
-                        <div className="lt-wt-song-main">
-                          <div className="lt-wt-song-header">
-                            <span className="lt-wt-song-title-text" title={song.title}>
-                              {song.title}
-                            </span>
-                            {!musical && (
-                              <span className="lt-wt-nonsong-tag">
-                                {t("transport.worshiptools.notASong", { defaultValue: "cue" })}
-                              </span>
-                            )}
-                          </div>
-                          {musical ? (
-                            <div className="lt-wt-song-badges">
-                              {song.key && song.key !== "—" ? (
-                                <span className="lt-wt-badge is-key">{song.key}</span>
-                              ) : null}
-                              {song.bpm ? (
-                                <span className="lt-wt-badge is-bpm">{song.bpm} BPM</span>
-                              ) : null}
-                              {song.meter ? (
-                                <span className="lt-wt-badge is-meter">{song.meter}</span>
-                              ) : null}
-                            </div>
-                          ) : null}
-
-                          {musical && (
-                            <div className="lt-wt-song-ref-row">
-                              <button
-                                type="button"
-                                className="lt-wt-song-rehearse-btn"
-                                title={t("transport.worshiptools.generateMarkersFromRehearse", {
-                                  defaultValue: "Generate markers from Rehearse",
+                {/* Cloud Drive setlist search bar */}
+                <div className={`lt-wt-cloud-card ${cloudStatus?.connected ? "is-connected" : "is-disconnected"}`}>
+                  <div className="lt-wt-cloud-card-info">
+                    <div className="lt-wt-cloud-status-text">
+                      <span className={`material-symbols-outlined lt-wt-cloud-icon ${cloudStatus?.connected ? "is-connected" : ""}`}>
+                        {cloudStatus?.connected ? "cloud_done" : "cloud_off"}
+                      </span>
+                      <div>
+                        <span className="lt-wt-cloud-title">
+                          {t("transport.worshiptools.cloudStatusTitle", { defaultValue: "Cloud Drive (Google Drive)" })}
+                        </span>
+                        <span className="lt-wt-cloud-counter">
+                          {!cloudStatus?.connected
+                            ? t("transport.worshiptools.cloudConnectPrompt", {
+                                defaultValue: "Verbind Cloud Drive om liederen te zoeken.",
+                              })
+                            : isLoadingCloudFiles
+                              ? t("transport.worshiptools.cloudSearching", {
+                                  defaultValue: "Zoeken in Cloud Drive…",
+                                })
+                              : t("transport.worshiptools.cloudFoundSummary", {
+                                  found: cloudMatchResult.foundCount,
+                                  total: cloudMatchResult.totalMusical,
+                                  percent: cloudMatchResult.percentFound,
+                                  defaultValue: `${cloudMatchResult.foundCount} van ${cloudMatchResult.totalMusical} liederen beschikbaar (${cloudMatchResult.percentFound}%)`,
                                 })}
-                                onClick={() => {
-                                  setActiveTab("rehearse");
-                                  setRehearseTrackInput(song.title);
-                                  void handleFetchRehearse(song.title);
-                                }}
-                              >
-                                <span className="material-symbols-outlined" style={{ fontSize: "16px" }}>flag</span>
-                                <span>{t("transport.worshiptools.markers", { defaultValue: "Markers" })}</span>
-                              </button>
-                              {refPath ? (
-                                <>
-                                  <span className="lt-wt-ref-name" title={refPath}>
-                                    <span className="material-symbols-outlined">audiotrack</span>
-                                    {fileNameOf(refPath)}
-                                  </span>
-                                  <button
-                                    type="button"
-                                    className="lt-wt-ref-clear"
-                                    title={t("transport.worshiptools.clearAudio", {
-                                      defaultValue: "Remove reference track",
-                                    })}
-                                    onClick={() => clearReference(rowKey)}
-                                  >
-                                    <span className="material-symbols-outlined">close</span>
-                                  </button>
-                                </>
-                              ) : (
-                                <button
-                                  type="button"
-                                  className="lt-wt-ref-pick-btn"
-                                  onClick={() => void handlePickReference(rowKey)}
-                                >
-                                  <span className="material-symbols-outlined">music_note</span>
-                                  {t("transport.worshiptools.pickAudio", {
-                                    defaultValue: "+ Reference track",
-                                  })}
-                                </button>
+                        </span>
+                      </div>
+                    </div>
+                    {!cloudStatus?.connected ? (
+                      <button
+                        type="button"
+                        className="lt-secondary-button lt-wt-cloud-connect-btn"
+                        disabled={isConnectingCloud}
+                        onClick={() => void connectCloud()}
+                      >
+                        <span className="material-symbols-outlined">cloud</span>
+                        {isConnectingCloud
+                          ? t("common.connecting", { defaultValue: "Verbinden…" })
+                          : t("transport.worshiptools.connectCloud", { defaultValue: "Verbinden" })}
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        className={`lt-secondary-button lt-wt-cloud-refresh-btn ${isLoadingCloudFiles ? "is-spinning" : ""}`}
+                        disabled={isLoadingCloudFiles}
+                        onClick={() => void refreshCloudFiles("songs")}
+                        title={t("transport.worshiptools.refreshCloud", { defaultValue: "Zoek opnieuw in Cloud Drive" })}
+                      >
+                        <span className="material-symbols-outlined">refresh</span>
+                        <span>{t("transport.worshiptools.searchCloudBtn", { defaultValue: "Zoek in Cloud" })}</span>
+                      </button>
+                    )}
+                  </div>
+
+                  {cloudStatus?.connected && cloudMatchResult.totalMusical > 0 && !isLoadingCloudFiles && (
+                    <div className="lt-wt-cloud-filter-pills" role="radiogroup" aria-label="Cloud Filter">
+                      <button
+                        type="button"
+                        className={`lt-wt-cloud-filter-pill ${cloudFilter === "all" ? "is-active" : ""}`}
+                        onClick={() => setCloudFilter("all")}
+                      >
+                        {t("transport.worshiptools.filterAll", {
+                          count: songs.length,
+                          defaultValue: `Alle (${songs.length})`,
+                        })}
+                      </button>
+                      <button
+                        type="button"
+                        className={`lt-wt-cloud-filter-pill is-matched ${cloudFilter === "found" ? "is-active" : ""}`}
+                        onClick={() => setCloudFilter("found")}
+                      >
+                        <span className="material-symbols-outlined">check_circle</span>
+                        {t("transport.worshiptools.filterFound", {
+                          count: cloudMatchResult.foundCount,
+                          defaultValue: `In Cloud (${cloudMatchResult.foundCount})`,
+                        })}
+                      </button>
+                      <button
+                        type="button"
+                        className={`lt-wt-cloud-filter-pill is-missing ${cloudFilter === "missing" ? "is-active" : ""}`}
+                        onClick={() => setCloudFilter("missing")}
+                      >
+                        <span className="material-symbols-outlined">cancel</span>
+                        {t("transport.worshiptools.filterMissing", {
+                          count: cloudMatchResult.missingCount,
+                          defaultValue: `Ontbrekend (${cloudMatchResult.missingCount})`,
+                        })}
+                      </button>
+                    </div>
+                  )}
+                </div>
+
+                {filteredSongs.length === 0 ? (
+                  <div className="lt-library-panel-empty" style={{ margin: "1rem 0" }}>
+                    {t("transport.worshiptools.noFilteredSongs", {
+                      defaultValue: "Geen liederen gevonden voor dit filter.",
+                    })}
+                  </div>
+                ) : (
+                  <ul className="lt-wt-sidebar-song-list">
+                    {filteredSongs.map((song, index) => {
+                      const rowKey = `${selectedService.id}:${song.cueId ?? song.songId ?? index}`;
+                      const musical = isMusicalSong(song);
+                      const refPath = references[rowKey];
+                      const matchInfo = cloudMatchResult.matchedMap.get(rowKey);
+
+                      return (
+                        <li
+                          key={rowKey}
+                          className={`lt-wt-sidebar-song-item ${!musical ? "is-nonsong" : ""}`}
+                        >
+                          <div className="lt-wt-song-position">{song.position ?? index + 1}</div>
+                          <div className="lt-wt-song-main">
+                            <div className="lt-wt-song-header">
+                              <span className="lt-wt-song-title-text" title={song.title}>
+                                {song.title}
+                              </span>
+                              {!musical && (
+                                <span className="lt-wt-nonsong-tag">
+                                  {t("transport.worshiptools.notASong", { defaultValue: "cue" })}
+                                </span>
                               )}
                             </div>
-                          )}
-                        </div>
-                      </li>
-                    );
-                  })}
-                </ul>
+                            {musical ? (
+                              <div className="lt-wt-song-badges">
+                                {song.key && song.key !== "—" ? (
+                                  <span className="lt-wt-badge is-key">{song.key}</span>
+                                ) : null}
+                                {song.bpm ? (
+                                  <span className="lt-wt-badge is-bpm">{song.bpm} BPM</span>
+                                ) : null}
+                                {song.meter ? (
+                                  <span className="lt-wt-badge is-meter">{song.meter}</span>
+                                ) : null}
+                              </div>
+                            ) : null}
+
+                            {musical && (
+                              <div className="lt-wt-song-cloud-status">
+                                {isLoadingCloudFiles ? (
+                                  <span className="lt-wt-cloud-badge is-loading">
+                                    <span className="material-symbols-outlined is-spinning">progress_activity</span>
+                                    {t("transport.worshiptools.checkingCloud", { defaultValue: "Controleren…" })}
+                                  </span>
+                                ) : !cloudStatus?.connected ? (
+                                  <span
+                                    className="lt-wt-cloud-badge is-unknown"
+                                    title={t("transport.worshiptools.cloudNotConnectedHint", {
+                                      defaultValue: "Verbind Cloud Drive om beschikbaarheid te zien",
+                                    })}
+                                  >
+                                    <span className="material-symbols-outlined">cloud_off</span>
+                                    {t("transport.worshiptools.cloudNotChecked", { defaultValue: "Niet gecontroleerd" })}
+                                  </span>
+                                ) : matchInfo?.hasMatch ? (
+                                  <>
+                                    <span
+                                      className="lt-wt-cloud-badge is-found"
+                                      title={matchInfo.bestMatch?.name}
+                                    >
+                                      <span className="material-symbols-outlined">check_circle</span>
+                                      {t("transport.worshiptools.inCloud", { defaultValue: "In Cloud" })}
+                                      {matchInfo.allMatches.length > 1 && (
+                                        <span className="lt-wt-cloud-versions-tag">
+                                          {matchInfo.allMatches.length} {t("transport.worshiptools.versions", { defaultValue: "versies" })}
+                                        </span>
+                                      )}
+                                    </span>
+                                    {matchInfo.bestMatch && (
+                                      <span className="lt-wt-cloud-file-name" title={matchInfo.bestMatch.name}>
+                                        <span className="material-symbols-outlined">inventory_2</span>
+                                        {matchInfo.bestMatch.name}
+                                      </span>
+                                    )}
+                                    {matchInfo.bestMatch && (
+                                      <button
+                                        type="button"
+                                        className="lt-wt-song-cloud-import-btn"
+                                        disabled={importingSongKey !== null}
+                                        onClick={() => void handleImportCloudSong(song, matchInfo.bestMatch!, rowKey)}
+                                        title={t("transport.worshiptools.importCloudSongHint", {
+                                          defaultValue: "Download song package from Cloud Drive and import to timeline",
+                                        })}
+                                      >
+                                        {importingSongKey === rowKey ? (
+                                          <span className="material-symbols-outlined is-spinning">progress_activity</span>
+                                        ) : (
+                                          <span className="material-symbols-outlined">download</span>
+                                        )}
+                                        <span>
+                                          {importingSongKey === rowKey
+                                            ? t("transport.worshiptools.importing", { defaultValue: "Importeren…" })
+                                            : t("transport.worshiptools.importToTimeline", { defaultValue: "+ Timeline" })}
+                                        </span>
+                                      </button>
+                                    )}
+                                  </>
+                                ) : (
+                                  <span className="lt-wt-cloud-badge is-missing">
+                                    <span className="material-symbols-outlined">cancel</span>
+                                    {t("transport.worshiptools.notInCloud", { defaultValue: "Niet in Cloud" })}
+                                  </span>
+                                )}
+                              </div>
+                            )}
+
+                            {musical && (
+                              <div className="lt-wt-song-ref-row">
+                                <button
+                                  type="button"
+                                  className="lt-wt-song-rehearse-btn"
+                                  title={t("transport.worshiptools.generateMarkersFromRehearse", {
+                                    defaultValue: "Generate markers from Rehearse",
+                                  })}
+                                  onClick={() => {
+                                    setActiveTab("rehearse");
+                                    setRehearseTrackInput(song.title);
+                                    void handleFetchRehearse(song.title);
+                                  }}
+                                >
+                                  <span className="material-symbols-outlined" style={{ fontSize: "16px" }}>flag</span>
+                                  <span>{t("transport.worshiptools.markers", { defaultValue: "Markers" })}</span>
+                                </button>
+                                {refPath ? (
+                                  <>
+                                    <span className="lt-wt-ref-name" title={refPath}>
+                                      <span className="material-symbols-outlined">audiotrack</span>
+                                      {fileNameOf(refPath)}
+                                    </span>
+                                    <button
+                                      type="button"
+                                      className="lt-wt-ref-clear"
+                                      title={t("transport.worshiptools.clearAudio", {
+                                        defaultValue: "Remove reference track",
+                                      })}
+                                      onClick={() => clearReference(rowKey)}
+                                    >
+                                      <span className="material-symbols-outlined">close</span>
+                                    </button>
+                                  </>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    className="lt-wt-ref-pick-btn"
+                                    onClick={() => void handlePickReference(rowKey)}
+                                  >
+                                    <span className="material-symbols-outlined">music_note</span>
+                                    {t("transport.worshiptools.pickAudio", {
+                                      defaultValue: "+ Reference track",
+                                    })}
+                                  </button>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                )}
               </>
             )}
           </div>

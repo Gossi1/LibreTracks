@@ -27,7 +27,7 @@
 
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -53,6 +53,23 @@ const intoIndex = args.indexOf("--into");
 const intoDir = intoIndex >= 0 ? path.resolve(args[intoIndex + 1]) : null;
 
 const sha256 = (file) => createHash("sha256").update(readFileSync(file)).digest("hex");
+
+const copyIfChanged = (src, dest) => {
+  if (existsSync(dest)) {
+    const srcStat = statSync(src);
+    const destStat = statSync(dest);
+    if (
+      srcStat.size === destStat.size &&
+      Math.abs(srcStat.mtimeMs - destStat.mtimeMs) < 1000
+    ) {
+      return false;
+    }
+  }
+  copyFileSync(src, dest);
+  const srcStat = statSync(src);
+  utimesSync(dest, srcStat.atime, srcStat.mtime);
+  return true;
+};
 
 const run = (command, commandArgs, options = {}) => {
   const result = spawnSync(command, commandArgs, { stdio: "inherit", ...options });
@@ -95,8 +112,10 @@ function fetchWindows() {
 
   if (intoDir) {
     mkdirSync(intoDir, { recursive: true });
-    copyFileSync(dll, path.join(intoDir, "libmpv-2.dll"));
-    console.log(`Copiada a ${intoDir}`);
+    const destDll = path.join(intoDir, "libmpv-2.dll");
+    if (copyIfChanged(dll, destDll)) {
+      console.log(`Copiada a ${intoDir}`);
+    }
   }
 }
 
@@ -116,8 +135,10 @@ function fetchMac() {
   }
   if (intoDir) {
     mkdirSync(intoDir, { recursive: true });
-    copyFileSync(dylib, path.join(intoDir, "libmpv.2.dylib"));
-    console.log(`Copiada a ${intoDir}`);
+    const destDylib = path.join(intoDir, "libmpv.2.dylib");
+    if (copyIfChanged(dylib, destDylib)) {
+      console.log(`Copiada a ${intoDir}`);
+    }
   }
 }
 

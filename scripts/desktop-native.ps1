@@ -1,4 +1,4 @@
-﻿param(
+param(
   [ValidateSet("dev", "check", "build", "profile", "test")]
   [string]$Mode = "dev"
 )
@@ -409,23 +409,57 @@ if ($env:VCPKG_DEFAULT_TRIPLET) {
 if ($env:VCPKG_OVERLAY_TRIPLETS) {
   $cmakeConfigureArgs += "-DVCPKG_OVERLAY_TRIPLETS=$env:VCPKG_OVERLAY_TRIPLETS"
 }
-cmake @cmakeConfigureArgs
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+$cmakeCachePath = Join-Path $engineV2BuildDir "CMakeCache.txt"
+$cmakeStampPath = Join-Path $engineV2BuildDir ".lt-cmake-args.stamp"
+$cmakeArgsSignature = ($cmakeConfigureArgs -join "`n").Trim()
+$cachedArgsSignature = if (Test-Path -LiteralPath $cmakeStampPath) {
+  (Get-Content -LiteralPath $cmakeStampPath -Raw -ErrorAction SilentlyContinue).Trim()
+} else {
+  ""
+}
+if ((-not (Test-Path -LiteralPath $cmakeCachePath)) -or ($cachedArgsSignature -ne $cmakeArgsSignature)) {
+  cmake @cmakeConfigureArgs
+  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  Set-Content -LiteralPath $cmakeStampPath -Value $cmakeArgsSignature -NoNewline
+} else {
+  Write-Host "Audio Engine v2 CMake cache up to date; skipping reconfigure."
+}
 
 cmake --build $engineV2BuildDir --config $engineV2Config --target lt_audio_engine_v2
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-$nativeVendorDir = Join-Path $repoRoot "vendor\bin\native"
-New-Item -ItemType Directory -Force -Path $nativeVendorDir | Out-Null
-Get-ChildItem $nativeVendorDir -File -ErrorAction SilentlyContinue | Where-Object {
-  $_.Extension -in @(".dll", ".dylib", ".so")
-} | ForEach-Object {
-  Remove-Item -LiteralPath $_.FullName -Force
+function Copy-FileIfChanged {
+  param(
+    [Parameter(Mandatory = $true)][string]$SourcePath,
+    [Parameter(Mandatory = $true)][string]$DestinationDir
+  )
+  $fileName = Split-Path -Leaf $SourcePath
+  $destPath = Join-Path $DestinationDir $fileName
+  if (Test-Path -LiteralPath $destPath) {
+    $srcItem = Get-Item -LiteralPath $SourcePath
+    $dstItem = Get-Item -LiteralPath $destPath
+    if ($srcItem.Length -eq $dstItem.Length -and
+        [Math]::Abs(($srcItem.LastWriteTimeUtc - $dstItem.LastWriteTimeUtc).TotalSeconds) -lt 1) {
+      return $false
+    }
+  }
+  Copy-Item -LiteralPath $SourcePath -Destination $destPath -Force
+  return $true
 }
+
+$nativeVendorDir = Join-Path $repoRoot "vendor\bin\native"
+if (-not (Test-Path -LiteralPath $nativeVendorDir)) {
+  New-Item -ItemType Directory -Force -Path $nativeVendorDir | Out-Null
+}
+
+$expectedVendorFiles = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+[void]$expectedVendorFiles.Add("libmpv-2.dll")
+
 Get-ChildItem $engineV2LibDir -File -ErrorAction SilentlyContinue | Where-Object {
   $_.Extension -in @(".dll", ".dylib", ".so")
 } | ForEach-Object {
-    Copy-Item $_.FullName $nativeVendorDir -Force
+  [void]$expectedVendorFiles.Add($_.Name)
+  Copy-FileIfChanged -SourcePath $_.FullName -DestinationDir $nativeVendorDir | Out-Null
 }
 
 $vcpkgTriplet = if ($env:VCPKG_DEFAULT_TRIPLET) { $env:VCPKG_DEFAULT_TRIPLET } else { "x64-windows-release" }
@@ -436,13 +470,20 @@ if ($useFFmpeg -eq "ON") {
   }
 
   Get-ChildItem $buildVcpkgBin -Filter "*.dll" -File | ForEach-Object {
-    Copy-Item $_.FullName $nativeVendorDir -Force
+    [void]$expectedVendorFiles.Add($_.Name)
+    Copy-FileIfChanged -SourcePath $_.FullName -DestinationDir $nativeVendorDir | Out-Null
   }
 }
 
-# Video output (docs/plans/video-output): the loop above just cleared
-# vendor\bin\native, so put libmpv back where the resources glob bundles it
-# (and where the debug exe finds it below), like the release workflow does.
+Get-ChildItem $nativeVendorDir -File -ErrorAction SilentlyContinue | Where-Object {
+  $_.Extension -in @(".dll", ".dylib", ".so") -and (-not $expectedVendorFiles.Contains($_.Name))
+} | ForEach-Object {
+  Remove-Item -LiteralPath $_.FullName -Force
+}
+
+# Video output (docs/plans/video-output): ensure libmpv is present in
+# vendor\bin\native so the resources glob bundles it (and the debug exe finds
+# it below), like the release workflow does.
 # Not fatal: offline, the app builds and runs with video unavailable.
 node (Join-Path $repoRoot "scripts\libmpv-fetch.mjs") --into $nativeVendorDir
 if ($LASTEXITCODE -ne 0) {
@@ -461,7 +502,7 @@ if (Test-Path $buildVcpkgBin) {
 $cargoDebugDir = Join-Path $nativeTargetDir "debug"
 if (Test-Path $cargoDebugDir) {
   Get-ChildItem $nativeVendorDir -Filter "*.dll" | ForEach-Object {
-    Copy-Item $_.FullName $cargoDebugDir -Force
+    Copy-FileIfChanged -SourcePath $_.FullName -DestinationDir $cargoDebugDir | Out-Null
   }
 }
 
